@@ -3,6 +3,11 @@ Use this adress to open the program in your browser but put your raspberry pi IP
 
 ## Installation on Raspberry Pi
 
+if git isnt installed already on your device:
+    
+    sudo apt update && sudo apt install -y git
+
+
 Put this commands in your terminal:
 
 1. Download repo:
