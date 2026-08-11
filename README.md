@@ -31,22 +31,22 @@ Put this commands in your terminal:
 PASTE THIS
 
     [Unit]
-    Description=Paternoster Filament Storage
+    Description=Pawn Filament Paternoster Next.js Service
     After=network.target
 
     [Service]
     Type=simple
     User=raspberry
     WorkingDirectory=/home/raspberry/paternoster-filament-storage
-    ExecStart=/usr/bin/npm run start
-    Restart=always
     Environment=PATERNESTER_DB_PATH=/home/raspberry/paternoster-filament-storage/paternoster.db
+    ExecStart=/usr/bin/npm run start -- -H 0.0.0.0
+    Restart=always
 
     [Install]
     WantedBy=multi-user.target
 
 CTRL+O and CTRL+X
-Activake/Start the server:
+Activate/Start the server:
 
     sudo systemctl daemon-reload
     sudo systemctl enable --now paternoster.service
