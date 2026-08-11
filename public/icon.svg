@@ -1,0 +1,59 @@
+<svg width="180" height="180" viewBox="0 0 180 180" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <radialGradient id="bg" cx="35%" cy="28%" r="85%">
+      <stop offset="0%" stop-color="#141b26" />
+      <stop offset="100%" stop-color="#0a0e14" />
+    </radialGradient>
+    <radialGradient id="flange" cx="36%" cy="30%" r="75%">
+      <stop offset="0%" stop-color="#3a3a42" />
+      <stop offset="70%" stop-color="#1c1d22" />
+      <stop offset="100%" stop-color="#141519" />
+    </radialGradient>
+    <radialGradient id="track" cx="40%" cy="32%" r="72%">
+      <stop offset="0%" stop-color="#26262b" />
+      <stop offset="78%" stop-color="#0d0d10" />
+    </radialGradient>
+    <radialGradient id="filament" cx="34%" cy="26%" r="80%">
+      <stop offset="0%" stop-color="#6aa8ff" />
+      <stop offset="55%" stop-color="#2f6bff" />
+      <stop offset="100%" stop-color="#1b4fd6" />
+    </radialGradient>
+    <radialGradient id="hub" cx="38%" cy="32%" r="75%">
+      <stop offset="0%" stop-color="#2c2c32" />
+      <stop offset="75%" stop-color="#101014" />
+    </radialGradient>
+    <clipPath id="lowerHalf">
+      <rect x="22" y="90" width="136" height="80" />
+    </clipPath>
+  </defs>
+
+  <!-- rounded-square badge -->
+  <rect width="180" height="180" rx="38" fill="url(#bg)" />
+
+  <!-- outer flange -->
+  <circle cx="90" cy="90" r="68" fill="url(#flange)" />
+  <!-- empty winding track (full ring, dark) -->
+  <circle cx="90" cy="90" r="58" fill="url(#track)" />
+
+  <!-- half-full blue filament: only the bottom half of the winding is wound -->
+  <g clip-path="url(#lowerHalf)">
+    <circle cx="90" cy="90" r="58" fill="url(#filament)" />
+    <!-- subtle concentric winding lines -->
+    <g stroke="#ffffff" stroke-opacity="0.12" fill="none">
+      <circle cx="90" cy="90" r="52" />
+      <circle cx="90" cy="90" r="45" />
+      <circle cx="90" cy="90" r="38" />
+    </g>
+  </g>
+
+  <!-- fill line at the half mark -->
+  <line x1="34" y1="90" x2="146" y2="90" stroke="#8fbcff" stroke-opacity="0.55" stroke-width="2" />
+
+  <!-- dark plastic hub carves out the center so it reads as a spool -->
+  <circle cx="90" cy="90" r="30" fill="url(#hub)" />
+  <!-- center bore -->
+  <circle cx="90" cy="90" r="13" fill="#050506" />
+  <!-- two mounting holes on the hub -->
+  <circle cx="90" cy="68" r="4.5" fill="#050506" fill-opacity="0.85" />
+  <circle cx="90" cy="112" r="4.5" fill="#050506" fill-opacity="0.85" />
+</svg>

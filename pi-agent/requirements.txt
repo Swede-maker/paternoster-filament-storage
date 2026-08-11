@@ -1,0 +1,10 @@
+# Paternoster Pi agent dependencies
+# Install on the Raspberry Pi with:  pip3 install -r requirements.txt
+
+# WebSocket server the app connects to.
+websockets>=12.0
+
+# GPIO access. gpiozero is the high-level API; it needs a pin-factory backend.
+# On Raspberry Pi OS Bookworm+ use lgpio; on older images RPi.GPIO works too.
+gpiozero>=2.0
+lgpio>=0.2.2.0 ; platform_machine == "aarch64" or platform_machine == "armv7l" or platform_machine == "armv6l"

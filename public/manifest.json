@@ -1,0 +1,17 @@
+{
+  "name": "PAX Filament System",
+  "short_name": "PAX System",
+  "description": "Control panel for a paternoster 3D-printer filament storage carousel.",
+  "start_url": "/",
+  "display": "fullscreen",
+  "orientation": "landscape",
+  "background_color": "#0a0e14",
+  "theme_color": "#0a0e14",
+  "icons": [
+    {
+      "src": "/icon.svg",
+      "type": "image/svg+xml",
+      "sizes": "any"
+    }
+  ]
+}

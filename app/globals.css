@@ -1,0 +1,139 @@
+@import 'tailwindcss';
+@import 'tw-animate-css';
+
+@custom-variant dark (&:is(.dark *));
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-panel: var(--panel);
+  --color-panel-foreground: var(--panel-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-success: var(--success);
+  --color-warning: var(--warning);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-slot: var(--slot);
+  --color-slot-ring: var(--slot-ring);
+
+  --font-sans: var(--font-geist-sans), ui-sans-serif, system-ui, sans-serif;
+  --font-mono: var(--font-geist-mono), ui-monospace, monospace;
+
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+}
+
+:root {
+  color-scheme: dark;
+  --radius: 0.75rem;
+
+  /* Near-black control panel base with a cool blue undertone */
+  --background: oklch(0.16 0.012 255);
+  --foreground: oklch(0.95 0.008 255);
+
+  --card: oklch(0.2 0.014 255);
+  --card-foreground: oklch(0.95 0.008 255);
+
+  /* Slightly raised panels (sidebar, bottom rack) */
+  --panel: oklch(0.185 0.013 255);
+  --panel-foreground: oklch(0.95 0.008 255);
+
+  --popover: oklch(0.21 0.015 255);
+  --popover-foreground: oklch(0.95 0.008 255);
+
+  /* Signature blue accent */
+  --primary: oklch(0.68 0.16 245);
+  --primary-foreground: oklch(0.16 0.02 255);
+
+  --secondary: oklch(0.26 0.015 255);
+  --secondary-foreground: oklch(0.95 0.008 255);
+
+  --muted: oklch(0.24 0.013 255);
+  --muted-foreground: oklch(0.66 0.02 255);
+
+  --accent: oklch(0.3 0.03 245);
+  --accent-foreground: oklch(0.95 0.008 255);
+
+  --destructive: oklch(0.62 0.2 22);
+  --destructive-foreground: oklch(0.98 0 0);
+
+  --success: oklch(0.72 0.16 155);
+  --warning: oklch(0.78 0.15 75);
+
+  --border: oklch(0.32 0.012 255 / 55%);
+  --input: oklch(0.3 0.012 255);
+  --ring: oklch(0.68 0.16 245);
+
+  /* Empty carousel slot styling */
+  --slot: oklch(0.13 0.01 255);
+  --slot-ring: oklch(0.34 0.012 255);
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+  html {
+    @apply bg-background;
+  }
+  body {
+    @apply bg-background text-foreground antialiased;
+  }
+  /* Larger, touch-friendly tap targets on the Pi touchscreen */
+  button,
+  [role='button'] {
+    -webkit-tap-highlight-color: transparent;
+    touch-action: manipulation;
+  }
+}
+
+/* Slow yellow "place here" flash for the active carousel target slot */
+@keyframes slot-flash {
+  0%,
+  100% {
+    box-shadow: 0 0 0 2px var(--warning), 0 0 12px 0 oklch(0.78 0.15 75 / 25%);
+    background-color: oklch(0.78 0.15 75 / 12%);
+  }
+  50% {
+    box-shadow: 0 0 0 3px var(--warning), 0 0 30px 4px oklch(0.78 0.15 75 / 60%);
+    background-color: oklch(0.78 0.15 75 / 30%);
+  }
+}
+
+@layer utilities {
+  .animate-slot-flash {
+    animation: slot-flash 1.6s ease-in-out infinite;
+  }
+}
+
+/* Thin custom scrollbars for the dense panels */
+@layer utilities {
+  .scrollbar-thin {
+    scrollbar-width: thin;
+    scrollbar-color: var(--border) transparent;
+  }
+  .scrollbar-thin::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+  .scrollbar-thin::-webkit-scrollbar-thumb {
+    background-color: var(--border);
+    border-radius: 9999px;
+  }
+}
