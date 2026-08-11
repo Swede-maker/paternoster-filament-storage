@@ -1,4 +1,5 @@
 # Paternoster Filament Storage
+Use this adress to open the program in your browser but put your raspberry pi IP adress: http://192.168.X.XX:3000/
 
 ## Installation on Raspberry Pi
 
