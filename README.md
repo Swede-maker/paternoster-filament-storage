@@ -61,7 +61,7 @@ The installation is DONE now. but here below is the command to restart the serve
 
     sudo systemctl restart paternoster.service
 
-If you want to use the scan barcode if the phone dosent open your camera you need to install caddy. I paste the command below
+If you want to use the scan barcode if the phone dosent open your camera you need to install caddy. I paste the command below. but note that some barcode dose note even get scanned.
     
     sudo apt install -y debian-keyring debian-archive-keyring apt-transport-https
     curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | sudo gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
@@ -84,6 +84,7 @@ Restart the caddy:
 
     sudo systemctl restart caddy
 
+Now you need to paste or go to https://192.168.x.xx use your raspberry pi IP adress here, but note that you dont need the port 3000 in here.
 
 UNINSTALL:
 
