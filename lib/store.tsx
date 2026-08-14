@@ -78,7 +78,7 @@ function toPersisted(state: AppState): PersistedState {
     // (mid-home) never broadcasts `homed:false` to peers and makes THEM home
     // too. Combined with migrate() trusting the persisted value, a remote client
     // simply follows the shared position and never spontaneously re-homes.
-    nodes: state.nodes.map((n) => ({
+    nodes: state.nodes.map(({ connSeq: _connSeq, ...n }) => ({
       ...n,
       link: n.driver === "hardware" ? "offline" : "online",
       machine: { ...n.machine, homed: true, status: "idle", targetShelf: null, direction: null, moveFrom: null },
@@ -96,34 +96,56 @@ function persistedSig(state: AppState): string {
 }
 
 /**
- * Union two arrays of keyed items: keep every local item, then append any
- * remote item whose key we don't already have. Local wins on key conflicts.
+ * Three-way merge of keyed items so concurrent ADDS survive without
+ * resurrecting local DELETES.
+ *
+ *  - Keep every local item (local wins on key conflicts).
+ *  - Append a remote item only when it's genuinely new since our `baseline`
+ *    (the last document we synced from the server) — i.e. another device added
+ *    it. A remote item that WAS in the baseline but is now missing locally is
+ *    something we deleted, so we must NOT add it back.
+ *
+ * Without the baseline this was a plain add-only union, which made deletions
+ * impossible: removing a profile/brand/order/barcode locally, then folding the
+ * still-present remote copy back in on the next save, silently restored it —
+ * the reported "I remove it but it comes back on refresh" bug.
  */
-function unionByKey<T>(local: T[] | undefined, remote: T[] | undefined, key: (x: T) => string): T[] {
+function mergeByKey<T>(
+  local: T[] | undefined,
+  remote: T[] | undefined,
+  baseline: T[] | undefined,
+  key: (x: T) => string,
+): T[] {
   const base = local ?? []
   const seen = new Set(base.map(key))
-  const extras = (remote ?? []).filter((r) => !seen.has(key(r)))
+  const baseKeys = new Set((baseline ?? []).map(key))
+  // A remote item is a true concurrent add only if we've never seen its key:
+  // not present locally AND not present in the baseline we diverged from.
+  const extras = (remote ?? []).filter((r) => !seen.has(key(r)) && !baseKeys.has(key(r)))
   return extras.length ? [...base, ...extras] : base
 }
 
 /**
  * Merge the additive "catalog" registries — saved filament profiles, barcode
- * links, containers, custom materials/brands, and orders — from a remote
- * snapshot into our outgoing document.
+ * links, containers, custom materials/brands, orders, and the history log —
+ * from a remote snapshot into our outgoing document, using `baseline` (the last
+ * synced server document) as the common ancestor.
  *
- * The system uses a single shared document with last-write-wins saves. Without
- * this, two devices editing at once would let the later save wipe the other's
- * newly added profiles (the reported "I can only keep one profile" bug). These
- * registries are purely additive and keyed, so a union preserves everyone's
- * additions. Positional / live state (nodes, slots, printers, spools) stays
- * last-write-wins, which is correct for a physical carousel's current layout.
+ * The system uses a single shared document with last-write-wins saves. This
+ * three-way merge preserves additions made on another device (so a later save
+ * can't drop them — the "I can only keep one profile" bug) while still honoring
+ * deletions made locally (so removed items stay removed). Positional / live
+ * state (nodes, slots, printers, spools) stays last-write-wins, which is correct
+ * for a physical carousel's current layout.
  */
-function mergeCatalog(local: PersistedState, remote: PersistedState): PersistedState {
+function mergeCatalog(local: PersistedState, remote: PersistedState, baseline: PersistedState | null): PersistedState {
   const ls = local.settings
   const rs = remote.settings
-  // History is an append-only keyed log, so a union preserves events recorded on
-  // every device. Re-sort newest-first and cap so the merged log stays bounded.
-  const history = unionByKey(local.history, remote.history, (e) => e.id)
+  const bs = baseline?.settings
+  // History is append-only, so newly recorded events on other devices should be
+  // preserved — but a local CLEAR_HISTORY (or capacity trim) must still win, so
+  // baseline-known events aren't resurrected. Re-sort newest-first and cap.
+  const history = mergeByKey(local.history, remote.history, baseline?.history, (e) => e.id)
     .sort((a, b) => b.at - a.at)
     .slice(0, HISTORY_CAP)
   return {
@@ -131,12 +153,12 @@ function mergeCatalog(local: PersistedState, remote: PersistedState): PersistedS
     history,
     settings: {
       ...ls,
-      filamentProfiles: unionByKey(ls.filamentProfiles, rs.filamentProfiles, (p) => p.id),
-      barcodes: unionByKey(ls.barcodes, rs.barcodes, (b) => b.code),
-      containers: unionByKey(ls.containers, rs.containers, (c) => c.id),
-      customMaterials: unionByKey(ls.customMaterials, rs.customMaterials, (m) => m),
-      customBrands: unionByKey(ls.customBrands, rs.customBrands, (b) => b),
-      orders: unionByKey(ls.orders, rs.orders, (o) => o.id),
+      filamentProfiles: mergeByKey(ls.filamentProfiles, rs.filamentProfiles, bs?.filamentProfiles, (p) => p.id),
+      barcodes: mergeByKey(ls.barcodes, rs.barcodes, bs?.barcodes, (b) => b.code),
+      containers: mergeByKey(ls.containers, rs.containers, bs?.containers, (c) => c.id),
+      customMaterials: mergeByKey(ls.customMaterials, rs.customMaterials, bs?.customMaterials, (m) => m),
+      customBrands: mergeByKey(ls.customBrands, rs.customBrands, bs?.customBrands, (b) => b),
+      orders: mergeByKey(ls.orders, rs.orders, bs?.orders, (o) => o.id),
     },
   }
 }
@@ -290,6 +312,8 @@ type Action =
   /** Rebuild a node's shelf/slot layout, preserving spools that still fit. */
   | { type: "RESHAPE_NODE"; id: string; storage: StorageConfig; shelfMeta?: ShelfMeta[] }
   | { type: "REMOVE_NODE"; id: string }
+  /** Force a hardware node's WebSocket to close and reopen (manual retry). */
+  | { type: "RECONNECT_NODE"; id: string }
   | { type: "SET_MASTER"; id: string }
   | { type: "SET_ACTIVE_NODE"; id: string }
   // Hardware bridge (events reported by a real Pi agent over WebSocket)
@@ -623,6 +647,14 @@ function coreReducer(state: AppState, action: Action): AppState {
       const activeNodeId = state.activeNodeId === action.id ? nodes[0].id : state.activeNodeId
       return { ...state, nodes, activeNodeId, spools }
     }
+
+    case "RECONNECT_NODE":
+      // Bump an ephemeral counter and flip the link to "checking" so the
+      // NodeConnection effect (which keys off connSeq) tears down and reopens the
+      // socket. Only meaningful for hardware nodes; a no-op for simulated ones.
+      return withNode(state, action.id, (n) =>
+        n.driver === "hardware" ? { ...n, connSeq: (n.connSeq ?? 0) + 1, link: "checking" } : n,
+      )
 
     case "SET_MASTER": {
       if (!getNode(state, action.id)) return state
@@ -1386,6 +1418,10 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   // we can skip redundant saves and skip reloading our own writes.
   const dbVersion = useRef(0)
   const lastSavedSig = useRef<string | null>(null)
+  // The last document we synced from the server. Used as the common ancestor in
+  // mergeCatalog so a local delete isn't resurrected while concurrent remote
+  // adds are still preserved.
+  const baselineRef = useRef<PersistedState | null>(null)
   const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   // A save that has been scheduled/started but not yet acknowledged by the
   // server. While this is true, a poll must not reload — otherwise it can fetch
@@ -1408,7 +1444,9 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         if (data) {
           dbVersion.current = version
           const hydrated = migrate(data)
-          lastSavedSig.current = persistedSig(hydrated)
+          const persisted = toPersisted(hydrated)
+          lastSavedSig.current = JSON.stringify(persisted)
+          baselineRef.current = persisted
           dispatch({ type: "HYDRATE", state: hydrated })
         } else {
           // Nothing shared yet — attempt a one-time migration from localStorage.
@@ -1421,11 +1459,13 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           }
           if (legacy) {
             const hydrated = migrate(legacy)
+            const persisted = toPersisted(hydrated)
             dispatch({ type: "HYDRATE", state: hydrated })
-            const { version: v } = await saveSystemState(toPersisted(hydrated))
+            const { version: v } = await saveSystemState(persisted)
             if (!cancelled) {
               dbVersion.current = v
-              lastSavedSig.current = persistedSig(hydrated)
+              lastSavedSig.current = JSON.stringify(persisted)
+              baselineRef.current = persisted
             }
           }
         }
@@ -1455,17 +1495,22 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         let payload = toPersisted(state)
         // Before a last-write-wins save, fold in any catalog additions another
         // device made since our last sync (profiles, barcodes, containers,
-        // custom materials/brands, orders) so this save can't drop them. The
-        // merged extras flow back into local state on the next poll.
+        // custom materials/brands, orders) so this save can't drop them — while
+        // using our baseline (last synced doc) as the common ancestor so items
+        // WE deleted are not resurrected. The merged result flows back into local
+        // state on the next poll.
         try {
           const latest = await loadSystemState()
-          if (latest.data) payload = mergeCatalog(payload, latest.data)
+          if (latest.data) payload = mergeCatalog(payload, latest.data, baselineRef.current)
         } catch {
           // Offline or load failed — save the local document as-is.
         }
         const { version } = await saveSystemState(payload)
         dbVersion.current = version
         lastSavedSig.current = sig
+        // The document we just wrote is now the server truth — adopt it as the
+        // baseline so subsequent deletes diff against what's actually stored.
+        baselineRef.current = payload
       } catch (e) {
         console.log("[v0] system save failed:", (e as Error).message)
       } finally {
@@ -1496,8 +1541,12 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         const { data, version: v } = await loadSystemState()
         if (cancelled || !data || stateRef.current.job || saveInFlight.current) return
         const incoming = migrate(data)
-        const incomingSig = persistedSig(incoming)
+        const incomingPersisted = toPersisted(incoming)
+        const incomingSig = JSON.stringify(incomingPersisted)
         dbVersion.current = v
+        // The freshly loaded server document becomes our new baseline for future
+        // delete-aware merges, regardless of whether we re-hydrate below.
+        baselineRef.current = incomingPersisted
         // Only apply if it actually differs from what we already have, so a
         // remote change doesn't clobber local live motion needlessly.
         if (incomingSig !== persistedSig(stateRef.current)) {

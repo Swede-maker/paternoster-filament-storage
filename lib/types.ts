@@ -356,6 +356,12 @@ export interface StorageNode {
    */
   link: PrinterLinkStatus
   /**
+   * Ephemeral, per-session counter bumped by a manual "Reconnect" action to
+   * force the live WebSocket to close and reopen without changing ip/port. Not
+   * persisted (stripped in toPersisted) so it never syncs between devices.
+   */
+  connSeq?: number
+  /**
    * Calibrated carousel travel time between adjacent shelves, in seconds. This
    * is the real-world speed found by auto-calibration (target ~3.5 s) and also
    * adjustable with the manual speed slider. Drives how fast the carousel

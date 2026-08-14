@@ -32,18 +32,22 @@ export function BottomNav({
   const online = state.nodes.every((n) => n.machine.homed) && !anyHoming
 
   return (
-    <footer className="flex h-14 shrink-0 items-center justify-between border-t border-border bg-panel px-4">
-      <div className="flex items-center gap-2 text-xs text-muted-foreground">
-        <span
-          className={cn(
-            "h-2 w-2 rounded-full",
-            online ? "bg-success" : "bg-warning",
-          )}
-        />
-        {online ? "System Online" : anyHoming ? "Homing…" : "Not Homed"}
+    <footer className="flex h-14 shrink-0 items-center gap-2 border-t border-border bg-panel px-3 sm:px-4">
+      {/* System status. Keep just the dot on phones so the tab row has room;
+          show the label from sm up. */}
+      <div className="flex shrink-0 items-center gap-1.5 text-xs text-muted-foreground">
+        <span className={cn("h-2 w-2 rounded-full", online ? "bg-success" : "bg-warning")} />
+        <span className="hidden sm:inline">
+          {online ? "System Online" : anyHoming ? "Homing…" : "Not Homed"}
+        </span>
       </div>
 
-      <nav className="flex items-center gap-1">
+      {/* Tabs. Horizontally scrollable so every tab (incl. Settings) is always
+          reachable on a narrow phone — swipe left/right. Scrollbar is hidden. */}
+      <nav
+        className="flex flex-1 items-center justify-start gap-1 overflow-x-auto [-ms-overflow-style:none] [scrollbar-width:none] sm:justify-center [&::-webkit-scrollbar]:hidden"
+        aria-label="Primary"
+      >
         {items.map(({ id, label, icon: Icon, badge, alert }) => {
           const active = tab === id
           return (
@@ -52,10 +56,8 @@ export function BottomNav({
               type="button"
               onClick={() => onChange(id)}
               className={cn(
-                "relative flex items-center gap-2 rounded-lg px-4 py-1.5 text-sm font-medium transition-colors",
-                active
-                  ? "text-primary"
-                  : "text-muted-foreground hover:text-foreground",
+                "relative flex min-h-11 shrink-0 items-center gap-2 whitespace-nowrap rounded-lg px-4 py-1.5 text-sm font-medium transition-colors",
+                active ? "text-primary" : "text-muted-foreground hover:text-foreground",
               )}
               aria-current={active ? "page" : undefined}
             >
@@ -65,9 +67,7 @@ export function BottomNav({
                   <span
                     className={cn(
                       "absolute -right-2 -top-2 flex h-4 min-w-4 items-center justify-center rounded-full px-1 text-[10px] font-semibold leading-none",
-                      alert
-                        ? "bg-warning text-background"
-                        : "bg-primary text-primary-foreground",
+                      alert ? "bg-warning text-background" : "bg-primary text-primary-foreground",
                     )}
                   >
                     {badge}
@@ -80,9 +80,8 @@ export function BottomNav({
         })}
       </nav>
 
-      <div className="text-xs text-muted-foreground">
-        PAX Filament System v1.0.0
-      </div>
+      {/* Version footnote — desktop only; it just wastes width on a phone. */}
+      <div className="hidden shrink-0 text-xs text-muted-foreground lg:block">PAX Filament System v1.0.0</div>
     </footer>
   )
 }

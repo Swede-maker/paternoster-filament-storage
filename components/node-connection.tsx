@@ -50,12 +50,14 @@ export function NodeConnection() {
   // --- Reconcile the set of open sockets with the hardware nodes. ---
   const connectionSig = state.nodes
     .filter((n) => n.driver === "hardware")
-    .map((n) => `${n.id}@${n.ip}:${n.port}`)
+    // Include connSeq so a manual "Reconnect" (which bumps it) changes the key
+    // for that node and forces the reconcile below to close + reopen its socket.
+    .map((n) => `${n.id}@${n.ip}:${n.port}#${n.connSeq ?? 0}`)
     .join("|")
 
   useEffect(() => {
     const hardware = state.nodes.filter((n) => n.driver === "hardware")
-    const wanted = new Map(hardware.map((n) => [n.id, `${n.ip}:${n.port}`]))
+    const wanted = new Map(hardware.map((n) => [n.id, `${n.ip}:${n.port}#${n.connSeq ?? 0}`]))
 
     const send = (nodeId: string, cmd: NodeCommand) => {
       const c = conns.current[nodeId]

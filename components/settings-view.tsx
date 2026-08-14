@@ -474,14 +474,36 @@ function NodeEndpointEditor({ node }: { node: StorageNode }) {
           onChange={(e) => setPort(Math.max(1, Math.min(65535, Number.parseInt(e.target.value) || 8765)))}
           aria-label="Agent port"
         />
-        <Button
-          size="sm"
-          disabled={!ipValid || !dirty}
-          onClick={() => dispatch({ type: "UPDATE_NODE", id: node.id, changes: { ip: ip.trim(), port } })}
-        >
-          Save & reconnect
-        </Button>
+        {dirty ? (
+          <Button
+            size="sm"
+            disabled={!ipValid}
+            onClick={() => dispatch({ type: "UPDATE_NODE", id: node.id, changes: { ip: ip.trim(), port } })}
+          >
+            Save & reconnect
+          </Button>
+        ) : (
+          // No pending edits — offer a plain retry that reopens the socket
+          // without needing to change (and change back) the IP/port.
+          <Button size="sm" variant="secondary" onClick={() => dispatch({ type: "RECONNECT_NODE", id: node.id })}>
+            <RotateCcw className="h-4 w-4" /> Reconnect
+          </Button>
+        )}
       </div>
+      {/* Live link state so the retry gives visible feedback. */}
+      <p className="mt-2 flex items-center gap-1.5 text-xs text-muted-foreground">
+        <span
+          className={cn(
+            "h-1.5 w-1.5 rounded-full",
+            node.link === "online" ? "bg-success" : node.link === "checking" ? "bg-warning" : "bg-destructive",
+          )}
+        />
+        {node.link === "online"
+          ? "Connected to Pi agent"
+          : node.link === "checking"
+            ? "Connecting…"
+            : "Offline — check the Pi agent is running, then Reconnect."}
+      </p>
       {ip && !ipValid && <p className="mt-1 text-xs text-destructive">Enter an IPv4 address or a *.local hostname.</p>}
     </div>
   )
