@@ -69,6 +69,7 @@ export function HistoryView() {
   const { state, dispatch } = useStore()
   const now = Date.now()
   const [filter, setFilter] = useState<FilterKey>("all")
+  const [confirmingReset, setConfirmingReset] = useState(false)
 
   const spools = state.spools
 
@@ -93,11 +94,37 @@ export function HistoryView() {
 
   return (
     <div className="mx-auto w-full max-w-3xl px-4 py-6 sm:px-6">
-      <header className="mb-6">
-        <h1 className="text-balance text-2xl font-semibold text-foreground">History</h1>
-        <p className="mt-1 text-pretty text-sm text-muted-foreground">
-          Every load, unload, and placement of your filament — plus reminders to dry spools before they go brittle.
-        </p>
+      <header className="mb-6 flex items-start justify-between gap-4">
+        <div className="min-w-0">
+          <h1 className="text-balance text-2xl font-semibold text-foreground">History</h1>
+          <p className="mt-1 text-pretty text-sm text-muted-foreground">
+            Every load, unload, and placement of your filament — plus reminders to dry spools before they go brittle.
+          </p>
+        </div>
+        {/* Reset the activity log. Two-step confirm since it can't be undone.
+            Only clears the log — spools and dry reminders are untouched. */}
+        {confirmingReset ? (
+          <div className="flex shrink-0 items-center gap-2">
+            <span className="hidden text-xs text-muted-foreground sm:inline">Clear all history?</span>
+            <Button size="sm" variant="destructive" onClick={resetHistory}>
+              Confirm
+            </Button>
+            <Button size="sm" variant="ghost" onClick={() => setConfirmingReset(false)}>
+              Cancel
+            </Button>
+          </div>
+        ) : (
+          <Button
+            size="sm"
+            variant="outline"
+            className="shrink-0 gap-1.5 text-muted-foreground"
+            onClick={() => setConfirmingReset(true)}
+            disabled={events.length === 0}
+          >
+            <Trash2 className="h-4 w-4" />
+            Reset history
+          </Button>
+        )}
       </header>
 
       {/* Dry alerts */}
@@ -178,6 +205,10 @@ export function HistoryView() {
   }
   function clear(spoolId: string) {
     dispatch({ type: "CLEAR_DRY_REMINDER", spoolId })
+  }
+  function resetHistory() {
+    dispatch({ type: "CLEAR_HISTORY" })
+    setConfirmingReset(false)
   }
 }
 

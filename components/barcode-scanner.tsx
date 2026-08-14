@@ -38,6 +38,7 @@ export function BarcodeScanner({
   onClose: () => void
 }) {
   const videoRef = useRef<HTMLVideoElement>(null)
+  const manualRef = useRef<HTMLInputElement>(null)
   const [error, setError] = useState<string | null>(null)
   const [starting, setStarting] = useState(true)
   const [manual, setManual] = useState("")
@@ -57,9 +58,11 @@ export function BarcodeScanner({
       setStarting(false)
       setError(
         typeof window !== "undefined" && !window.isSecureContext
-          ? "Camera needs a secure connection (HTTPS). Open this app over https or type the code below."
+          ? "Your phone's camera only works over a secure (https://) connection. This app is open over http://, so the camera can't start — reach it via https, or just type the barcode below."
           : "No camera available on this device. Type the code below instead.",
       )
+      // Nothing to scan with — put the cursor straight in the manual field.
+      setTimeout(() => manualRef.current?.focus(), 50)
       return
     }
 
@@ -98,6 +101,8 @@ export function BarcodeScanner({
               ? "No camera found on this device. Type the code below instead."
               : "Couldn't start the camera. Type the code below instead.",
         )
+        // Camera unusable — move focus to manual entry so typing just works.
+        setTimeout(() => manualRef.current?.focus(), 50)
       })
 
     return () => {
@@ -144,6 +149,7 @@ export function BarcodeScanner({
           </label>
           <div className="flex gap-2">
             <Input
+              ref={manualRef}
               value={manual}
               onChange={(e) => setManual(e.target.value)}
               placeholder="Type or paste a barcode"

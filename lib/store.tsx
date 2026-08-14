@@ -335,6 +335,8 @@ type Action =
   | { type: "SET_DRY_REMINDER"; spoolId: string; days: number }
   | { type: "RESET_DRY_REMINDER"; spoolId: string }
   | { type: "CLEAR_DRY_REMINDER"; spoolId: string }
+  // Wipe the activity log (does not touch spools or reminders)
+  | { type: "CLEAR_HISTORY" }
   // Machine / simulation (per node)
   | { type: "HOME_START"; nodeId: string }
   | { type: "HOME_DONE"; nodeId: string }
@@ -857,6 +859,12 @@ function coreReducer(state: AppState, action: Action): AppState {
       if (!spool?.dryReminder) return state
       const { dryReminder: _removed, ...rest } = spool
       return { ...state, spools: { ...state.spools, [action.spoolId]: rest } }
+    }
+
+    case "CLEAR_HISTORY": {
+      // Already empty — return the same reference so machineReducer skips work.
+      if (!state.history || state.history.length === 0) return state
+      return { ...state, history: [] }
     }
 
     // ----- machine (per node) -----
