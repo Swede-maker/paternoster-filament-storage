@@ -3,33 +3,30 @@
 import { useEffect, useRef } from "react"
 import { useStore } from "@/lib/store"
 import type { StorageNode } from "@/lib/types"
-import { agentUrl, encodeCommand, parseEvent, type NodeCommand } from "@/lib/node-protocol"
+import { parseEvent, type NodeCommand } from "@/lib/node-protocol"
 
 /**
- * Owns the live WebSocket connections to hardware nodes' Pi agents.
+ * Owns the live connection to hardware nodes' Pi agents — via the app server.
  *
- * Responsibilities:
- *  - Open/close a socket per hardware node (reconnecting with backoff).
- *  - Translate the machine's *intent* (homing / moving) into agent commands,
- *    sending each command exactly once per episode.
- *  - Translate agent *events* (pos / arrived / homed / fault) back into store
- *    actions so the UI reflects the real carousel.
+ * Rather than each browser opening its own `ws://<pi-ip>:<port>` socket (which
+ * only works on devices that can reach the Pi's LAN IP and aren't blocked by
+ * HTTPS mixed-content), every browser talks to THIS app's own origin:
+ *   - downstream: an EventSource on `/api/pi/stream` (SSE) delivers Pi events
+ *     and relay link-status.
+ *   - upstream: `POST /api/pi/command` forwards commands.
+ * The app server keeps the single WebSocket to the Pi and fans out to everyone,
+ * so ANY device (phone on cellular, HTTPS, other subnet) can drive the carousel
+ * as long as the server can reach the Pi.
  *
- * Renders nothing. Simulated nodes are ignored entirely (they run on in-app
- * timers inside the store).
- *
- * NOTE on mixed content: a browser page served over HTTPS cannot open an
- * insecure ws:// socket. Real hardware use therefore happens over the LAN via
- * http:// (or a wss:// reverse proxy on the Pi). On the hosted HTTPS preview,
- * hardware nodes will simply show as "offline" — this is expected.
+ * Renders nothing. Simulated nodes are ignored (they run on in-app timers).
  */
 
 interface Conn {
-  ws: WebSocket | null
-  /** `${ip}:${port}` — used to detect when a node's endpoint changed. */
+  es: EventSource | null
+  /** `${ip}:${port}#${connSeq}` — used to detect when a node changed. */
   key: string
-  reconnect: ReturnType<typeof setTimeout> | null
-  closedByUs: boolean
+  /** Whether the relay currently has a live socket to the Pi. */
+  online: boolean
   // Command de-duplication so we don't spam the agent every render.
   homeSent: boolean
   gotoTarget: number | null
@@ -37,21 +34,19 @@ interface Conn {
   commandActive: boolean
 }
 
-const RECONNECT_MS = 3000
-
 export function NodeConnection() {
   const { state, dispatch } = useStore()
   const conns = useRef<Record<string, Conn>>({})
-  // Keep the latest nodes list available to socket callbacks (which close over
-  // stale state otherwise).
+  // Keep the latest nodes list available to callbacks (which close over stale
+  // state otherwise).
   const nodesRef = useRef<StorageNode[]>(state.nodes)
   nodesRef.current = state.nodes
 
-  // --- Reconcile the set of open sockets with the hardware nodes. ---
+  // --- Reconcile the set of open streams with the hardware nodes. ---
   const connectionSig = state.nodes
     .filter((n) => n.driver === "hardware")
-    // Include connSeq so a manual "Reconnect" (which bumps it) changes the key
-    // for that node and forces the reconcile below to close + reopen its socket.
+    // Include connSeq so a manual "Reconnect" (which bumps it) re-opens the
+    // stream for that node.
     .map((n) => `${n.id}@${n.ip}:${n.port}#${n.connSeq ?? 0}`)
     .join("|")
 
@@ -59,18 +54,11 @@ export function NodeConnection() {
     const hardware = state.nodes.filter((n) => n.driver === "hardware")
     const wanted = new Map(hardware.map((n) => [n.id, `${n.ip}:${n.port}#${n.connSeq ?? 0}`]))
 
-    const send = (nodeId: string, cmd: NodeCommand) => {
-      const c = conns.current[nodeId]
-      if (c?.ws && c.ws.readyState === WebSocket.OPEN) c.ws.send(encodeCommand(cmd))
-    }
-
     const closeConn = (nodeId: string) => {
       const c = conns.current[nodeId]
       if (!c) return
-      c.closedByUs = true
-      if (c.reconnect) clearTimeout(c.reconnect)
       try {
-        c.ws?.close()
+        c.es?.close()
       } catch {
         // ignore
       }
@@ -82,33 +70,46 @@ export function NodeConnection() {
       const c = conns.current[nodeId]
       if (!node || !c) return
       dispatch({ type: "NODE_LINK", nodeId, link: "checking" })
-      let ws: WebSocket
+
+      const params = new URLSearchParams({
+        ip: node.ip,
+        port: String(node.port),
+        shelves: String(node.storage.shelves),
+      })
+      let es: EventSource
       try {
-        ws = new WebSocket(agentUrl(node.ip, node.port))
+        es = new EventSource(`/api/pi/stream?${params.toString()}`)
       } catch {
         dispatch({ type: "NODE_LINK", nodeId, link: "offline" })
-        scheduleReconnect(nodeId)
         return
       }
-      c.ws = ws
+      c.es = es
 
-      ws.onopen = () => {
-        dispatch({ type: "NODE_LINK", nodeId, link: "online" })
-        // Tell the agent the carousel geometry so it can wrap shelf indexes.
-        const fresh = nodesRef.current.find((n) => n.id === nodeId)
-        if (fresh) send(nodeId, { type: "config", shelves: fresh.storage.shelves })
-      }
-
-      ws.onmessage = (e) => {
-        const ev = parseEvent(typeof e.data === "string" ? e.data : "")
-        if (!ev) return
+      // Relay link-status frames reflect the server↔Pi socket state.
+      es.addEventListener("link", (e) => {
         const conn = conns.current[nodeId]
+        if (!conn) return
+        let status: string | undefined
+        try {
+          status = (JSON.parse((e as MessageEvent).data) as { status?: string }).status
+        } catch {
+          return
+        }
+        if (status === "online" || status === "checking" || status === "offline") {
+          conn.online = status === "online"
+          dispatch({ type: "NODE_LINK", nodeId, link: status })
+        }
+      })
+
+      // Pi event frames (raw agent JSON), forwarded verbatim by the relay.
+      es.addEventListener("pi", (e) => {
+        const conn = conns.current[nodeId]
+        const ev = parseEvent((e as MessageEvent).data)
+        if (!ev) return
         switch (ev.type) {
           case "hello":
             break
           case "state":
-            dispatch({ type: "NODE_POS", nodeId, currentShelf: ev.shelf })
-            break
           case "pos":
             dispatch({ type: "NODE_POS", nodeId, currentShelf: ev.shelf })
             break
@@ -135,51 +136,32 @@ export function NodeConnection() {
             dispatch({ type: "NODE_FAULT", nodeId, message: ev.message })
             break
         }
-      }
+      })
 
-      ws.onclose = () => {
+      // SSE dropped (network blip). EventSource auto-reconnects; show "checking"
+      // meanwhile and let the next `link` frame restore the true status.
+      es.onerror = () => {
         const conn = conns.current[nodeId]
         if (!conn) return
-        conn.ws = null
-        dispatch({ type: "NODE_LINK", nodeId, link: "offline" })
-        if (!conn.closedByUs) scheduleReconnect(nodeId)
-      }
-
-      ws.onerror = () => {
-        try {
-          ws.close()
-        } catch {
-          // onclose will handle reconnect
-        }
+        conn.online = false
+        dispatch({ type: "NODE_LINK", nodeId, link: "checking" })
       }
     }
 
-    const scheduleReconnect = (nodeId: string) => {
-      const c = conns.current[nodeId]
-      if (!c || c.reconnect) return
-      c.reconnect = setTimeout(() => {
-        const conn = conns.current[nodeId]
-        if (!conn) return
-        conn.reconnect = null
-        connect(nodeId)
-      }, RECONNECT_MS)
-    }
-
-    // Close sockets for nodes that are gone or whose endpoint changed.
+    // Close streams for nodes that are gone or whose endpoint changed.
     for (const nodeId of Object.keys(conns.current)) {
       if (!wanted.has(nodeId) || wanted.get(nodeId) !== conns.current[nodeId].key) {
         closeConn(nodeId)
       }
     }
 
-    // Open sockets for new hardware nodes.
+    // Open streams for new hardware nodes.
     for (const [nodeId, key] of wanted) {
       if (!conns.current[nodeId]) {
         conns.current[nodeId] = {
-          ws: null,
+          es: null,
           key,
-          reconnect: null,
-          closedByUs: false,
+          online: false,
           homeSent: false,
           gotoTarget: null,
           commandActive: false,
@@ -190,29 +172,39 @@ export function NodeConnection() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [connectionSig])
 
-  // --- Translate machine intent into commands for connected agents. ---
+  // --- Translate machine intent into commands, sent via the relay. ---
   const intentSig = state.nodes
     .filter((n) => n.driver === "hardware")
     .map((n) => `${n.id}:${n.link}:${n.machine.status}:${n.machine.targetShelf}`)
     .join("|")
 
   useEffect(() => {
+    const post = (node: StorageNode, cmd: NodeCommand) => {
+      void fetch("/api/pi/command", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ip: node.ip, port: node.port, command: cmd }),
+      }).catch(() => {
+        // Delivery failure is surfaced by the lack of a resulting Pi event; the
+        // relay keeps retrying its own socket independently.
+      })
+    }
+
     for (const node of state.nodes) {
       if (node.driver !== "hardware") continue
       const c = conns.current[node.id]
-      if (!c || !c.ws || c.ws.readyState !== WebSocket.OPEN) continue
+      if (!c || !c.online) continue
       const m = node.machine
-      const send = (cmd: NodeCommand) => c.ws?.send(encodeCommand(cmd))
 
       if (m.status === "homing") {
         if (!c.homeSent) {
-          send({ type: "home" })
+          post(node, { type: "home" })
           c.homeSent = true
           c.commandActive = true
         }
       } else if (m.status === "moving") {
         if (m.targetShelf != null && c.gotoTarget !== m.targetShelf) {
-          send({ type: "goto", shelf: m.targetShelf })
+          post(node, { type: "goto", shelf: m.targetShelf })
           c.gotoTarget = m.targetShelf
           c.commandActive = true
         }
@@ -220,7 +212,7 @@ export function NodeConnection() {
         // Reached idle without an arrival/homed (e.g. the user cancelled a
         // job) — make sure the physical motor stops too.
         if (c.commandActive) {
-          send({ type: "stop" })
+          post(node, { type: "stop" })
           c.commandActive = false
         }
         c.homeSent = false
@@ -236,11 +228,8 @@ export function NodeConnection() {
     const map = conns.current
     return () => {
       for (const id of Object.keys(map)) {
-        const c = map[id]
-        c.closedByUs = true
-        if (c.reconnect) clearTimeout(c.reconnect)
         try {
-          c.ws?.close()
+          map[id].es?.close()
         } catch {
           // ignore
         }
