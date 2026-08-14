@@ -20,8 +20,13 @@ export function AddPrinterDialog({ open, onClose }: { open: boolean; onClose: ()
   const [ip, setIp] = useState("")
   const [port, setPort] = useState("7125")
   const [apiKey, setApiKey] = useState("")
+  // Bambu Lab link (MQTT): serial + LAN access code, or cloud mode.
+  const [serial, setSerial] = useState("")
+  const [accessCode, setAccessCode] = useState("")
+  const [bambuMode, setBambuMode] = useState<"lan" | "cloud">("lan")
 
   const atLimit = state.printers.length >= MAX_PRINTERS
+  const isBambu = firmware === "bambu"
 
   function reset() {
     setName("")
@@ -33,6 +38,9 @@ export function AddPrinterDialog({ open, onClose }: { open: boolean; onClose: ()
     setIp("")
     setPort("7125")
     setApiKey("")
+    setSerial("")
+    setAccessCode("")
+    setBambuMode("lan")
   }
 
   function submit() {
@@ -45,14 +53,18 @@ export function AddPrinterDialog({ open, onClose }: { open: boolean; onClose: ()
       amsUnits,
       slotsPerAms,
       toolheads,
-      // Firmware selects which live temps we read (Klipper heater names). Store
-      // it for toolchangers and for any linked printer (so single/AMS printers
-      // can read their nozzle temp too).
-      firmware: kind === "toolchanger" || ip.trim() ? firmware : undefined,
+      // Firmware selects the live-read transport (Klipper heater names over
+      // Moonraker, or Bambu AMS/RFID over MQTT). Store it for toolchangers, any
+      // linked Klipper/Marlin printer, and any Bambu printer.
+      firmware: kind === "toolchanger" || ip.trim() || isBambu ? firmware : undefined,
       loaded: Array.from({ length: count }, () => null),
+      // Bambu LAN also uses the IP; cloud mode doesn't require it.
       ip: ip.trim() || undefined,
-      port: ip.trim() ? Number.parseInt(port) || 7125 : undefined,
-      apiKey: ip.trim() && apiKey.trim() ? apiKey.trim() : undefined,
+      port: !isBambu && ip.trim() ? Number.parseInt(port) || 7125 : undefined,
+      apiKey: !isBambu && ip.trim() && apiKey.trim() ? apiKey.trim() : undefined,
+      serial: isBambu && serial.trim() ? serial.trim() : undefined,
+      accessCode: isBambu && accessCode.trim() ? accessCode.trim() : undefined,
+      bambuMode: isBambu ? bambuMode : undefined,
       link: "offline",
     }
     dispatch({ type: "ADD_PRINTER", printer })
@@ -121,54 +133,108 @@ export function AddPrinterDialog({ open, onClose }: { open: boolean; onClose: ()
               <span className="font-mono font-semibold text-primary">{preview}</span>
             </div>
 
-            <Field label="Printer IP address (optional)">
-              <Input
-                value={ip}
-                onChange={(e) => setIp(e.target.value)}
-                placeholder="e.g. 192.168.1.50"
-                inputMode="decimal"
+            <Field label="Controller firmware (optional)">
+              <Segmented
+                className="w-full [&>button]:flex-1"
+                value={firmware}
+                onChange={(v) => setFirmware(v as PrinterFirmware)}
+                options={[
+                  { value: "klipper", label: "Klipper" },
+                  { value: "marlin", label: "Marlin" },
+                  { value: "bambu", label: "Bambu Lab" },
+                ]}
               />
               <p className="mt-1 text-xs text-muted-foreground">
-                Link the printer to read its live nozzle temperature. You can add or change this later. Leave blank if
-                your printer can&apos;t be linked.
+                {isBambu
+                  ? "Bambu printers link over MQTT to read live AMS spools and RFID tags."
+                  : "Klipper links over Moonraker for live nozzle temperatures. Leave the fields blank to skip linking."}
               </p>
             </Field>
 
-            {ip.trim() && (
-              <div className="grid grid-cols-2 gap-4 rounded-lg border border-border bg-background/40 p-3">
-                <Field label="Controller firmware" className="col-span-2">
+            {isBambu ? (
+              <div className="space-y-4 rounded-lg border border-border bg-background/40 p-3">
+                <Field label="Connection">
                   <Segmented
                     className="w-full [&>button]:flex-1"
-                    value={firmware}
-                    onChange={(v) => setFirmware(v as PrinterFirmware)}
+                    value={bambuMode}
+                    onChange={(v) => setBambuMode(v as "lan" | "cloud")}
                     options={[
-                      { value: "klipper", label: "Klipper" },
-                      { value: "marlin", label: "Marlin" },
+                      { value: "lan", label: "LAN (local)" },
+                      { value: "cloud", label: "Cloud" },
                     ]}
                   />
-                  <p className="mt-1 text-xs text-muted-foreground">
-                    Live nozzle temperatures are read over Moonraker, so choose Klipper to see them.
-                  </p>
                 </Field>
-                <Field label="Moonraker port">
+                <Field label="Serial number">
                   <Input
-                    value={port}
-                    onChange={(e) => setPort(e.target.value)}
-                    placeholder="7125"
-                    inputMode="numeric"
+                    value={serial}
+                    onChange={(e) => setSerial(e.target.value)}
+                    placeholder="e.g. 01P00A1234567890"
+                    spellCheck={false}
+                    className="font-mono"
                   />
                 </Field>
-                <Field label="API key (optional)">
+                <Field label="Access code">
                   <Input
-                    value={apiKey}
-                    onChange={(e) => setApiKey(e.target.value)}
-                    placeholder="Only if required"
+                    value={accessCode}
+                    onChange={(e) => setAccessCode(e.target.value)}
+                    placeholder="8-digit code from the printer screen"
+                    spellCheck={false}
+                    className="font-mono"
                   />
                 </Field>
-                <p className="col-span-2 text-xs text-muted-foreground">
-                  For Klipper/Mainsail the default port is 7125 and no key is needed on a trusted LAN.
+                {bambuMode === "lan" && (
+                  <Field label="Printer IP address">
+                    <Input
+                      value={ip}
+                      onChange={(e) => setIp(e.target.value)}
+                      placeholder="e.g. 192.168.1.50"
+                      inputMode="decimal"
+                    />
+                  </Field>
+                )}
+                <p className="text-xs text-muted-foreground">
+                  Find the access code and serial under Settings → WLAN / Device on the printer. Real AMS reads work when
+                  the app is self-hosted on the printer&apos;s network; the preview shows simulated trays.
                 </p>
               </div>
+            ) : (
+              <>
+                <Field label="Printer IP address (optional)">
+                  <Input
+                    value={ip}
+                    onChange={(e) => setIp(e.target.value)}
+                    placeholder="e.g. 192.168.1.50"
+                    inputMode="decimal"
+                  />
+                  <p className="mt-1 text-xs text-muted-foreground">
+                    Link the printer to read its live nozzle temperature. You can add or change this later. Leave blank
+                    if your printer can&apos;t be linked.
+                  </p>
+                </Field>
+
+                {ip.trim() && (
+                  <div className="grid grid-cols-2 gap-4 rounded-lg border border-border bg-background/40 p-3">
+                    <Field label="Moonraker port">
+                      <Input
+                        value={port}
+                        onChange={(e) => setPort(e.target.value)}
+                        placeholder="7125"
+                        inputMode="numeric"
+                      />
+                    </Field>
+                    <Field label="API key (optional)">
+                      <Input
+                        value={apiKey}
+                        onChange={(e) => setApiKey(e.target.value)}
+                        placeholder="Only if required"
+                      />
+                    </Field>
+                    <p className="col-span-2 text-xs text-muted-foreground">
+                      For Klipper/Mainsail the default port is 7125 and no key is needed on a trusted LAN.
+                    </p>
+                  </div>
+                )}
+              </>
             )}
           </div>
         )}

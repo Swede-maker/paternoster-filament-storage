@@ -34,7 +34,84 @@ export interface Spool {
    * bare spool with no container.
    */
   containerId?: string
+  /**
+   * Material density (g/cm³) used to convert firmware-reported filament length
+   * into consumed mass for live weight tracking. Defaults from the material
+   * (see `densityFor`) when absent.
+   */
+  density?: number
+  /**
+   * Filament diameter (mm). Affects the length→mass conversion. Defaults to
+   * 1.75mm (see `Settings.defaultDiameter`) when absent.
+   */
+  diameter?: number
+  /**
+   * RFID tag UID (e.g. a Bambu AMS `tray_uuid`). Used to recognise a spool that
+   * has already been auto-created from an AMS tray so it isn't duplicated.
+   */
+  rfidUid?: string
+  /** Scanned barcode string associated with this spool, if any. */
+  barcode?: string
+  /**
+   * Optional "dry this filament" reminder. When set, an alert surfaces once
+   * `setAt + days` has passed. The user can reset it (restart the countdown from
+   * now) or clear it entirely. Absent = no reminder.
+   */
+  dryReminder?: DryReminder
   createdAt: number
+}
+
+/** A per-spool reminder to dry the filament after a number of days. */
+export interface DryReminder {
+  /** When the countdown started (ms epoch). Reset updates this to "now". */
+  setAt: number
+  /** Number of days after `setAt` before the dry alert becomes due. */
+  days: number
+}
+
+/**
+ * A reusable filament profile: a saved bundle of spool attributes the user can
+ * quickly apply when creating a new spool or preparing an incoming order. Stored
+ * on `Settings.filamentProfiles`.
+ */
+export interface FilamentProfile {
+  id: string
+  name: string
+  material: FilamentMaterial
+  brand: string
+  color: string
+  colorName: string
+  /** Full-spool weight (g) to seed a new spool with. */
+  capacity: number
+  nozzleTemp?: number
+  density?: number
+  diameter?: number
+  containerId?: string
+}
+
+/** A single line item in an incoming filament order / cart. */
+export interface OrderItem {
+  id: string
+  material: FilamentMaterial
+  brand: string
+  color: string
+  colorName: string
+  capacity: number
+  nozzleTemp?: number
+  density?: number
+  diameter?: number
+  containerId?: string
+  /** How many spools of this item are in the order. */
+  quantity: number
+}
+
+/** A named incoming order / shopping cart of filament to receive into storage. */
+export interface FilamentOrder {
+  id: string
+  /** Cart name, e.g. "Amazon", "Prusa restock". */
+  name: string
+  createdAt: number
+  items: OrderItem[]
 }
 
 /**
@@ -89,12 +166,25 @@ export interface Printer {
   port?: number
   /** Optional Moonraker API key (X-Api-Key) when the instance requires one. */
   apiKey?: string
+  /**
+   * Bambu Lab only: printer serial number. Required (with `accessCode`) to read
+   * AMS / RFID data over MQTT.
+   */
+  serial?: string
+  /** Bambu Lab only: LAN access code shown on the printer screen. */
+  accessCode?: string
+  /** Bambu Lab only: connect over the local network ("lan") or cloud ("cloud"). */
+  bambuMode?: "lan" | "cloud"
   /** Live connection state for the optional printer link. */
   link?: PrinterLinkStatus
 }
 
-/** 3D-printer controller firmware families we can generate preheat commands for. */
-export type PrinterFirmware = "marlin" | "klipper"
+/**
+ * 3D-printer controller firmware families. Marlin/Klipper get generated preheat
+ * commands; Klipper (Moonraker) and Bambu (MQTT) additionally support live reads
+ * of temperature, filament usage, and — for Bambu — AMS tray / RFID data.
+ */
+export type PrinterFirmware = "marlin" | "klipper" | "bambu"
 
 export type PrinterLinkStatus = "offline" | "checking" | "online"
 
@@ -178,6 +268,17 @@ export interface Settings {
    * during balance calculations. Optional for backwards-compat with old saves.
    */
   containers?: Container[]
+  /**
+   * Default filament diameter (mm) for new spools. Defaults to 1.75 when absent.
+   * Affects the length→mass conversion used for live weight tracking.
+   */
+  defaultDiameter?: number
+  /** Saved filament profiles the user can quickly apply. */
+  filamentProfiles?: FilamentProfile[]
+  /** Scanned-barcode → saved-profile mappings, so a scan can prefill a spool. */
+  barcodes?: { code: string; profileId: string }[]
+  /** Incoming filament orders / carts waiting to be received into storage. */
+  orders?: FilamentOrder[]
 }
 
 export interface StorageConfig {
@@ -197,8 +298,12 @@ export interface StorageConfig {
  * - "paternoster": an automated vertical carousel driven by a controller.
  * - "shelf": a plain manual shelving unit with no hardware/automation — the
  *   user retrieves spools by hand; the app just tracks what's where.
+ * - "library": an unbounded, manual inventory of spools with no fixed grid.
+ *   Spools accumulate in a single auto-growing row and are surfaced through a
+ *   filterable/sortable list rather than physical shelf/slot positions. Used to
+ *   catalog what filament the user owns; has no hardware/automation.
  */
-export type NodeType = "paternoster" | "shelf"
+export type NodeType = "paternoster" | "shelf" | "library"
 
 /** Per-shelf metadata (name + physical area). Index-aligned to the shelves. */
 export interface ShelfMeta {
@@ -277,6 +382,46 @@ export interface StorageNode {
   machine: Machine
 }
 
+/**
+ * A single filament-history event. Every load, unload, placement, move,
+ * removal, and dry-reminder change is logged here. Identity fields (material,
+ * brand, color, colorName) are SNAPSHOTTED at log time so the entry stays
+ * readable even after the spool is edited or deleted.
+ */
+export type HistoryEventKind =
+  | "load" // spool loaded onto a printer
+  | "unload" // spool removed from a printer
+  | "placed" // spool placed into a storage location (place / move / store)
+  | "removed" // spool deleted from the system
+  | "dry-set" // a dry reminder was created
+  | "dry-reset" // a dry reminder countdown was restarted
+  | "dry-cleared" // a dry reminder was deleted
+
+export interface HistoryEvent {
+  id: string
+  /** When it happened (ms epoch). */
+  at: number
+  kind: HistoryEventKind
+  spoolId: string
+  /** Snapshot of the spool identity at the time of the event. */
+  material: string
+  brand: string
+  color: string
+  colorName: string
+  /** Printer context (load / unload). */
+  printerId?: string
+  printerName?: string
+  /** Slot label on the printer, e.g. "T1" or "1-2". */
+  slotLabel?: string
+  /** Storage context (placed). */
+  nodeId?: string
+  nodeName?: string
+  /** Human location within the unit, e.g. "Shelf 2 · Slot 3" or "Library". */
+  locationLabel?: string
+  /** Days configured (dry-set / dry-reset). */
+  days?: number
+}
+
 export interface AppState {
   /** Whether first-run setup has been completed. */
   configured: boolean
@@ -290,6 +435,8 @@ export interface AppState {
   printers: Printer[]
   activePrinterId: string | null
   job: ActiveJob | null
+  /** Filament usage/movement log, newest first, capped in the reducer. */
+  history: HistoryEvent[]
 }
 
 /**
@@ -306,4 +453,6 @@ export interface PersistedState {
   activeNodeId: string
   printers: Printer[]
   activePrinterId: string | null
+  /** Filament usage/movement log (shared + synced across devices). */
+  history: HistoryEvent[]
 }

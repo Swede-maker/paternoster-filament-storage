@@ -177,7 +177,15 @@ export function bestSlotForNode(
   exclude: StorageLocation[] = [],
   containers: Container[] = [],
 ): StorageLocation | null {
-  if ((node.type ?? "paternoster") === "shelf") return firstEmptySlot(node, exclude)
+  const type = node.type ?? "paternoster"
+  // A library is an unbounded single row, so a placement always appends to the
+  // end. Each already-queued placement (`exclude`) also appends, so offset past
+  // them to keep queued slot indices distinct.
+  if (type === "library") {
+    const base = node.slots[0]?.length ?? 0
+    return { shelf: 0, slot: base + exclude.length }
+  }
+  if (type === "shelf") return firstEmptySlot(node, exclude)
   return bestBalancedSlot(node, spools, grams, exclude, containers)
 }
 
@@ -196,6 +204,10 @@ export function bestNodeSlot(
   let best: { nodeId: string; shelf: number; slot: number } | null = null
   let bestScore = Number.POSITIVE_INFINITY
   for (const node of nodes) {
+    // A library is a manual catalog with no balancing role, so auto-placement
+    // (find-best-slot across the pool) never spills into it — spools only enter
+    // a library when the user explicitly targets it.
+    if ((node.type ?? "paternoster") === "library") continue
     const exclude = reserved.filter((r) => r.nodeId === node.id).map((r) => ({ shelf: r.shelf, slot: r.slot }))
     const slot = bestSlotForNode(node, spools, grams, exclude, containers)
     if (!slot) continue

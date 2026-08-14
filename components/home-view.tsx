@@ -1,7 +1,7 @@
 "use client"
 
 import { useState } from "react"
-import { Boxes, Package, PackagePlus, Server, Loader2, MapPin } from "lucide-react"
+import { Boxes, Package, Plus, Server, Loader2, MapPin } from "lucide-react"
 import { useStore } from "@/lib/store"
 import { useFlow, type NodeLocation } from "./flow-controller"
 import { Button } from "./ui/button"
@@ -10,10 +10,12 @@ import { ManualControl } from "./manual-control"
 import { StatsBar } from "./stats-bar"
 import { CarouselView } from "./carousel-view"
 import { ShelfStorageView } from "./shelf-storage-view"
+import { LibraryView } from "./library-view"
 import { PrinterPanel } from "./printer-panel"
 import { QueueTray } from "./queue-tray"
 import { PickBrowser } from "./pick-browser"
 import { PlaceDialog } from "./place-dialog"
+import { LibraryAddDialog } from "./library-add-dialog"
 import { SlotActionDialog } from "./slot-action-dialog"
 import { UnloadDialog } from "./unload-dialog"
 import { NewSpoolDialog } from "./new-spool-dialog"
@@ -34,6 +36,8 @@ export function HomeView() {
   const [pickTarget, setPickTarget] = useState<{ printer: Printer; slot: number } | null>(null)
   const [browserOpen, setBrowserOpen] = useState(false)
   const [placeOpen, setPlaceOpen] = useState(false)
+  // "Add filament to library" dialog (library nodes only — instant catalog add).
+  const [libraryAddOpen, setLibraryAddOpen] = useState(false)
   const [newSpoolOpen, setNewSpoolOpen] = useState(false)
   const [slotPickerOpen, setSlotPickerOpen] = useState(false)
   const [slotPickerMode, setSlotPickerMode] = useState<"empty" | "loaded">("empty")
@@ -56,6 +60,10 @@ export function HomeView() {
 
   const currentNode = activeNode(state)
   const isShelf = (currentNode.type ?? "paternoster") === "shelf"
+  const isLibrary = (currentNode.type ?? "paternoster") === "library"
+  // Both shelf and library are manual (no motor); the carousel chrome + auto
+  // "place" button are paternoster-only.
+  const isManual = isShelf || isLibrary
 
   const loadablePrinters = state.printers.filter((p) => p.loaded.some((s) => s == null))
   // Printers that currently have at least one loaded spool — the ones "Take out
@@ -232,8 +240,9 @@ export function HomeView() {
       {/* Left sidebar. Manual shelf storage has no carousel to navigate and shows
           every shelf full-width in the main column, so the sidebar (overview +
           controls + summary) is paternoster-only — dropping it lets the shelf
-          grid and printer panel reclaim the full width. */}
-      {!isShelf && (
+          grid and printer panel reclaim the full width. Library storage is also
+          manual and full-width, so it hides the sidebar too. */}
+      {!isManual && (
         <aside className="flex w-full shrink-0 flex-col rounded-2xl border border-border bg-panel lg:w-[300px] lg:min-h-0">
           <SidebarHeader />
           <ShelfOverview />
@@ -250,9 +259,11 @@ export function HomeView() {
           <div className="flex flex-wrap items-center gap-2" role="tablist" aria-label="Storage units">
             {state.nodes.map((n) => {
               const active = n.id === state.activeNodeId
-              const nodeIsShelf = (n.type ?? "paternoster") === "shelf"
-              const busy = !nodeIsShelf && n.machine.status === "moving"
-              const Icon = nodeIsShelf ? Package : Server
+              const nodeType = n.type ?? "paternoster"
+              const nodeIsShelf = nodeType === "shelf"
+              const nodeIsLibrary = nodeType === "library"
+              const busy = nodeType === "paternoster" && n.machine.status === "moving"
+              const Icon = nodeIsLibrary ? Boxes : nodeIsShelf ? Package : Server
               return (
                 <button
                   key={n.id}
@@ -276,7 +287,7 @@ export function HomeView() {
                     </span>
                   ) : (
                     <span className="text-[10px] uppercase tracking-wide text-muted-foreground">
-                      {nodeIsShelf ? "shelf" : n.role}
+                      {nodeIsLibrary ? "library" : nodeIsShelf ? "shelf" : n.role}
                     </span>
                   )}
                   {busy && <Loader2 className="h-3.5 w-3.5 animate-spin text-primary" />}
@@ -286,20 +297,41 @@ export function HomeView() {
           </div>
         )}
 
-        {/* Place-new action. On manual shelf storage you place a spool by tapping
-            the exact slot you want, so the auto-placement button is paternoster-only. */}
-        <div className="flex flex-col gap-2 lg:flex-row lg:items-center lg:justify-between">
-          <p className="text-sm text-muted-foreground">
-            {jobTarget ? "Operation in progress — follow the on-screen prompts." : "Tap a slot to manage filament."}
+        {/* Place-new action. A big "+" button appears on every unit type. On a
+            library it opens the instant catalog-add dialog; on a paternoster or
+            shelf it opens the "Place new filament" flow, which auto-picks the
+            destination slot (balanced for a carousel, lowest-empty for a shelf). */}
+        <div className="flex items-center justify-between gap-3">
+          <p className="text-sm text-muted-foreground text-pretty">
+            {jobTarget
+              ? "Operation in progress — follow the on-screen prompts."
+              : isLibrary
+                ? "Filter and sort your inventory, or tap + to add a new spool."
+                : "Tap a slot to manage filament, or tap + to add a new spool."}
           </p>
-          {!isShelf && (
-            <Button className="w-full lg:w-auto" onClick={() => setPlaceOpen(true)} disabled={!!state.job}>
-              <PackagePlus className="h-4 w-4" /> Place new filament in storage
-            </Button>
-          )}
+          <Button
+            size="icon"
+            aria-label={isLibrary ? "Add filament to library" : "Place new filament in storage"}
+            title={isLibrary ? "Add filament to library" : "Place new filament in storage"}
+            className="h-12 w-12 shrink-0 rounded-xl shadow-sm"
+            onClick={() => (isLibrary ? setLibraryAddOpen(true) : setPlaceOpen(true))}
+            disabled={!!state.job}
+          >
+            <Plus className="h-7 w-7" strokeWidth={2.5} />
+            <span className="sr-only">{isLibrary ? "Add filament to library" : "Place new filament in storage"}</span>
+          </Button>
         </div>
 
-        {isShelf ? (
+        {isLibrary ? (
+          <LibraryView
+            onAddClick={() => setLibraryAddOpen(true)}
+            onSpoolClick={(slot) => {
+              if (state.job) return
+              setSlotTarget({ shelf: 0, slot })
+            }}
+            highlight={jobTarget && jobTarget.shelf === 0 ? jobTarget.slot : null}
+          />
+        ) : isShelf ? (
           <ShelfStorageView
             onSlotClick={(shelf, slot) => {
               if (state.job) return // don't open slot editor during an active operation
@@ -430,6 +462,8 @@ export function HomeView() {
       />
 
       <PlaceDialog open={placeOpen} onClose={() => setPlaceOpen(false)} />
+
+      <LibraryAddDialog open={libraryAddOpen} onClose={() => setLibraryAddOpen(false)} nodeId={currentNode.id} />
 
       {/* Manual shelf placement: drop a queued spool into a tapped empty slot,
           or create a new one for it while the rest keep waiting. */}

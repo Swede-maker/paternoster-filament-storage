@@ -1,7 +1,7 @@
 "use client"
 
 import { useEffect, useState } from "react"
-import { PackageMinus, Archive, Trash2, Server, Package, MapPin } from "lucide-react"
+import { PackageMinus, Archive, Trash2, Server, Package, Library, MapPin } from "lucide-react"
 import { useStore } from "@/lib/store"
 import { printerSlotLabel } from "@/lib/selectors"
 import { nodeFreeSlots } from "@/lib/balance"
@@ -43,22 +43,34 @@ export function UnloadDialog({
   const [containerId, setContainerId] = useState<string>("")
   const containers = state.settings.containers ?? []
 
-  // Units that still have room, with a friendly capacity/label for each.
-  const options = state.nodes.map((n) => ({
-    node: n,
-    free: nodeFreeSlots(n),
-    isShelf: (n.type ?? "paternoster") === "shelf",
-  }))
-  const hasRoom = options.filter((o) => o.free > 0)
+  // Units that still have room, with a friendly capacity/label for each. A
+  // library is an unbounded catalog, so it always has room (never "Full") no
+  // matter how many spools it already holds.
+  const options = state.nodes.map((n) => {
+    const type = n.type ?? "paternoster"
+    const isLibrary = type === "library"
+    return {
+      node: n,
+      free: nodeFreeSlots(n),
+      unbounded: isLibrary,
+      isShelf: type === "shelf",
+      isLibrary,
+    }
+  })
+  const hasRoom = options.filter((o) => o.unbounded || o.free > 0)
   const storageFull = hasRoom.length === 0
 
   useEffect(() => {
     if (!target) return
     setGrams(String(Math.round(target.spool.grams)))
-    // Prefer the active unit if it has room, otherwise the first unit that does.
+    // A library never fills up; fixed grids need a free slot. Prefer the active
+    // unit (the section the user is on) when it has room, else the first unit
+    // that does.
+    const roomFor = (n: (typeof state.nodes)[number]) =>
+      (n.type ?? "paternoster") === "library" || nodeFreeSlots(n) > 0
     const active = state.nodes.find((n) => n.id === state.activeNodeId)
-    const activeHasRoom = active && nodeFreeSlots(active) > 0
-    const firstWithRoom = state.nodes.find((n) => nodeFreeSlots(n) > 0)
+    const activeHasRoom = active && roomFor(active)
+    const firstWithRoom = state.nodes.find(roomFor)
     setDestNodeId(activeHasRoom ? active!.id : firstWithRoom?.id ?? "")
     // Seed the container from whatever the spool was in; still valid only if that
     // container still exists in settings, otherwise fall back to "none".
@@ -121,10 +133,10 @@ export function UnloadDialog({
         {!placing && options.length > 1 && (
           <Field label="Store in">
             <div className="grid gap-2 sm:grid-cols-2">
-              {options.map(({ node, free, isShelf }) => {
+              {options.map(({ node, free, isShelf, isLibrary }) => {
                 const selected = node.id === destNodeId
-                const full = free === 0
-                const Icon = isShelf ? Package : Server
+                const full = !isLibrary && free === 0
+                const Icon = isLibrary ? Library : isShelf ? Package : Server
                 return (
                   <button
                     key={node.id}
@@ -150,9 +162,11 @@ export function UnloadDialog({
                             <span aria-hidden>·</span>
                           </>
                         )}
-                        {isShelf ? "Shelf" : "Paternoster"}
+                        {isLibrary ? "Library" : isShelf ? "Shelf" : "Paternoster"}
                       </span>
-                      <span className="text-[11px] text-muted-foreground">{full ? "Full" : `${free} free`}</span>
+                      <span className="text-[11px] text-muted-foreground">
+                        {isLibrary ? "Unlimited" : full ? "Full" : `${free} free`}
+                      </span>
                     </span>
                   </button>
                 )

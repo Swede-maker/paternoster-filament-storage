@@ -1,10 +1,11 @@
 "use client"
 
-import { Home, Settings } from "lucide-react"
+import { Home, Settings, ShoppingCart, History } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { useStore } from "@/lib/store"
+import { dueReminders } from "@/lib/selectors"
 
-export type NavTab = "home" | "settings"
+export type NavTab = "home" | "orders" | "history" | "settings"
 
 export function BottomNav({
   tab,
@@ -15,8 +16,14 @@ export function BottomNav({
 }) {
   const { state } = useStore()
 
-  const items: { id: NavTab; label: string; icon: typeof Home }[] = [
+  const orderCount = (state.settings.orders ?? []).length
+  // Surface overdue dry reminders as an alert badge on the History tab.
+  const dueCount = dueReminders(state).length
+
+  const items: { id: NavTab; label: string; icon: typeof Home; badge?: number; alert?: boolean }[] = [
     { id: "home", label: "Home", icon: Home },
+    { id: "orders", label: "Orders", icon: ShoppingCart, badge: orderCount || undefined },
+    { id: "history", label: "History", icon: History, badge: dueCount || undefined, alert: dueCount > 0 },
     { id: "settings", label: "Settings", icon: Settings },
   ]
 
@@ -37,7 +44,7 @@ export function BottomNav({
       </div>
 
       <nav className="flex items-center gap-1">
-        {items.map(({ id, label, icon: Icon }) => {
+        {items.map(({ id, label, icon: Icon, badge, alert }) => {
           const active = tab === id
           return (
             <button
@@ -45,16 +52,29 @@ export function BottomNav({
               type="button"
               onClick={() => onChange(id)}
               className={cn(
-                "flex items-center gap-2 rounded-lg px-4 py-1.5 text-sm font-medium transition-colors",
+                "relative flex items-center gap-2 rounded-lg px-4 py-1.5 text-sm font-medium transition-colors",
                 active
                   ? "text-primary"
                   : "text-muted-foreground hover:text-foreground",
               )}
               aria-current={active ? "page" : undefined}
             >
-              <Icon className="h-4 w-4" />
+              <span className="relative">
+                <Icon className="h-4 w-4" />
+                {badge ? (
+                  <span
+                    className={cn(
+                      "absolute -right-2 -top-2 flex h-4 min-w-4 items-center justify-center rounded-full px-1 text-[10px] font-semibold leading-none",
+                      alert
+                        ? "bg-warning text-background"
+                        : "bg-primary text-primary-foreground",
+                    )}
+                  >
+                    {badge}
+                  </span>
+                ) : null}
+              </span>
               {label}
-              {active && <span className="ml-1 h-0.5 w-full" />}
             </button>
           )
         })}

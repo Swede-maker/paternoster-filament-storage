@@ -25,12 +25,14 @@ export function NewSpoolDialog({
   onConfirm: (draft: SpoolDraft) => void
 }) {
   const { state } = useStore()
-  const [draft, setDraft] = useState<SpoolDraft>(emptyDraft(state.settings.defaultSpoolWeight))
+  const [draft, setDraft] = useState<SpoolDraft>(
+    emptyDraft(state.settings.defaultSpoolWeight, state.settings.defaultDiameter),
+  )
 
   // Reset the form each time the dialog opens.
   useEffect(() => {
-    if (open) setDraft(emptyDraft(state.settings.defaultSpoolWeight))
-  }, [open, state.settings.defaultSpoolWeight])
+    if (open) setDraft(emptyDraft(state.settings.defaultSpoolWeight, state.settings.defaultDiameter))
+  }, [open, state.settings.defaultSpoolWeight, state.settings.defaultDiameter])
 
   function submit() {
     onConfirm(draft)
@@ -49,7 +51,7 @@ export function NewSpoolDialog({
         }
       />
       <DialogBody>
-        <SpoolForm value={draft} onChange={setDraft} />
+        <SpoolForm value={draft} onChange={setDraft} showProfiles showBarcode />
       </DialogBody>
       <DialogFooter>
         <Button variant="ghost" onClick={onClose}>

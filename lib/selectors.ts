@@ -238,3 +238,28 @@ export function printerSlotLabel(
   const slot = (index % printer.slotsPerAms) + 1
   return `${unit}-${slot}`
 }
+
+// ---------------------------------------------------------------------------
+// Dry reminders
+// ---------------------------------------------------------------------------
+
+const DAY_MS = 86_400_000
+
+/** When a spool's dry reminder becomes due (ms epoch), or null if none set. */
+export function reminderDueAt(spool: Spool): number | null {
+  if (!spool.dryReminder) return null
+  return spool.dryReminder.setAt + spool.dryReminder.days * DAY_MS
+}
+
+/** Whether a spool's dry reminder is currently due (overdue to dry). */
+export function isReminderDue(spool: Spool, now: number = Date.now()): boolean {
+  const due = reminderDueAt(spool)
+  return due !== null && now >= due
+}
+
+/** Every spool whose dry reminder is due right now, most overdue first. */
+export function dueReminders(state: AppState, now: number = Date.now()): Spool[] {
+  return Object.values(state.spools)
+    .filter((s) => isReminderDue(s, now))
+    .sort((a, b) => (reminderDueAt(a) ?? 0) - (reminderDueAt(b) ?? 0))
+}

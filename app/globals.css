@@ -39,9 +39,60 @@
   --radius-xl: calc(var(--radius) + 4px);
 }
 
+/*
+ * Light theme is the default palette on :root. The dark theme (the original
+ * control-panel look) lives under .dark and is applied per-device via a
+ * localStorage-backed toggle (see lib/use-theme.ts + the no-flash script in
+ * layout.tsx). Both share the same signature blue accent.
+ */
 :root {
-  color-scheme: dark;
+  color-scheme: light;
   --radius: 0.75rem;
+
+  /* Clean off-white base with the same cool blue undertone */
+  --background: oklch(0.98 0.004 255);
+  --foreground: oklch(0.22 0.02 255);
+
+  --card: oklch(1 0 0);
+  --card-foreground: oklch(0.22 0.02 255);
+
+  /* Slightly tinted raised panels (sidebar, bottom rack) */
+  --panel: oklch(0.965 0.006 255);
+  --panel-foreground: oklch(0.22 0.02 255);
+
+  --popover: oklch(1 0 0);
+  --popover-foreground: oklch(0.22 0.02 255);
+
+  /* Signature blue accent, deepened for contrast on white */
+  --primary: oklch(0.55 0.17 250);
+  --primary-foreground: oklch(0.99 0.002 255);
+
+  --secondary: oklch(0.94 0.008 255);
+  --secondary-foreground: oklch(0.24 0.02 255);
+
+  --muted: oklch(0.95 0.006 255);
+  --muted-foreground: oklch(0.5 0.02 255);
+
+  --accent: oklch(0.9 0.035 250);
+  --accent-foreground: oklch(0.28 0.05 250);
+
+  --destructive: oklch(0.58 0.22 25);
+  --destructive-foreground: oklch(0.99 0 0);
+
+  --success: oklch(0.6 0.15 155);
+  --warning: oklch(0.68 0.15 75);
+
+  --border: oklch(0.88 0.01 255);
+  --input: oklch(0.91 0.01 255);
+  --ring: oklch(0.55 0.17 250);
+
+  /* Empty carousel slot styling */
+  --slot: oklch(0.94 0.006 255);
+  --slot-ring: oklch(0.83 0.012 255);
+}
+
+.dark {
+  color-scheme: dark;
 
   /* Near-black control panel base with a cool blue undertone */
   --background: oklch(0.16 0.012 255);

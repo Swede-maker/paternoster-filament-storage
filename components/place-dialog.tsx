@@ -16,14 +16,19 @@ import { getStats } from "@/lib/selectors"
 export function PlaceDialog({ open, onClose }: { open: boolean; onClose: () => void }) {
   const { state } = useStore()
   const { startPlace } = useFlow()
-  const [draft, setDraft] = useState<SpoolDraft>(emptyDraft(state.settings.defaultSpoolWeight))
+  const [draft, setDraft] = useState<SpoolDraft>(
+    emptyDraft(state.settings.defaultSpoolWeight, state.settings.defaultDiameter),
+  )
 
   const stats = getStats(state)
   const full = stats.emptySlots === 0
+  const qty = Math.max(1, Math.round(draft.quantity ?? 1))
 
   function submit() {
-    startPlace(draft)
-    setDraft(emptyDraft(state.settings.defaultSpoolWeight))
+    // Default the destination to the unit the user is currently viewing; they
+    // can still redirect each queued spool from the queue tray.
+    startPlace(draft, state.activeNodeId)
+    setDraft(emptyDraft(state.settings.defaultSpoolWeight, state.settings.defaultDiameter))
     onClose()
   }
 
@@ -40,7 +45,7 @@ export function PlaceDialog({ open, onClose }: { open: boolean; onClose: () => v
             Storage is full. Remove a spool before adding a new one.
           </p>
         ) : (
-          <SpoolForm value={draft} onChange={setDraft} />
+          <SpoolForm value={draft} onChange={setDraft} showProfiles showQuantity showBarcode />
         )}
       </DialogBody>
       <DialogFooter>
@@ -48,7 +53,7 @@ export function PlaceDialog({ open, onClose }: { open: boolean; onClose: () => v
           Cancel
         </Button>
         <Button onClick={submit} disabled={full}>
-          Find best slot
+          {qty > 1 ? `Find ${qty} slots` : "Find best slot"}
         </Button>
       </DialogFooter>
     </Dialog>

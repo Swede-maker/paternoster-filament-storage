@@ -1,7 +1,7 @@
 "use client"
 
 import type { NodeType, ShelfMeta, StorageConfig } from "@/lib/types"
-import { Boxes, LayoutGrid, Package, SlidersHorizontal } from "lucide-react"
+import { Boxes, LayoutGrid, Library, Package, SlidersHorizontal } from "lucide-react"
 import { Field, Input } from "./ui/field"
 
 /**
@@ -23,18 +23,21 @@ export interface StorageDraft {
 }
 
 // Paternosters are physical carousels: modest, uniform shelves. Manual shelf
-// units can be much larger and irregular.
+// units can be much larger and irregular. A library has no physical grid — it's
+// an unbounded flat list — so its "limits" are nominal and never surfaced.
 export const LIMITS = {
   paternoster: { shelves: 40, slots: 20 },
   shelf: { shelves: 10, slots: 100 },
+  library: { shelves: 1, slots: 1 },
 }
 
 export const clampInt = (v: number, min: number, max: number) =>
   Math.max(min, Math.min(max, Math.floor(Number.isFinite(v) ? v : min)))
 
 export function makeDraft(nodeType: NodeType): StorageDraft {
-  const shelves = nodeType === "shelf" ? 3 : 9
-  const slotsPerShelf = nodeType === "shelf" ? 10 : 8
+  // A library has no configurable grid, so its shelf/slot values are nominal.
+  const shelves = nodeType === "library" ? 1 : nodeType === "shelf" ? 3 : 9
+  const slotsPerShelf = nodeType === "library" ? 1 : nodeType === "shelf" ? 10 : 8
   return {
     nodeType,
     name: "",
@@ -55,7 +58,8 @@ export function draftFromNode(node: {
   shelfMeta?: ShelfMeta[]
   slots: (string | null)[][]
 }): StorageDraft {
-  const nodeType: NodeType = node.type === "shelf" ? "shelf" : "paternoster"
+  const nodeType: NodeType =
+    node.type === "shelf" ? "shelf" : node.type === "library" ? "library" : "paternoster"
   const counts = node.slots.map((row) => row.length)
   const jagged = counts.some((c) => c !== counts[0])
   return {
@@ -113,6 +117,12 @@ const TYPES: { type: NodeType; title: string; blurb: string; icon: typeof Boxes 
     blurb: "Plain manual shelving — no hardware. The app just tracks what filament sits where.",
     icon: Package,
   },
+  {
+    type: "library",
+    title: "Library",
+    blurb: "Unbounded catalog of everything you own. No fixed slots — just filter and sort your inventory.",
+    icon: Library,
+  },
 ]
 
 export function StorageLayoutEditor({
@@ -126,6 +136,7 @@ export function StorageLayoutEditor({
 }) {
   const limit = LIMITS[draft.nodeType]
   const isShelf = draft.nodeType === "shelf"
+  const isLibrary = draft.nodeType === "library"
   const total = draft.jagged
     ? draft.perShelf.slice(0, draft.shelves).reduce((s, p) => s + clampInt(p.slots, 1, limit.slots), 0)
     : draft.shelves * draft.slotsPerShelf
@@ -191,11 +202,11 @@ export function StorageLayoutEditor({
       )}
 
       <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
-        <Field label={isShelf ? "Storage name" : "System name"}>
+        <Field label={isLibrary ? "Library name" : isShelf ? "Storage name" : "System name"}>
           <Input
             value={draft.name}
             onChange={(e) => update({ name: e.target.value })}
-            placeholder={isShelf ? "e.g. Garage rack" : "e.g. Workshop PAX"}
+            placeholder={isLibrary ? "e.g. Filament stash" : isShelf ? "e.g. Garage rack" : "e.g. Workshop PAX"}
           />
         </Field>
         <Field label={isShelf ? "Area / location" : "Where it stands (area)"}>
@@ -207,42 +218,51 @@ export function StorageLayoutEditor({
         </Field>
       </div>
 
-      <div className="grid grid-cols-2 gap-4">
-        <Field label={`Number of shelves (1–${limit.shelves})`}>
-          <Input
-            type="number"
-            inputMode="numeric"
-            min={1}
-            max={limit.shelves}
-            value={draft.shelves}
-            onChange={(e) => setShelves(Number.parseInt(e.target.value) || 1)}
-          />
-        </Field>
-        <Field label={`Slots per shelf (1–${limit.slots})`}>
-          <Input
-            type="number"
-            inputMode="numeric"
-            min={1}
-            max={limit.slots}
-            value={draft.slotsPerShelf}
-            disabled={draft.jagged}
-            onChange={(e) => setSlotsPerShelf(Number.parseInt(e.target.value) || 1)}
-          />
-        </Field>
-      </div>
+      {isLibrary ? (
+        <p className="rounded-xl border border-border bg-background/50 p-3 text-sm text-muted-foreground text-pretty">
+          A library has no fixed shelves or slots — it holds as many spools as you add. Manage its contents from the
+          Home screen, where you can filter and sort the whole collection.
+        </p>
+      ) : (
+        <>
+          <div className="grid grid-cols-2 gap-4">
+            <Field label={`Number of shelves (1–${limit.shelves})`}>
+              <Input
+                type="number"
+                inputMode="numeric"
+                min={1}
+                max={limit.shelves}
+                value={draft.shelves}
+                onChange={(e) => setShelves(Number.parseInt(e.target.value) || 1)}
+              />
+            </Field>
+            <Field label={`Slots per shelf (1–${limit.slots})`}>
+              <Input
+                type="number"
+                inputMode="numeric"
+                min={1}
+                max={limit.slots}
+                value={draft.slotsPerShelf}
+                disabled={draft.jagged}
+                onChange={(e) => setSlotsPerShelf(Number.parseInt(e.target.value) || 1)}
+              />
+            </Field>
+          </div>
 
-      <label className="flex cursor-pointer items-center gap-2 text-sm text-muted-foreground">
-        <input
-          type="checkbox"
-          className="h-4 w-4 accent-primary"
-          checked={draft.jagged}
-          onChange={(e) => toggleJagged(e.target.checked)}
-        />
-        <SlidersHorizontal className="h-4 w-4" />
-        Different slot counts per shelf
-      </label>
+          <label className="flex cursor-pointer items-center gap-2 text-sm text-muted-foreground">
+            <input
+              type="checkbox"
+              className="h-4 w-4 accent-primary"
+              checked={draft.jagged}
+              onChange={(e) => toggleJagged(e.target.checked)}
+            />
+            <SlidersHorizontal className="h-4 w-4" />
+            Different slot counts per shelf
+          </label>
+        </>
+      )}
 
-      {(isShelf || draft.jagged) && (
+      {!isLibrary && (isShelf || draft.jagged) && (
         <div className="rounded-xl border border-border bg-background/50 p-3">
           <div className="mb-2 flex items-center justify-between">
             <span className="flex items-center gap-2 text-sm font-medium text-muted-foreground">

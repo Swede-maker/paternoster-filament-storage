@@ -76,6 +76,58 @@ export function nozzleTempFor(material: string): number {
   return hit ? NOZZLE_TEMP_PRESETS[hit] : 210
 }
 
+/**
+ * Typical solid density (g/cm³) by material, used to convert firmware-reported
+ * filament length into consumed mass for live weight tracking. Mid-range
+ * published values; the user can override per spool. Unknown → PLA (1.24).
+ */
+export const MATERIAL_DENSITY: Record<string, number> = {
+  PLA: 1.24,
+  PETG: 1.27,
+  ABS: 1.04,
+  ASA: 1.07,
+  TPU: 1.21,
+  PC: 1.2,
+  Nylon: 1.14,
+  PVA: 1.23,
+  HIPS: 1.04,
+  "PLA-CF": 1.29,
+  "PETG-CF": 1.3,
+}
+
+/** Fallback density (g/cm³) when a material isn't in the table. */
+export const DEFAULT_DENSITY = 1.24
+/** Default filament diameter (mm). */
+export const DEFAULT_DIAMETER = 1.75
+
+/** Density (g/cm³) for a material name (case-insensitive), with fallback. */
+export function densityFor(material: string): number {
+  if (!material) return DEFAULT_DENSITY
+  const hit = Object.keys(MATERIAL_DENSITY).find((k) => k.toLowerCase() === material.toLowerCase())
+  return hit ? MATERIAL_DENSITY[hit] : DEFAULT_DENSITY
+}
+
+/**
+ * Convert a filament length (mm) into mass (g) for a solid cylinder of the given
+ * diameter (mm) and density (g/cm³). Volume = π·r²·L; mm³→cm³ divides by 1000.
+ */
+export function lengthToGrams(mm: number, diameterMm = DEFAULT_DIAMETER, density = DEFAULT_DENSITY): number {
+  const r = diameterMm / 2 / 10 // mm → cm
+  const lengthCm = mm / 10
+  const volumeCm3 = Math.PI * r * r * lengthCm
+  return volumeCm3 * density
+}
+
+/** Effective density for a spool: its explicit value, else material default. */
+export function spoolDensity(spool: Pick<Spool, "density" | "material">): number {
+  return spool.density && spool.density > 0 ? spool.density : densityFor(spool.material)
+}
+
+/** Effective diameter for a spool: its explicit value, else the default. */
+export function spoolDiameter(spool: Pick<Spool, "diameter">, fallback = DEFAULT_DIAMETER): number {
+  return spool.diameter && spool.diameter > 0 ? spool.diameter : fallback
+}
+
 /** Target carousel speed found/assumed by calibration, in seconds per shelf. */
 export const DEFAULT_SEC_PER_SHELF = 3.5
 /** Bounds the manual speed slider (fast … slow), in seconds per shelf. */

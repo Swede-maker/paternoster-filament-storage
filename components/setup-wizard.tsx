@@ -11,10 +11,13 @@ export function SetupWizard() {
   const [draft, setDraft] = useState(() => makeDraft("paternoster"))
 
   const isShelf = draft.nodeType === "shelf"
+  const isLibrary = draft.nodeType === "library"
+  // Both shelf and library are manual (no motor), so they skip carousel copy.
+  const isManual = isShelf || isLibrary
 
   const build = () => {
     const { storage, shelfMeta } = draftToConfig(draft)
-    const fallbackName = isShelf ? "Shelf Storage 1" : "Paternoster 1"
+    const fallbackName = isLibrary ? "Library 1" : isShelf ? "Shelf Storage 1" : "Paternoster 1"
     dispatch({
       type: "SETUP",
       nodeType: draft.nodeType,
@@ -46,11 +49,11 @@ export function SetupWizard() {
         <div className="mt-6 space-y-3">
           <Button size="lg" className="w-full" onClick={build}>
             <Check className="h-5 w-5" />
-            {isShelf ? "Create storage" : "Build machine"}
+            {isLibrary ? "Create library" : isShelf ? "Create storage" : "Build machine"}
           </Button>
           <p className="text-center text-xs text-muted-foreground">
             You can change these later, and add more storage units, in Settings.
-            {!isShelf && " First you'll calibrate the carousel speed, then it homes itself."}
+            {!isManual && " First you'll calibrate the carousel speed, then it homes itself."}
           </p>
         </div>
       </div>

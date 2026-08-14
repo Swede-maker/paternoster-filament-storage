@@ -7,6 +7,7 @@ import { useStore } from "@/lib/store"
 import { Button } from "./ui/button"
 import { SpoolDisc } from "./spool"
 import { printerSlotLabel, getNode, shelfLabel, orderQueueItems } from "@/lib/selectors"
+import { nodeFreeSlots } from "@/lib/balance"
 import { isLightColor, spoolFill } from "@/lib/filament"
 
 /**
@@ -14,8 +15,16 @@ import { isLightColor, spoolFill } from "@/lib/filament"
  * items and lets them add more or start the machine.
  */
 export function QueueTray({ onAddMore }: { onAddMore: () => void }) {
-  const { flow, cancel, run } = useFlow()
+  const { flow, cancel, run, reassignItemNode } = useFlow()
   const { state } = useStore()
+  // Storage units a queued spool can be redirected into: a library is unbounded,
+  // fixed grids need a free slot (the item's own current unit always qualifies).
+  const nodeHasRoom = (nodeId: string, currentNodeId: string) => {
+    if (nodeId === currentNodeId) return true
+    const node = state.nodes.find((n) => n.id === nodeId)
+    if (!node) return false
+    return (node.type ?? "paternoster") === "library" || nodeFreeSlots(node) > 0
+  }
   // Let the user shrink the tray to just its header so it stops covering the
   // slots/printers they're navigating. Purely local UI state.
   const [collapsed, setCollapsed] = useState(false)
@@ -67,7 +76,12 @@ export function QueueTray({ onAddMore }: { onAddMore: () => void }) {
             // Use the shelf's real name so shelf storage reads correctly (e.g.
             // "Middle·5") instead of a raw index ("S2·5") pointing at a phantom shelf.
             const itemNode = getNode(state, it.nodeId)
-            const where = `${itemNode ? shelfLabel(itemNode, it.shelf) : `Shelf ${it.shelf + 1}`}·${it.slot + 1}`
+            // A library has no shelves/slots, so a "Shelf·N" label would be a
+            // meaningless phantom position — show the library's name instead.
+            const where =
+              itemNode && (itemNode.type ?? "paternoster") === "library"
+                ? itemNode.name
+                : `${itemNode ? shelfLabel(itemNode, it.shelf) : `Shelf ${it.shelf + 1}`}·${it.slot + 1}`
             // A move shows its source too, so "src → dest" reads as a relocation.
             const fromNode = it.from ? getNode(state, it.from.nodeId) : undefined
             const fromWhere = it.from
@@ -93,6 +107,20 @@ export function QueueTray({ onAddMore }: { onAddMore: () => void }) {
                       ? `${fromWhere} → ${where}`
                       : `→ ${where}`}
                 </span>
+                {flow.mode !== "pick" && state.nodes.length > 1 && (
+                  <select
+                    value={it.nodeId}
+                    onChange={(e) => reassignItemNode(it.spool.id, e.target.value)}
+                    aria-label={`Storage unit for ${it.spool.material} ${it.spool.colorName}`}
+                    className="mt-0.5 max-w-[104px] rounded-md border border-border bg-background px-1.5 py-1 text-[10px] text-foreground focus:border-primary focus:outline-none"
+                  >
+                    {state.nodes.map((n) => (
+                      <option key={n.id} value={n.id} disabled={!nodeHasRoom(n.id, it.nodeId)}>
+                        {n.name}
+                      </option>
+                    ))}
+                  </select>
+                )}
               </li>
             )
           })}

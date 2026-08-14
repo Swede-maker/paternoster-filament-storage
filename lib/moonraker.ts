@@ -16,6 +16,12 @@ export type MoonrakerStatus = {
   connected: boolean
   /** Live readings keyed by Klipper heater name (extruder, extruder1, …). */
   temps: Record<string, HeaterReading>
+  /** Print state reported by Klipper (`printing`, `paused`, `complete`, …). */
+  printState?: string
+  /** Cumulative filament used for the current print, in millimetres. */
+  filamentUsedMm?: number
+  /** Index of the currently active extruder/tool (0-based). */
+  activeTool?: number
   error?: string
 }
 
@@ -46,7 +52,13 @@ export async function fetchMoonrakerStatus(printer: Printer): Promise<MoonrakerS
     if (!res.ok || !json.ok) {
       return { connected: false, temps: {}, error: json?.error ?? `Error ${res.status}` }
     }
-    return { connected: true, temps: json.temps ?? {} }
+    return {
+      connected: true,
+      temps: json.temps ?? {},
+      printState: json.printState,
+      filamentUsedMm: typeof json.filamentUsedMm === "number" ? json.filamentUsedMm : undefined,
+      activeTool: typeof json.activeTool === "number" ? json.activeTool : undefined,
+    }
   } catch (err) {
     return { connected: false, temps: {}, error: err instanceof Error ? err.message : "Request failed" }
   }

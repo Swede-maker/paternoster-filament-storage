@@ -11,10 +11,15 @@ import {
 import type {
   ActiveJob,
   AppState,
+  FilamentOrder,
+  FilamentProfile,
+  HistoryEvent,
+  HistoryEventKind,
   Machine,
   NodeDriver,
   NodeRole,
   NodeType,
+  OrderItem,
   PersistedState,
   Printer,
   PrinterLinkStatus,
@@ -29,9 +34,11 @@ import {
   secPerShelfToStepMs,
   rampStepMs,
   autoRampPct,
+  newId,
   DEFAULT_SEC_PER_SHELF,
   DEFAULT_RAMP_PCT,
 } from "./filament"
+import { shelfLabel, printerSlotLabel } from "./selectors"
 import { shortestRotation } from "./balance"
 import { getSystemVersion, loadSystemState, saveSystemState } from "@/app/actions/system-state"
 
@@ -43,6 +50,13 @@ const STORAGE_KEY = "pax-filament-system-v1"
 
 /** How often (ms) to poll the DB so edits from other devices show up here. */
 const SYNC_POLL_MS = 4000
+
+/**
+ * Maximum number of filament-history events to retain. The log is a rolling
+ * buffer (newest first); once full, the oldest events drop off so the shared
+ * save stays small and fast.
+ */
+const HISTORY_CAP = 1000
 
 /** Pull the durable, shareable subset out of the full runtime state. */
 function toPersisted(state: AppState): PersistedState {
@@ -72,12 +86,59 @@ function toPersisted(state: AppState): PersistedState {
     activeNodeId: state.activeNodeId,
     printers: state.printers,
     activePrinterId: state.activePrinterId,
+    history: state.history ?? [],
   }
 }
 
 /** Serialize the persisted subset for cheap change-detection. */
 function persistedSig(state: AppState): string {
   return JSON.stringify(toPersisted(state))
+}
+
+/**
+ * Union two arrays of keyed items: keep every local item, then append any
+ * remote item whose key we don't already have. Local wins on key conflicts.
+ */
+function unionByKey<T>(local: T[] | undefined, remote: T[] | undefined, key: (x: T) => string): T[] {
+  const base = local ?? []
+  const seen = new Set(base.map(key))
+  const extras = (remote ?? []).filter((r) => !seen.has(key(r)))
+  return extras.length ? [...base, ...extras] : base
+}
+
+/**
+ * Merge the additive "catalog" registries — saved filament profiles, barcode
+ * links, containers, custom materials/brands, and orders — from a remote
+ * snapshot into our outgoing document.
+ *
+ * The system uses a single shared document with last-write-wins saves. Without
+ * this, two devices editing at once would let the later save wipe the other's
+ * newly added profiles (the reported "I can only keep one profile" bug). These
+ * registries are purely additive and keyed, so a union preserves everyone's
+ * additions. Positional / live state (nodes, slots, printers, spools) stays
+ * last-write-wins, which is correct for a physical carousel's current layout.
+ */
+function mergeCatalog(local: PersistedState, remote: PersistedState): PersistedState {
+  const ls = local.settings
+  const rs = remote.settings
+  // History is an append-only keyed log, so a union preserves events recorded on
+  // every device. Re-sort newest-first and cap so the merged log stays bounded.
+  const history = unionByKey(local.history, remote.history, (e) => e.id)
+    .sort((a, b) => b.at - a.at)
+    .slice(0, HISTORY_CAP)
+  return {
+    ...local,
+    history,
+    settings: {
+      ...ls,
+      filamentProfiles: unionByKey(ls.filamentProfiles, rs.filamentProfiles, (p) => p.id),
+      barcodes: unionByKey(ls.barcodes, rs.barcodes, (b) => b.code),
+      containers: unionByKey(ls.containers, rs.containers, (c) => c.id),
+      customMaterials: unionByKey(ls.customMaterials, rs.customMaterials, (m) => m),
+      customBrands: unionByKey(ls.customBrands, rs.customBrands, (b) => b),
+      orders: unionByKey(ls.orders, rs.orders, (o) => o.id),
+    },
+  }
 }
 
 /** Homing duration (ms). Per-shelf rotation time is per-node (calibrated speed). */
@@ -94,6 +155,10 @@ const defaultSettings: Settings = {
   customMaterials: [],
   customBrands: [],
   containers: [],
+  defaultDiameter: 1.75,
+  filamentProfiles: [],
+  barcodes: [],
+  orders: [],
 }
 
 /** Per-shelf slot counts for a config (jagged when `slotCounts` is present). */
@@ -134,9 +199,11 @@ function makeNode(opts: {
 }): StorageNode {
   nodeCounter += 1
   const type: NodeType = opts.type ?? "paternoster"
-  // Shelf storage has no controller, so it always runs "simulated" and stays
-  // online; only paternosters can be driven by real hardware.
-  const driver = type === "shelf" ? "simulated" : opts.driver ?? "simulated"
+  // Shelf and library storage have no controller, so they always run
+  // "simulated" and stay online; only paternosters can be driven by real
+  // hardware.
+  const manual = type === "shelf" || type === "library"
+  const driver = manual ? "simulated" : opts.driver ?? "simulated"
   return {
     id: `node-${Date.now().toString(36)}-${nodeCounter}`,
     name: opts.name,
@@ -155,10 +222,12 @@ function makeNode(opts: {
     // considered calibrated.
     secPerShelf: DEFAULT_SEC_PER_SHELF,
     rampPct: DEFAULT_RAMP_PCT,
-    calibrated: type === "shelf",
+    calibrated: manual,
     storage: opts.storage,
-    slots: buildGrid(opts.storage),
-    machine: type === "shelf" ? shelfMachine() : freshMachine(),
+    // A library is an unbounded single row of spools, so it ignores the
+    // shelves/slots config and starts as one empty row that grows on demand.
+    slots: type === "library" ? [[]] : buildGrid(opts.storage),
+    machine: manual ? shelfMachine() : freshMachine(),
   }
 }
 
@@ -178,6 +247,7 @@ function makeInitialState(): AppState {
     printers: [],
     activePrinterId: null,
     job: null,
+    history: [],
   }
 }
 
@@ -237,8 +307,34 @@ type Action =
   | { type: "UPSERT_SPOOL"; spool: Spool }
   | { type: "UPDATE_SPOOL"; id: string; changes: Partial<Spool> }
   | { type: "DELETE_SPOOL"; id: string }
+  /** Subtract consumed filament (g) from a spool, clamped at 0. */
+  | { type: "CONSUME_FILAMENT"; spoolId: string; grams: number }
+  /**
+   * Upsert a spool auto-created from a Bambu AMS tray (matched by RFID uid) and
+   * seat it in the given printer slot. Idempotent: an existing spool with the
+   * same `rfidUid` is updated in place rather than duplicated.
+   */
+  | { type: "INGEST_AMS_TRAY"; printerId: string; slot: number; spool: Spool }
+  // Filament profiles
+  | { type: "ADD_PROFILE"; profile: FilamentProfile }
+  | { type: "REMOVE_PROFILE"; id: string }
+  // Barcode → profile mappings
+  | { type: "ADD_BARCODE"; code: string; profileId: string }
+  | { type: "REMOVE_BARCODE"; code: string }
+  // Incoming orders / carts
+  | { type: "ADD_ORDER"; order: FilamentOrder }
+  | { type: "RENAME_ORDER"; id: string; name: string }
+  | { type: "REMOVE_ORDER"; id: string }
+  | { type: "ADD_ORDER_ITEM"; orderId: string; item: OrderItem }
+  | { type: "REMOVE_ORDER_ITEM"; orderId: string; itemId: string }
   | { type: "SET_STORAGE_SLOT"; nodeId: string; shelf: number; slot: number; spoolId: string | null }
+  /** Create a brand-new spool directly into a library node's inventory row. */
+  | { type: "LIBRARY_ADD_SPOOL"; nodeId: string; spool: Spool }
   | { type: "SET_PRINTER_SLOT"; printerId: string; slot: number; spoolId: string | null }
+  // Dry-reminder lifecycle (per spool)
+  | { type: "SET_DRY_REMINDER"; spoolId: string; days: number }
+  | { type: "RESET_DRY_REMINDER"; spoolId: string }
+  | { type: "CLEAR_DRY_REMINDER"; spoolId: string }
   // Machine / simulation (per node)
   | { type: "HOME_START"; nodeId: string }
   | { type: "HOME_DONE"; nodeId: string }
@@ -297,9 +393,9 @@ function removeSpoolEverywhere(state: AppState, id: string): AppState {
 function beginNodeMoveTo(state: AppState, nodeId: string, target: number, serviced: boolean): AppState {
   const node = getNode(state, nodeId)
   if (!node) return state
-  // Shelf storage has no motor: "arrive" immediately (the confirm step still
-  // runs so the user is told which named shelf/slot to reach for by hand).
-  if (node.type === "shelf") {
+  // Shelf and library storage have no motor: "arrive" immediately (the confirm
+  // step still runs so the user is told which spool to reach for by hand).
+  if (node.type === "shelf" || node.type === "library") {
     return onNodeArrived(state, nodeId)
   }
   if (node.machine.currentShelf === target) {
@@ -393,7 +489,11 @@ function prefetchOtherNodes(state: AppState): AppState {
 // Reducer
 // ---------------------------------------------------------------------------
 
-function machineReducer(state: AppState, action: Action): AppState {
+/**
+ * The core state transition. Wrapped by `machineReducer`, which layers on
+ * automatic filament-history logging around the mutations below.
+ */
+function coreReducer(state: AppState, action: Action): AppState {
   switch (action.type) {
     case "HYDRATE":
       return action.state
@@ -474,6 +574,10 @@ function machineReducer(state: AppState, action: Action): AppState {
     case "RESHAPE_NODE": {
       const target = getNode(state, action.id)
       if (!target) return state
+      // A library has no configurable grid — it's an unbounded single row — so
+      // reshaping must never rebuild/truncate it (that would drop spools). Its
+      // rename/relocate is handled by UPDATE_NODE; leave its slots untouched.
+      if (target.type === "library") return state
       const grid = buildGrid(action.storage)
       // Preserve spools that still fit the new shape; drop spool objects that
       // no longer have a home so the registry doesn't accumulate orphans.
@@ -585,12 +689,130 @@ function machineReducer(state: AppState, action: Action): AppState {
       return { ...cleared, spools }
     }
 
+    case "CONSUME_FILAMENT": {
+      const existing = state.spools[action.spoolId]
+      if (!existing || !(action.grams > 0)) return state
+      const grams = Math.max(0, existing.grams - action.grams)
+      if (grams === existing.grams) return state
+      return { ...state, spools: { ...state.spools, [action.spoolId]: { ...existing, grams } } }
+    }
+
+    case "INGEST_AMS_TRAY": {
+      // Match an existing spool by RFID uid so re-reads update in place instead
+      // of piling up duplicates.
+      const existing = action.spool.rfidUid
+        ? Object.values(state.spools).find((s) => s.rfidUid && s.rfidUid === action.spool.rfidUid)
+        : undefined
+      const id = existing?.id ?? action.spool.id
+      const merged: Spool = existing ? { ...existing, ...action.spool, id } : { ...action.spool, id }
+      // A physical spool lives in exactly one place. If this same uid was already
+      // seated in another slot/AMS or parked in storage, vacate it there first so
+      // moving a spool between slots (or reconnecting a different AMS unit) never
+      // leaves a ghost copy behind. New spools have no prior location to clear.
+      const base = existing ? removeSpoolEverywhere(state, id) : state
+      const spools = { ...base.spools, [id]: merged }
+      const printers = base.printers.map((p) => {
+        if (p.id !== action.printerId) return p
+        const loaded = [...p.loaded]
+        loaded[action.slot] = id
+        return { ...p, loaded }
+      })
+      return { ...base, spools, printers }
+    }
+
+    // ----- filament profiles -----
+    case "ADD_PROFILE": {
+      const list = state.settings.filamentProfiles ?? []
+      const idx = list.findIndex((p) => p.id === action.profile.id)
+      const next = idx >= 0 ? list.map((p) => (p.id === action.profile.id ? action.profile : p)) : [...list, action.profile]
+      return { ...state, settings: { ...state.settings, filamentProfiles: next } }
+    }
+
+    case "REMOVE_PROFILE": {
+      const list = state.settings.filamentProfiles ?? []
+      const barcodes = (state.settings.barcodes ?? []).filter((b) => b.profileId !== action.id)
+      return {
+        ...state,
+        settings: { ...state.settings, filamentProfiles: list.filter((p) => p.id !== action.id), barcodes },
+      }
+    }
+
+    // ----- barcode → profile mappings -----
+    case "ADD_BARCODE": {
+      const code = action.code.trim()
+      if (!code) return state
+      const list = (state.settings.barcodes ?? []).filter((b) => b.code !== code)
+      return { ...state, settings: { ...state.settings, barcodes: [...list, { code, profileId: action.profileId }] } }
+    }
+
+    case "REMOVE_BARCODE": {
+      const list = state.settings.barcodes ?? []
+      return { ...state, settings: { ...state.settings, barcodes: list.filter((b) => b.code !== action.code) } }
+    }
+
+    // ----- incoming orders / carts -----
+    case "ADD_ORDER":
+      return { ...state, settings: { ...state.settings, orders: [...(state.settings.orders ?? []), action.order] } }
+
+    case "RENAME_ORDER": {
+      const name = action.name.trim()
+      const orders = (state.settings.orders ?? []).map((o) => (o.id === action.id ? { ...o, name: name || o.name } : o))
+      return { ...state, settings: { ...state.settings, orders } }
+    }
+
+    case "REMOVE_ORDER": {
+      const orders = (state.settings.orders ?? []).filter((o) => o.id !== action.id)
+      return { ...state, settings: { ...state.settings, orders } }
+    }
+
+    case "ADD_ORDER_ITEM": {
+      const orders = (state.settings.orders ?? []).map((o) =>
+        o.id === action.orderId ? { ...o, items: [...o.items, action.item] } : o,
+      )
+      return { ...state, settings: { ...state.settings, orders } }
+    }
+
+    case "REMOVE_ORDER_ITEM": {
+      const orders = (state.settings.orders ?? []).map((o) =>
+        o.id === action.orderId ? { ...o, items: o.items.filter((it) => it.id !== action.itemId) } : o,
+      )
+      return { ...state, settings: { ...state.settings, orders } }
+    }
+
     case "SET_STORAGE_SLOT":
       return withNode(state, action.nodeId, (n) => {
         const slots = n.slots.map((row) => [...row])
+        // A library is an unbounded single row: placing a spool at an index at
+        // or beyond the current length appends (grows the row), and clearing a
+        // spool removes that hole so the row stays compact instead of filling
+        // with nulls. Fixed grids (paternoster/shelf) write in place as before.
+        if (n.type === "library") {
+          const row = slots[0] ?? []
+          if (action.spoolId === null) {
+            if (action.slot >= 0 && action.slot < row.length) row.splice(action.slot, 1)
+          } else if (action.slot >= row.length) {
+            row.push(action.spoolId)
+          } else {
+            row[action.slot] = action.spoolId
+          }
+          slots[0] = row
+          return { ...n, slots }
+        }
         slots[action.shelf][action.slot] = action.spoolId
         return { ...n, slots }
       })
+
+    case "LIBRARY_ADD_SPOOL": {
+      const target = getNode(state, action.nodeId)
+      if (!target || target.type !== "library") return state
+      const spools = { ...state.spools, [action.spool.id]: action.spool }
+      const nodes = state.nodes.map((n) => {
+        if (n.id !== action.nodeId) return n
+        const row = [...(n.slots[0] ?? []), action.spool.id]
+        return { ...n, slots: [row] }
+      })
+      return { ...state, spools, nodes }
+    }
 
     case "SET_PRINTER_SLOT": {
       // Nozzle temperature is read-only (displayed live from the printer), so
@@ -603,6 +825,38 @@ function machineReducer(state: AppState, action: Action): AppState {
         return { ...p, loaded }
       })
       return { ...state, printers }
+    }
+
+    case "SET_DRY_REMINDER": {
+      const spool = state.spools[action.spoolId]
+      if (!spool) return state
+      const days = Math.max(1, Math.round(action.days))
+      return {
+        ...state,
+        spools: {
+          ...state.spools,
+          [action.spoolId]: { ...spool, dryReminder: { setAt: Date.now(), days } },
+        },
+      }
+    }
+
+    case "RESET_DRY_REMINDER": {
+      const spool = state.spools[action.spoolId]
+      if (!spool?.dryReminder) return state
+      return {
+        ...state,
+        spools: {
+          ...state.spools,
+          [action.spoolId]: { ...spool, dryReminder: { ...spool.dryReminder, setAt: Date.now() } },
+        },
+      }
+    }
+
+    case "CLEAR_DRY_REMINDER": {
+      const spool = state.spools[action.spoolId]
+      if (!spool?.dryReminder) return state
+      const { dryReminder: _removed, ...rest } = spool
+      return { ...state, spools: { ...state.spools, [action.spoolId]: rest } }
     }
 
     // ----- machine (per node) -----
@@ -911,6 +1165,123 @@ function machineReducer(state: AppState, action: Action): AppState {
 // ---------------------------------------------------------------------------
 
 /** Upgrade older single-unit saves into the multi-node shape. */
+// ---------------------------------------------------------------------------
+// Filament history logging
+// ---------------------------------------------------------------------------
+
+/**
+ * Derive the history events produced by an action, comparing the state before
+ * and after it ran. Load / unload / place / move / remove all funnel through a
+ * handful of atomic actions, so logging here captures every spool movement in
+ * one place. Storage-slot CLEARS aren't logged: they're always half of a move
+ * or a load (whose other half is logged), so logging them would double up.
+ */
+function historyFor(prev: AppState, next: AppState, action: Action): HistoryEvent[] {
+  const make = (kind: HistoryEventKind, spool: Spool, extra: Partial<HistoryEvent>): HistoryEvent => ({
+    id: newId("hist"),
+    at: Date.now(),
+    kind,
+    spoolId: spool.id,
+    material: spool.material,
+    brand: spool.brand,
+    color: spool.color,
+    colorName: spool.colorName,
+    ...extra,
+  })
+
+  switch (action.type) {
+    case "SET_PRINTER_SLOT": {
+      if (action.spoolId) {
+        const printer = next.printers.find((p) => p.id === action.printerId)
+        const spool = next.spools[action.spoolId]
+        if (!spool) return []
+        return [
+          make("load", spool, {
+            printerId: printer?.id,
+            printerName: printer?.name,
+            slotLabel: printer ? printerSlotLabel(printer, action.slot) : undefined,
+          }),
+        ]
+      }
+      // Unload: the spool that WAS in that slot is read from the previous state.
+      const prevPrinter = prev.printers.find((p) => p.id === action.printerId)
+      const oldId = prevPrinter?.loaded[action.slot]
+      if (!oldId) return []
+      const spool = next.spools[oldId] ?? prev.spools[oldId]
+      if (!spool) return []
+      return [
+        make("unload", spool, {
+          printerId: prevPrinter?.id,
+          printerName: prevPrinter?.name,
+          slotLabel: prevPrinter ? printerSlotLabel(prevPrinter, action.slot) : undefined,
+        }),
+      ]
+    }
+
+    case "SET_STORAGE_SLOT": {
+      if (!action.spoolId) return []
+      const spool = next.spools[action.spoolId]
+      if (!spool) return []
+      const node = getNode(next, action.nodeId)
+      const isLibrary = (node?.type ?? "paternoster") === "library"
+      const locationLabel = node
+        ? isLibrary
+          ? "Library"
+          : `${shelfLabel(node, action.shelf)} · Slot ${action.slot + 1}`
+        : undefined
+      return [make("placed", spool, { nodeId: node?.id, nodeName: node?.name, locationLabel })]
+    }
+
+    case "LIBRARY_ADD_SPOOL": {
+      const spool = next.spools[action.spool.id]
+      if (!spool) return []
+      const node = getNode(next, action.nodeId)
+      return [make("placed", spool, { nodeId: node?.id, nodeName: node?.name, locationLabel: "Library" })]
+    }
+
+    case "SET_DRY_REMINDER": {
+      const spool = next.spools[action.spoolId]
+      if (!spool) return []
+      return [make("dry-set", spool, { days: spool.dryReminder?.days })]
+    }
+
+    case "RESET_DRY_REMINDER": {
+      const spool = next.spools[action.spoolId]
+      if (!spool) return []
+      return [make("dry-reset", spool, { days: spool.dryReminder?.days })]
+    }
+
+    case "CLEAR_DRY_REMINDER": {
+      const spool = next.spools[action.spoolId] ?? prev.spools[action.spoolId]
+      if (!spool) return []
+      return [make("dry-cleared", spool, {})]
+    }
+
+    case "DELETE_SPOOL": {
+      const spool = prev.spools[action.id]
+      if (!spool) return []
+      return [make("removed", spool, {})]
+    }
+
+    default:
+      return []
+  }
+}
+
+/**
+ * The reducer the app actually uses: runs the core transition, then appends any
+ * filament-history events it produced (newest first, capped at HISTORY_CAP).
+ */
+function machineReducer(state: AppState, action: Action): AppState {
+  const next = coreReducer(state, action)
+  // HYDRATE/RESET replace the whole state (history included); never log around them.
+  if (next === state || action.type === "HYDRATE" || action.type === "RESET_ALL") return next
+  const events = historyFor(state, next, action)
+  if (events.length === 0) return next
+  const history = [...events, ...(next.history ?? [])].slice(0, HISTORY_CAP)
+  return { ...next, history }
+}
+
 function migrate(parsed: any): AppState {
   const base = makeInitialState()
   const settings: Settings = { ...defaultSettings, ...(parsed.settings ?? {}) }
@@ -919,31 +1290,39 @@ function migrate(parsed: any): AppState {
   let activeNodeId: string
   if (Array.isArray(parsed.nodes) && parsed.nodes.length > 0) {
     nodes = parsed.nodes.map((n: StorageNode) => {
-      const type: NodeType = n.type === "shelf" ? "shelf" : "paternoster"
-      // Shelf storage never uses hardware.
-      const driver: NodeDriver = type === "shelf" ? "simulated" : n.driver === "hardware" ? "hardware" : "simulated"
+      // Preserve every known node type. Previously any non-shelf type collapsed
+      // to "paternoster", which silently turned a persisted library back into a
+      // carousel (SLAVE badge + carousel view) on every hydrate/sync.
+      const type: NodeType = n.type === "shelf" ? "shelf" : n.type === "library" ? "library" : "paternoster"
+      // Shelf and library storage are manual — no controller, so never hardware.
+      const manual = type === "shelf" || type === "library"
+      const driver: NodeDriver = manual ? "simulated" : n.driver === "hardware" ? "hardware" : "simulated"
       return {
         ...n,
         type,
         driver,
+        // A library is an unbounded single row; guarantee it always has at least
+        // one row so adding/rendering spools never hits an undefined slot array.
+        slots: type === "library" ? (Array.isArray(n.slots) && n.slots.length > 0 ? n.slots : [[]]) : n.slots,
+        // Manual units have no motor, so they're always calibrated.
+        calibrated: manual ? true : n.calibrated,
         port: typeof n.port === "number" ? n.port : DEFAULT_AGENT_PORT,
         // Hardware nodes start offline until reconnected; simulated stay online.
         link: driver === "hardware" ? "offline" : "online",
-        // Shelf storage is permanently "homed". For a paternoster we TRUST the
-        // last known position that was persisted: a carousel with an absolute
-        // index sensor already knows where it is, so opening a new tab, device,
-        // or session must NOT force a re-home. We restore `homed` and
-        // `currentShelf` and only normalize the per-session motion fields
-        // (status/target/direction) back to idle. A brand-new, never-homed unit
-        // stays `homed: false` and is homed once by the auto-home effect.
-        machine:
-          type === "shelf"
-            ? shelfMachine()
-            : {
-                ...freshMachine(),
-                homed: n.machine?.homed ?? false,
-                currentShelf: n.machine?.currentShelf ?? 0,
-              },
+        // Manual units (shelf + library) are permanently "homed". For a
+        // paternoster we TRUST the last known position that was persisted: a
+        // carousel with an absolute index sensor already knows where it is, so
+        // opening a new tab, device, or session must NOT force a re-home. We
+        // restore `homed` and `currentShelf` and only normalize the per-session
+        // motion fields (status/target/direction) back to idle. A brand-new,
+        // never-homed unit stays `homed: false` and is homed once by auto-home.
+        machine: manual
+          ? shelfMachine()
+          : {
+              ...freshMachine(),
+              homed: n.machine?.homed ?? false,
+              currentShelf: n.machine?.currentShelf ?? 0,
+            },
       }
     })
     activeNodeId = parsed.activeNodeId && nodes.some((n) => n.id === parsed.activeNodeId) ? parsed.activeNodeId : nodes[0].id
@@ -972,6 +1351,7 @@ function migrate(parsed: any): AppState {
     printers: (parsed.printers ?? []).map((p: Printer) => ({ ...p, link: "offline" })),
     activePrinterId: parsed.activePrinterId ?? null,
     job: null,
+    history: Array.isArray(parsed.history) ? parsed.history.slice(0, HISTORY_CAP) : [],
   }
 }
 
@@ -1064,7 +1444,18 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     saveInFlight.current = true
     saveTimer.current = setTimeout(async () => {
       try {
-        const { version } = await saveSystemState(toPersisted(state))
+        let payload = toPersisted(state)
+        // Before a last-write-wins save, fold in any catalog additions another
+        // device made since our last sync (profiles, barcodes, containers,
+        // custom materials/brands, orders) so this save can't drop them. The
+        // merged extras flow back into local state on the next poll.
+        try {
+          const latest = await loadSystemState()
+          if (latest.data) payload = mergeCatalog(payload, latest.data)
+        } catch {
+          // Offline or load failed — save the local document as-is.
+        }
+        const { version } = await saveSystemState(payload)
         dbVersion.current = version
         lastSavedSig.current = sig
       } catch (e) {
@@ -1121,11 +1512,12 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     if (!ready || !state.configured) return
     for (const n of state.nodes) {
+      // Only a paternoster homes — manual shelf/library units have no motor.
+      if (n.type === "shelf" || n.type === "library") continue
       if (n.machine.homed || n.machine.status !== "idle") continue
       if (n.driver === "hardware" && n.link !== "online") continue
-      // A paternoster must be speed-calibrated before it may home. Shelf nodes
-      // are always calibrated (no motor), so this never blocks them.
-      if (n.type !== "shelf" && !n.calibrated) continue
+      // A paternoster must be speed-calibrated before it may home.
+      if (!n.calibrated) continue
       dispatch({ type: "HOME_START", nodeId: n.id })
     }
   }, [ready, state.configured, state.nodes])

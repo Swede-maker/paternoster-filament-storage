@@ -2,7 +2,7 @@
 
 import { Flame } from "lucide-react"
 import { cn } from "@/lib/utils"
-import { isLightColor, spoolFill } from "@/lib/filament"
+import { spoolFill } from "@/lib/filament"
 import { SpoolRoll } from "./spool"
 import type { Spool } from "@/lib/types"
 
@@ -70,13 +70,15 @@ export function AmsUnit({
                 <span className="font-mono text-xs text-muted-foreground">{i + 1}</span>
                 {spool ? (
                   <>
-                    <span
-                      className="text-[11px] font-semibold leading-none"
-                      style={{ color: isLightColor(spool.color) ? "#d4d4d8" : spool.color }}
-                    >
-                      {spool.material}
+                    <span className="text-[11px] font-semibold leading-none text-foreground">{spool.material}</span>
+                    <span className="flex max-w-full items-center gap-1 text-[10px] leading-none text-muted-foreground">
+                      <span
+                        className="h-2 w-2 shrink-0 rounded-full border border-border"
+                        style={{ backgroundColor: spool.color }}
+                        aria-hidden
+                      />
+                      <span className="truncate">{spool.colorName}</span>
                     </span>
-                    <span className="text-[10px] leading-none text-muted-foreground">{spool.colorName}</span>
                   </>
                 ) : (
                   <span className="text-[10px] text-muted-foreground/50">empty</span>
@@ -145,14 +147,16 @@ export function Toolhead({
       </div>
 
       {spool ? (
-        <div className="text-center leading-tight">
-          <div
-            className="text-[11px] font-semibold"
-            style={{ color: isLightColor(spool.color) ? "#d4d4d8" : spool.color }}
-          >
-            {spool.material}
+        <div className="flex flex-col items-center leading-tight">
+          <div className="text-[11px] font-semibold text-foreground">{spool.material}</div>
+          <div className="flex max-w-full items-center gap-1 text-[10px] text-muted-foreground">
+            <span
+              className="h-2 w-2 shrink-0 rounded-full border border-border"
+              style={{ backgroundColor: spool.color }}
+              aria-hidden
+            />
+            <span className="truncate">{spool.colorName}</span>
           </div>
-          <div className="text-[10px] text-muted-foreground">{spool.colorName}</div>
         </div>
       ) : (
         <span className="text-[10px] text-muted-foreground/50">empty</span>

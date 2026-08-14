@@ -6,6 +6,7 @@ import {
   Network,
   Server,
   Package,
+  Library,
   Plus,
   Radio,
   RotateCcw,
@@ -17,13 +18,21 @@ import {
   Pencil,
   Box,
   X,
+  Layers,
+  Sun,
+  Moon,
+  Barcode as BarcodeIcon,
 } from "lucide-react"
 import { useStore } from "@/lib/store"
+import { useTheme } from "@/lib/use-theme"
+import { cn } from "@/lib/utils"
 import { getStats, nodeSlotCount } from "@/lib/selectors"
 import { newId, formatGrams } from "@/lib/filament"
 import type { Container, StorageNode } from "@/lib/types"
 import { Button } from "./ui/button"
-import { Field, Input, Checkbox } from "./ui/field"
+import { Field, Input, Select, Checkbox } from "./ui/field"
+import { SpoolDisc } from "./spool"
+import { BarcodeScanner } from "./barcode-scanner"
 import {
   draftFromNode,
   draftToConfig,
@@ -54,6 +63,11 @@ export function SettingsView() {
           label="Confirm before every movement"
           description="When on, the machine waits for a 'Confirm & rotate' tap before the carousel moves during a job. Turn off to let it move automatically."
         />
+      </Section>
+
+      {/* Appearance */}
+      <Section icon={<Sun className="h-5 w-5 text-primary" />} title="Appearance">
+        <ThemeToggle />
       </Section>
 
       {/* General */}
@@ -88,6 +102,26 @@ export function SettingsView() {
             </Button>
           </div>
         </Field>
+
+        <Field label="Default filament diameter">
+          <Select
+            value={String(state.settings.defaultDiameter ?? 1.75)}
+            onChange={(e) =>
+              dispatch({
+                type: "UPDATE_SETTINGS",
+                settings: { defaultDiameter: Number.parseFloat(e.target.value) || 1.75 },
+              })
+            }
+            aria-label="Default filament diameter"
+          >
+            <option value="1.75">1.75 mm (standard)</option>
+            <option value="2.85">2.85 mm</option>
+            <option value="3">3.0 mm</option>
+          </Select>
+          <p className="mt-1 text-xs text-muted-foreground">
+            Pre-selected on new spools and used to convert print length into grams consumed.
+          </p>
+        </Field>
       </Section>
 
       {/* Filament presets */}
@@ -106,6 +140,16 @@ export function SettingsView() {
           values={state.settings.customBrands ?? []}
           onRemove={(v) => dispatch({ type: "REMOVE_PRESET", kind: "brand", value: v })}
         />
+      </Section>
+
+      {/* Filament profiles + barcode mappings */}
+      <Section icon={<Layers className="h-5 w-5 text-primary" />} title="Profiles & barcodes">
+        <p className="text-sm text-muted-foreground">
+          Profiles are reusable filament presets — save one from the &ldquo;Add filament&rdquo; form, then apply it in a
+          tap. Link a barcode to a profile so scanning a spool auto-fills everything.
+        </p>
+        <ProfileManager />
+        <BarcodeManager />
       </Section>
 
       {/* Storage containers / dry boxes */}
@@ -154,6 +198,42 @@ export function SettingsView() {
   )
 }
 
+/**
+ * Light/dark slider. Per-device (localStorage), so each screen keeps its own
+ * look. The track itself is the control — tap or click anywhere to flip.
+ */
+function ThemeToggle() {
+  const { theme, toggle } = useTheme()
+  const isDark = theme === "dark"
+  return (
+    <div className="flex items-center justify-between gap-4">
+      <div className="min-w-0">
+        <p className="text-sm font-medium">{isDark ? "Dark" : "Light"} theme</p>
+        <p className="text-xs text-muted-foreground">
+          Applies to this device only. Each screen remembers its own choice.
+        </p>
+      </div>
+      <button
+        type="button"
+        role="switch"
+        aria-checked={isDark}
+        aria-label="Toggle dark theme"
+        onClick={toggle}
+        className="relative inline-flex h-8 w-14 shrink-0 items-center rounded-full border border-border bg-secondary transition-colors"
+      >
+        <span
+          className={cn(
+            "inline-flex h-6 w-6 items-center justify-center rounded-full bg-primary text-primary-foreground shadow-sm transition-transform",
+            isDark ? "translate-x-7" : "translate-x-1",
+          )}
+        >
+          {isDark ? <Moon className="h-3.5 w-3.5" /> : <Sun className="h-3.5 w-3.5" />}
+        </span>
+      </button>
+    </div>
+  )
+}
+
 /** Small colored connection indicator for a node. */
 function LinkChip({ node }: { node: StorageNode }) {
   // Simulated nodes are always "online". Hardware reflects the real socket.
@@ -180,7 +260,12 @@ function NodeList() {
   return (
     <ul className="space-y-2">
       {state.nodes.map((node) => {
-        const isShelf = (node.type ?? "paternoster") === "shelf"
+        const nodeType = node.type ?? "paternoster"
+        const isShelf = nodeType === "shelf"
+        const isLibrary = nodeType === "library"
+        // Manual units (shelf + library) have no controller, role, driver or
+        // hardware endpoint, so all carousel-only chrome is hidden for them.
+        const isManual = isShelf || isLibrary
         const isMaster = node.role === "master"
         const isActive = node.id === state.activeNodeId
         const total = nodeSlotCount(node)
@@ -200,15 +285,21 @@ function NodeList() {
                 }
                 aria-hidden
               >
-                {isShelf ? <Package className="h-5 w-5" /> : <Server className="h-5 w-5" />}
+                {isLibrary ? (
+                  <Library className="h-5 w-5" />
+                ) : isShelf ? (
+                  <Package className="h-5 w-5" />
+                ) : (
+                  <Server className="h-5 w-5" />
+                )}
               </span>
               <div className="min-w-0 flex-1">
                 <div className="flex flex-wrap items-center gap-2">
                   <span className="truncate text-sm font-semibold text-foreground">{node.name}</span>
                   <span className="rounded-md bg-secondary/70 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
-                    {isShelf ? "shelf" : "paternoster"}
+                    {isLibrary ? "library" : isShelf ? "shelf" : "paternoster"}
                   </span>
-                  {!isShelf && (
+                  {!isManual && (
                     <>
                       <span
                         className={
@@ -238,13 +329,13 @@ function NodeList() {
                       <MapPin className="h-3 w-3" /> {node.area} ·
                     </span>
                   )}
-                  {!isShelf && (
+                  {!isManual && (
                     <span className="font-mono">
                       {node.driver === "hardware" ? `${node.ip}:${node.port}` : node.ip} ·{" "}
                     </span>
                   )}
                   <span className="font-mono">
-                    {node.slots.length} shelves · {total} slots
+                    {isLibrary ? `${node.slots[0]?.length ?? 0} spools` : `${node.slots.length} shelves · ${total} slots`}
                   </span>
                 </p>
               </div>
@@ -263,7 +354,7 @@ function NodeList() {
               >
                 <Pencil className="h-4 w-4" /> {editingId === node.id ? "Close" : "Edit layout"}
               </Button>
-              {!isShelf && (
+              {!isManual && (
                 <Button
                   variant="outline"
                   size="sm"
@@ -286,7 +377,7 @@ function NodeList() {
                   )}
                 </Button>
               )}
-              {!isShelf && !isMaster && (
+              {!isManual && !isMaster && (
                 <Button variant="outline" size="sm" onClick={() => dispatch({ type: "SET_MASTER", id: node.id })}>
                   Make master
                 </Button>
@@ -310,7 +401,7 @@ function NodeList() {
               <NodeLayoutEditor node={node} onDone={() => setEditingId(null)} />
             )}
 
-            {!isShelf && node.driver === "hardware" && <NodeEndpointEditor node={node} />}
+            {!isManual && node.driver === "hardware" && <NodeEndpointEditor node={node} />}
           </li>
         )
       })}
@@ -337,7 +428,9 @@ function NodeLayoutEditor({ node, onDone }: { node: StorageNode; onDone: () => v
   return (
     <div className="mt-3 rounded-xl border border-border/70 bg-muted/20 p-3">
       <p className="mb-3 text-xs font-medium text-muted-foreground">
-        Edit layout — removing shelves or slots discards any spools stored there.
+        {(node.type ?? "paternoster") === "library"
+          ? "Rename or relocate this library. Its contents are never affected."
+          : "Edit layout — removing shelves or slots discards any spools stored there."}
       </p>
       {/* Type is fixed once created; a paternoster can't become a shelf. */}
       <StorageLayoutEditor draft={draft} onChange={setDraft} allowTypeChange={false} />
@@ -405,6 +498,8 @@ function AddNodeRow() {
   const clamp = (v: number, min: number, max: number) => Math.max(min, Math.min(max, v))
 
   const isShelf = draft.nodeType === "shelf"
+  // Shelf and library units have no controller/hardware — only a paternoster does.
+  const isManual = draft.nodeType === "shelf" || draft.nodeType === "library"
   const reset = () => {
     setOpen(false)
     setDraft(makeDraft("paternoster"))
@@ -414,9 +509,9 @@ function AddNodeRow() {
   }
 
   const ipValid = /^(\d{1,3}\.){3}\d{1,3}$/.test(ip.trim()) || /^[a-z0-9.-]+\.local$/i.test(ip.trim())
-  // Shelf storage has no controller, so IP validity only matters for a
+  // Manual units have no controller, so IP validity only matters for a
   // hardware paternoster. Simulated paternosters get an auto-assigned address.
-  const canAdd = draft.name.trim().length > 0 && (isShelf || !hardware || ipValid)
+  const canAdd = draft.name.trim().length > 0 && (isManual || !hardware || ipValid)
 
   if (!open) {
     return (
@@ -431,7 +526,7 @@ function AddNodeRow() {
       <StorageLayoutEditor draft={draft} onChange={setDraft} />
 
       {/* Controller settings only apply to the automated paternoster. */}
-      {!isShelf && (
+      {!isManual && (
         <>
           <div>
             <p className="mb-1.5 text-sm font-medium text-muted-foreground">Controller</p>
@@ -503,14 +598,15 @@ function AddNodeRow() {
               area: draft.area.trim() || undefined,
               storage,
               shelfMeta,
-              ip: !isShelf && hardware ? ip.trim() : undefined,
-              driver: !isShelf && hardware ? "hardware" : "simulated",
-              port: !isShelf && hardware ? port : undefined,
+              ip: !isManual && hardware ? ip.trim() : undefined,
+              driver: !isManual && hardware ? "hardware" : "simulated",
+              port: !isManual && hardware ? port : undefined,
             })
             reset()
           }}
         >
-          <Plus className="h-4 w-4" /> {isShelf ? "Add shelf storage" : "Add paternoster"}
+          <Plus className="h-4 w-4" />{" "}
+          {draft.nodeType === "library" ? "Add library" : isShelf ? "Add shelf storage" : "Add paternoster"}
         </Button>
       </div>
     </div>
@@ -601,6 +697,151 @@ function ContainerManager() {
           <Plus className="h-4 w-4" /> Add container
         </Button>
       </div>
+    </div>
+  )
+}
+
+/** Lists saved filament profiles with a color preview and a remove action. */
+function ProfileManager() {
+  const { state, dispatch } = useStore()
+  const profiles = state.settings.filamentProfiles ?? []
+
+  return (
+    <div>
+      <p className="mb-2 text-sm font-medium text-muted-foreground">Saved profiles</p>
+      {profiles.length === 0 ? (
+        <p className="text-sm text-muted-foreground/70">
+          No profiles yet. Fill in the &ldquo;Add filament&rdquo; form and tap Save to create one.
+        </p>
+      ) : (
+        <ul className="space-y-2">
+          {profiles.map((p) => (
+            <li
+              key={p.id}
+              className="flex items-center gap-3 rounded-xl border border-border bg-background/50 p-3"
+            >
+              <SpoolDisc color={p.color} size={40} fill={1} boxed={!!p.containerId} />
+              <div className="min-w-0 flex-1">
+                <p className="truncate text-sm font-semibold text-foreground">{p.name}</p>
+                <p className="truncate font-mono text-xs text-muted-foreground">
+                  {p.material} · {p.brand} · {formatGrams(p.capacity)}
+                </p>
+              </div>
+              <Button
+                variant="ghost"
+                size="sm"
+                aria-label={`Remove ${p.name}`}
+                onClick={() => dispatch({ type: "REMOVE_PROFILE", id: p.id })}
+              >
+                <X className="h-4 w-4" /> Remove
+              </Button>
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  )
+}
+
+/** Map scanned/entered barcodes to saved profiles; scan-to-fill uses these. */
+function BarcodeManager() {
+  const { state, dispatch } = useStore()
+  const profiles = state.settings.filamentProfiles ?? []
+  const barcodes = state.settings.barcodes ?? []
+  const [code, setCode] = useState("")
+  const [profileId, setProfileId] = useState("")
+  const [scannerOpen, setScannerOpen] = useState(false)
+
+  const trimmed = code.trim()
+  const canAdd = trimmed !== "" && profileId !== ""
+  const nameFor = (id: string) => profiles.find((p) => p.id === id)?.name ?? "Unknown profile"
+
+  function add() {
+    if (!canAdd) return
+    dispatch({ type: "ADD_BARCODE", code: trimmed, profileId })
+    setCode("")
+    setProfileId("")
+  }
+
+  return (
+    <div className="space-y-3">
+      <p className="mb-1 text-sm font-medium text-muted-foreground">Barcode links</p>
+      {barcodes.length === 0 ? (
+        <p className="text-sm text-muted-foreground/70">No barcodes linked yet.</p>
+      ) : (
+        <ul className="space-y-2">
+          {barcodes.map((b) => (
+            <li
+              key={b.code}
+              className="flex items-center gap-3 rounded-xl border border-border bg-background/50 p-3"
+            >
+              <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-muted text-muted-foreground" aria-hidden>
+                <BarcodeIcon className="h-5 w-5" />
+              </span>
+              <div className="min-w-0 flex-1">
+                <p className="truncate font-mono text-sm font-semibold text-foreground">{b.code}</p>
+                <p className="truncate text-xs text-muted-foreground">→ {nameFor(b.profileId)}</p>
+              </div>
+              <Button
+                variant="ghost"
+                size="sm"
+                aria-label={`Remove barcode ${b.code}`}
+                onClick={() => dispatch({ type: "REMOVE_BARCODE", code: b.code })}
+              >
+                <X className="h-4 w-4" /> Remove
+              </Button>
+            </li>
+          ))}
+        </ul>
+      )}
+
+      {profiles.length === 0 ? (
+        <p className="text-xs text-muted-foreground/70">Save a profile first, then link a barcode to it.</p>
+      ) : (
+        <div className="rounded-xl border border-border bg-background/50 p-3">
+          <div className="flex flex-col gap-2 sm:flex-row">
+            <Field label="Barcode" className="sm:flex-1">
+              <div className="flex gap-2">
+                <Input
+                  value={code}
+                  onChange={(e) => setCode(e.target.value)}
+                  placeholder="Scan or type a code"
+                  spellCheck={false}
+                  className="font-mono"
+                  aria-label="Barcode value"
+                />
+                <Button variant="outline" onClick={() => setScannerOpen(true)} aria-label="Scan barcode">
+                  <BarcodeIcon className="h-4 w-4" />
+                </Button>
+              </div>
+            </Field>
+            <Field label="Profile" className="sm:w-48">
+              <Select value={profileId} onChange={(e) => setProfileId(e.target.value)} aria-label="Profile to link">
+                <option value="">Choose a profile…</option>
+                {profiles.map((p) => (
+                  <option key={p.id} value={p.id}>
+                    {p.name}
+                  </option>
+                ))}
+              </Select>
+            </Field>
+          </div>
+          <Button className="mt-2" disabled={!canAdd} onClick={add}>
+            <Plus className="h-4 w-4" /> Link barcode
+          </Button>
+        </div>
+      )}
+
+      <BarcodeScanner
+        open={scannerOpen}
+        title="Scan to link"
+        description="Scan the spool barcode you want to map to a profile."
+        onDetected={(c) => {
+          setCode(c)
+          setScannerOpen(false)
+        }}
+        onClose={() => setScannerOpen(false)}
+      />
     </div>
   )
 }

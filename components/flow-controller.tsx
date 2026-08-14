@@ -54,7 +54,13 @@ interface FlowContextValue {
   startStore: (spool: Spool, printer: Printer, printerSlot: number, grams?: number, nodeId?: string) => void
   /** Relocate a stored spool from its slot into another storage unit. */
   startMove: (spool: Spool, from: NodeLocation, destNodeId: string) => void
-  startPlace: (draft: SpoolDraft) => void
+  startPlace: (draft: SpoolDraft, preferredNodeId?: string) => void
+  /**
+   * Redirect a queued store/place item into a different storage unit. Recomputes
+   * a slot in the chosen unit (balanced for a paternoster, linear for a shelf,
+   * appended for a library) while reserving the other queued placements so they
+   * don't collide. No-op for pick, or if the chosen unit has no room. */
+  reassignItemNode: (spoolId: string, nodeId: string) => void
   /**
    * Manual shelf placement: immediately commit ONE queued store/place item into
    * an explicit slot the user tapped — no motion, no "Start" press — and drop it
@@ -87,9 +93,14 @@ function pickDestination(
   // weight into the search weight — the machine balances around the real mass
   // (filament + dry box), not just the filament.
   const weight = grams + containerWeight(containerId, containers)
-  const node = (preferredNodeId ? state.nodes.find((n) => n.id === preferredNodeId) : undefined) ?? activeNode(state)
+  const preferred = preferredNodeId ? state.nodes.find((n) => n.id === preferredNodeId) : undefined
+  const node = preferred ?? activeNode(state)
+  // A library only receives a spool when the user explicitly targets it. If it's
+  // merely the active tab, auto-placement balances across the real storage pool
+  // instead of dumping into the catalog.
+  const canUseLocal = !!preferred || (node.type ?? "paternoster") !== "library"
   const localReserved = reserved.filter((r) => r.nodeId === node.id).map((r) => ({ shelf: r.shelf, slot: r.slot }))
-  const local = bestSlotForNode(node, state.spools, weight, localReserved, containers)
+  const local = canUseLocal ? bestSlotForNode(node, state.spools, weight, localReserved, containers) : null
   if (local) return { nodeId: node.id, shelf: local.shelf, slot: local.slot }
   return bestNodeSlot(state.nodes, state.spools, weight, reserved, containers)
 }
@@ -166,18 +177,49 @@ export function FlowProvider({ children }: { children: ReactNode }) {
         })
       },
 
-      startPlace(draft) {
-        const spool: Spool = { id: newId("spool"), createdAt: Date.now(), ...draft }
-        // Register the spool immediately so it exists during placement.
-        dispatch({ type: "UPSERT_SPOOL", spool })
+      startPlace(draft, preferredNodeId) {
+        // A draft may request several identical spools; queue each into its own
+        // best slot for the chosen unit (or the balanced default when none is
+        // given), reserving destinations as we go so they don't collide.
+        // `preferredNodeId` defaults placement to the unit the user is on (the
+        // active section) — including a library, which auto-placement otherwise
+        // skips. `quantity` is a form-only field and never stored on a spool.
+        const count = Math.max(1, Math.round(draft.quantity ?? 1))
+        const { quantity: _q, ...spoolFields } = draft
         setFlow((prev) => {
           const base = prev?.mode === "place" ? prev.items : []
-          const reserved = base.map((i) => ({ nodeId: i.nodeId, shelf: i.shelf, slot: i.slot }))
-          const dest = pickDestination(state, spool.grams, reserved, undefined, spool.containerId)
-          if (!dest) return prev
+          const created: PendingItem[] = []
+          for (let n = 0; n < count; n++) {
+            const spool: Spool = { id: newId("spool"), createdAt: Date.now(), ...spoolFields }
+            // Register the spool immediately so it exists during placement.
+            dispatch({ type: "UPSERT_SPOOL", spool })
+            const reserved = [...base, ...created].map((i) => ({ nodeId: i.nodeId, shelf: i.shelf, slot: i.slot }))
+            const dest = pickDestination(state, spool.grams, reserved, preferredNodeId, spool.containerId)
+            if (!dest) break
+            created.push({ spool, nodeId: dest.nodeId, shelf: dest.shelf, slot: dest.slot, grams: spoolFields.grams })
+          }
+          if (created.length === 0) return prev
+          return { mode: "place", items: [...base, ...created] }
+        })
+      },
+
+      reassignItemNode(spoolId, nodeId) {
+        setFlow((prev) => {
+          if (!prev || prev.mode === "pick") return prev
+          const item = prev.items.find((i) => i.spool.id === spoolId)
+          if (!item || item.nodeId === nodeId) return prev
+          // Reserve every OTHER queued placement so the new slot doesn't collide.
+          const reserved = prev.items
+            .filter((i) => i.spool.id !== spoolId)
+            .map((i) => ({ nodeId: i.nodeId, shelf: i.shelf, slot: i.slot }))
+          const dest = pickDestination(state, item.grams ?? item.spool.grams, reserved, nodeId, item.spool.containerId)
+          // If the chosen unit is full there's nowhere to go — keep the old slot.
+          if (!dest || dest.nodeId !== nodeId) return prev
           return {
-            mode: "place",
-            items: [...base, { spool, nodeId: dest.nodeId, shelf: dest.shelf, slot: dest.slot, grams: draft.grams }],
+            ...prev,
+            items: prev.items.map((i) =>
+              i.spool.id === spoolId ? { ...i, nodeId: dest.nodeId, shelf: dest.shelf, slot: dest.slot } : i,
+            ),
           }
         })
       },
@@ -224,18 +266,55 @@ export function FlowProvider({ children }: { children: ReactNode }) {
 
       run() {
         if (!flow || flow.items.length === 0) return
-        // Group the queue by storage unit so the job finishes one location before
-        // moving on. Within each motorized carousel, route by proximity to where
-        // it's currently parked so it grabs the nearest queued shelf first instead
-        // of rotating past it. Manual shelves have no position, so they keep a
-        // stable shelf→slot order.
+
+        // A library has no physical location to travel to and no slot to reach
+        // for by hand, so its store/place items commit INSTANTLY here — no
+        // motion overlay, no "Confirm store" tap (mirrors the Add-to-library
+        // flow). We clear the printer/source slot, apply any weight override,
+        // then append the spool. Pick jobs never target a library.
+        const jobItems = flow.items.filter((it) => {
+          if (flow.mode === "pick") return true
+          const node = state.nodes.find((n) => n.id === it.nodeId)
+          if (!node || (node.type ?? "paternoster") !== "library") return true
+          if (it.printerId != null && it.printerSlot != null) {
+            dispatch({ type: "SET_PRINTER_SLOT", printerId: it.printerId, slot: it.printerSlot, spoolId: null })
+          }
+          if (it.from) {
+            dispatch({
+              type: "SET_STORAGE_SLOT",
+              nodeId: it.from.nodeId,
+              shelf: it.from.shelf,
+              slot: it.from.slot,
+              spoolId: null,
+            })
+          }
+          if (typeof it.grams === "number") {
+            dispatch({ type: "UPDATE_SPOOL", id: it.spool.id, changes: { grams: it.grams } })
+          }
+          // slot beyond the row length appends (see SET_STORAGE_SLOT library branch).
+          dispatch({ type: "SET_STORAGE_SLOT", nodeId: it.nodeId, shelf: 0, slot: it.slot, spoolId: it.spool.id })
+          return false
+        })
+
+        if (jobItems.length === 0) {
+          setFlow(null)
+          return
+        }
+
+        // Group the remaining queue by storage unit so the job finishes one
+        // location before moving on. Within each motorized carousel, route by
+        // proximity to where it's currently parked so it grabs the nearest queued
+        // shelf first instead of rotating past it. Manual shelves have no
+        // position, so they keep a stable shelf→slot order.
         const nodePos: Record<string, { currentShelf: number; shelves: number }> = {}
         for (const n of state.nodes) {
-          if ((n.type ?? "paternoster") !== "shelf") {
+          // Only motorized carousels have a position to route by; manual shelf and
+          // library units keep their stable insertion order.
+          if ((n.type ?? "paternoster") === "paternoster") {
             nodePos[n.id] = { currentShelf: n.machine.currentShelf, shelves: n.storage.shelves }
           }
         }
-        const items: QueueItem[] = orderQueueItems(flow.items, nodePos).map((i) => ({
+        const items: QueueItem[] = orderQueueItems(jobItems, nodePos).map((i) => ({
           spoolId: i.spool.id,
           nodeId: i.nodeId,
           shelf: i.shelf,

@@ -173,14 +173,20 @@ export function CarouselView({
                         )}
                       </span>
                       {isCenter && (
-                        <span className="mt-0.5 flex h-9 flex-col items-center justify-start leading-tight">
+                        <span className="mt-0.5 flex h-12 flex-col items-center justify-start leading-tight">
                           {spool ? (
                             <>
-                              <span
-                                className="text-[11px] font-semibold"
-                                style={{ color: spool.color === "#f4f4f5" ? "#e5e5e5" : spool.color }}
-                              >
-                                {spool.material}
+                              {/* Material stays on the foreground token so it is
+                                  legible regardless of the spool colour. */}
+                              <span className="text-[11px] font-semibold text-foreground">{spool.material}</span>
+                              {/* Colour shown as swatch dot + name (matches the library). */}
+                              <span className="flex max-w-full items-center gap-1 text-[10px] text-muted-foreground">
+                                <span
+                                  className="h-2 w-2 shrink-0 rounded-full border border-border"
+                                  style={{ backgroundColor: spool.color }}
+                                  aria-hidden
+                                />
+                                <span className="truncate">{spool.colorName?.trim() || spool.color}</span>
                               </span>
                               <span className="text-[10px] text-muted-foreground">{formatRemaining(spool)}</span>
                             </>

@@ -1,14 +1,23 @@
 "use client"
 
-import { useState } from "react"
+import { useEffect, useRef, useState } from "react"
 import useSWR from "swr"
 import { Plus, Trash2, Printer as PrinterIcon, Wifi, WifiOff, Loader2, Flame } from "lucide-react"
 import { useStore } from "@/lib/store"
 import { cn } from "@/lib/utils"
 import { activePrinter } from "@/lib/selectors"
-import { isLightColor, formatRemaining, spoolFill } from "@/lib/filament"
+import {
+  formatRemaining,
+  spoolFill,
+  lengthToGrams,
+  spoolDensity,
+  spoolDiameter,
+  densityFor,
+  newId,
+} from "@/lib/filament"
 import { klipperHeaterName } from "@/lib/printer-commands"
 import { fetchMoonrakerStatus, isKlipperLinked, type MoonrakerStatus } from "@/lib/moonraker"
+import { fetchBambuStatus, isBambuLinked, type BambuStatus } from "@/lib/bambu"
 import { Button } from "./ui/button"
 import { Input } from "./ui/field"
 import { AmsUnit, Toolhead } from "./ams-unit"
@@ -108,6 +117,156 @@ function liveTempForSlot(live: MoonrakerStatus | undefined, slot: number) {
   return live?.temps?.[klipperHeaterName(slot)]
 }
 
+/**
+ * Poll a Bambu Lab printer's AMS / RFID + print state via the /api/bambu proxy.
+ * Disabled for printers that aren't a linked Bambu machine. Falls back to a
+ * simulation server-side when the real printer is unreachable (preview).
+ */
+function useBambuLive(printer: Printer): BambuStatus | undefined {
+  const enabled = isBambuLinked(printer)
+  const { data } = useSWR<BambuStatus>(
+    enabled ? ["bambu", printer.id, printer.ip, printer.serial] : null,
+    () => fetchBambuStatus(printer),
+    { refreshInterval: 4000, revalidateOnFocus: false, dedupingInterval: 3000 },
+  )
+  return enabled ? data : undefined
+}
+
+/**
+ * Live weight tracking. Watches the printer's reported filament usage and
+ * subtracts grams from *only the spool that is actually printing* — idle loaded
+ * spools are never touched.
+ *
+ * - Klipper: `filament_used` is cumulative millimetres; each increase is
+ *   converted to mass via the active spool's diameter + density and subtracted.
+ *   A counter reset (new print) just re-baselines without consuming.
+ * - Bambu: the active tray's remaining-% decrements are applied against the
+ *   spool's full-spool capacity.
+ */
+function useLiveConsumption(
+  printer: Printer,
+  moonraker: MoonrakerStatus | undefined,
+  bambu: BambuStatus | undefined,
+) {
+  const { state, dispatch } = useStore()
+  const spools = state.spools
+  const defaultDiameter = state.settings.defaultDiameter
+  const prevMm = useRef<number | null>(null)
+  const prevRemain = useRef<Record<number, number>>({})
+
+  // Klipper: mm of filament → grams off the active tool's spool.
+  useEffect(() => {
+    if (!moonraker?.connected || typeof moonraker.filamentUsedMm !== "number") return
+    const mm = moonraker.filamentUsedMm
+    if (prevMm.current === null || mm < prevMm.current) {
+      prevMm.current = mm // first read, or a new print reset the counter
+      return
+    }
+    const delta = mm - prevMm.current
+    prevMm.current = mm
+    if (delta <= 0) return
+    const slot = printer.kind === "toolchanger" ? moonraker.activeTool ?? 0 : 0
+    const id = printer.loaded[slot]
+    const spool = id ? spools[id] : null
+    if (!spool) return
+    const grams = lengthToGrams(delta, spoolDiameter(spool, defaultDiameter), spoolDensity(spool))
+    if (grams > 0) dispatch({ type: "CONSUME_FILAMENT", spoolId: spool.id, grams })
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [moonraker])
+
+  // Bambu: remaining-% decrements on the active tray → grams.
+  useEffect(() => {
+    if (!bambu?.connected) return
+    for (const tray of bambu.trays) {
+      if (!tray.present || typeof tray.remainPct !== "number") continue
+      const prev = prevRemain.current[tray.globalIndex]
+      prevRemain.current[tray.globalIndex] = tray.remainPct
+      if (prev === undefined || tray.remainPct >= prev) continue
+      const id = printer.loaded[tray.globalIndex]
+      const spool = id ? spools[id] : null
+      if (!spool) continue
+      const cap = spool.capacity && spool.capacity > 0 ? spool.capacity : tray.capacityG ?? 1000
+      const grams = ((prev - tray.remainPct) / 100) * cap
+      if (grams > 0) dispatch({ type: "CONSUME_FILAMENT", spoolId: spool.id, grams })
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [bambu])
+}
+
+/**
+ * Auto-create spools from Bambu AMS trays via their RFID uid and seat them in
+ * the matching AMS slot, so a spool scanned by the printer can later be selected
+ * and stored in the paternoster. Idempotent: a slot already holding the tray's
+ * RFID spool is skipped.
+ */
+function useAmsRfidIngest(printer: Printer, bambu: BambuStatus | undefined) {
+  const { state, dispatch } = useStore()
+  const spools = state.spools
+  useEffect(() => {
+    if (!bambu?.connected || printer.kind !== "ams") return
+    for (const tray of bambu.trays) {
+      if (!tray.present || !tray.rfid) continue
+      const currentId = printer.loaded[tray.globalIndex]
+      const current = currentId ? spools[currentId] : null
+      if (current && current.rfidUid === tray.rfid) continue // already seated
+
+      // This tag already belongs to a spool we know about — the user physically
+      // moved that spool to a new slot/AMS unit (or put it back after storing
+      // it). Re-seat the SAME spool record here and refresh its live weight; the
+      // reducer vacates whatever slot/storage it left, so it never ghosts or
+      // duplicates. Its identity (brand/color/name) is preserved untouched. This
+      // takes priority over adoption below so a stray manual spool in this slot
+      // can't hijack a tag that's already assigned elsewhere.
+      const known = Object.values(spools).find((s) => s.rfidUid && s.rfidUid === tray.rfid)
+      if (known) {
+        const cap = known.capacity && known.capacity > 0 ? known.capacity : tray.capacityG && tray.capacityG > 0 ? tray.capacityG : 1000
+        const grams = typeof tray.remainPct === "number" ? Math.round((tray.remainPct / 100) * cap) : known.grams
+        dispatch({ type: "INGEST_AMS_TRAY", printerId: printer.id, slot: tray.globalIndex, spool: { ...known, grams } })
+        continue
+      }
+
+      // The slot already holds a spool the user picked/loaded manually (it has
+      // no tag yet). Adopt it rather than replacing it: bind this tag so future
+      // reads match, and refresh only the live remaining weight. The user's
+      // chosen material/brand/color/name always win, so nothing is overwritten
+      // or orphaned. A slot holding a *different* tagged spool falls through to
+      // ingest below, since that means a tagged spool was physically swapped in.
+      if (current && !current.rfidUid) {
+        const changes: Partial<Spool> = { rfidUid: tray.rfid }
+        if (typeof tray.remainPct === "number") {
+          const cap =
+            current.capacity && current.capacity > 0
+              ? current.capacity
+              : tray.capacityG && tray.capacityG > 0
+                ? tray.capacityG
+                : 1000
+          changes.grams = Math.round((tray.remainPct / 100) * cap)
+        }
+        dispatch({ type: "UPDATE_SPOOL", id: current.id, changes })
+        continue
+      }
+
+      const capacity = tray.capacityG && tray.capacityG > 0 ? tray.capacityG : 1000
+      const remain = typeof tray.remainPct === "number" ? tray.remainPct : 100
+      const material = tray.material || "PLA"
+      const spool = {
+        id: newId("spool"),
+        material,
+        brand: tray.brand || "Bambu",
+        color: tray.color || "#8b5cf6",
+        colorName: tray.colorName || `${material} ${tray.color ?? ""}`.trim(),
+        grams: Math.round((remain / 100) * capacity),
+        capacity,
+        density: densityFor(material),
+        rfidUid: tray.rfid,
+        createdAt: Date.now(),
+      }
+      dispatch({ type: "INGEST_AMS_TRAY", printerId: printer.id, slot: tray.globalIndex, spool })
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [bambu])
+}
+
 function PrinterCard({
   printer,
   spools,
@@ -124,11 +283,16 @@ function PrinterCard({
   // Live status/temps are read-only: we poll Moonraker and display the nozzle
   // temperature the printer reports. The app never commands the heaters.
   const live = useMoonrakerLive(printer)
+  const bambu = useBambuLive(printer)
+  // Subtract filament from the actively-printing spool, and auto-ingest AMS
+  // trays (RFID) so scanned Bambu spools can be stored afterwards.
+  useLiveConsumption(printer, live, bambu)
+  useAmsRfidIngest(printer, bambu)
 
   return (
     <div className="lg:min-h-0 lg:flex-1 lg:overflow-auto lg:scrollbar-thin">
       <PrinterHeader printer={printer} onRemove={onRemove} />
-      <PrinterLinkRow printer={printer} live={live} />
+      <PrinterLinkRow printer={printer} live={live} bambu={bambu} />
       <PrinterBody printer={printer} spools={spools} onSlot={onSlot} queuedPrinterSlots={queuedPrinterSlots} live={live} />
     </div>
   )
@@ -160,11 +324,17 @@ function PrinterHeader({ printer, onRemove }: { printer: Printer; onRemove: () =
  * reflects live polling of Moonraker (`live`), including any error message.
  * Non-Klipper / unlinked printers show a neutral "not linked" hint.
  */
-function PrinterLinkRow({ printer, live }: { printer: Printer; live?: MoonrakerStatus }) {
+function PrinterLinkRow({ printer, live, bambu }: { printer: Printer; live?: MoonrakerStatus; bambu?: BambuStatus }) {
   const { dispatch } = useStore()
   const [ip, setIp] = useState(printer.ip ?? "")
   const [editing, setEditing] = useState(!printer.ip)
   const klipperLinked = isKlipperLinked(printer)
+
+  // Bambu printers link via serial + access code (set when adding the printer),
+  // so show a live MQTT/AMS status row instead of the Klipper IP editor.
+  if (printer.firmware === "bambu") {
+    return <BambuLinkRow printer={printer} bambu={bambu} />
+  }
 
   function save() {
     const trimmed = ip.trim()
@@ -250,6 +420,62 @@ function PrinterLinkRow({ printer, live }: { printer: Printer; live?: MoonrakerS
         <Button size="sm" variant="ghost" onClick={unlink}>
           Unlink
         </Button>
+      </div>
+    </div>
+  )
+}
+
+/**
+ * Bambu Lab link status row. The connection (serial + access code) is set when
+ * the printer is added; here we only reflect the live MQTT/AMS read. In the
+ * hosted preview the LAN printer is unreachable, so the proxy returns a
+ * simulation — surfaced honestly as "Simulated (preview)".
+ */
+function BambuLinkRow({ printer, bambu }: { printer: Printer; bambu?: BambuStatus }) {
+  const linked = isBambuLinked(printer)
+  const connecting = linked && bambu === undefined
+  const simulated = bambu?.connected === true && bambu.simulated === true
+  const connected = bambu?.connected === true && !bambu.simulated
+  const error = linked ? bambu?.error : undefined
+
+  const status: "online" | "checking" | "offline" = connected || simulated ? "online" : connecting ? "checking" : "offline"
+  const dot =
+    status === "online"
+      ? simulated
+        ? "bg-warning"
+        : "bg-success"
+      : status === "checking"
+        ? "bg-warning animate-pulse"
+        : "bg-muted-foreground/50"
+  const StatusIcon = status === "online" ? Wifi : status === "checking" ? Loader2 : WifiOff
+  const statusColor =
+    status === "online" ? (simulated ? "text-warning" : "text-success") : status === "checking" ? "text-warning" : "text-muted-foreground"
+  const statusLabel = !linked
+    ? "Add serial + access code to link"
+    : simulated
+      ? "Simulated (preview)"
+      : connected
+        ? "Connected (MQTT)"
+        : connecting
+          ? "Connecting…"
+          : "Not reachable"
+
+  return (
+    <div className="mb-3 flex items-center justify-between gap-2 rounded-xl border border-border bg-background/40 p-3">
+      <div className="flex min-w-0 items-center gap-2">
+        <span className={cn("h-2.5 w-2.5 shrink-0 rounded-full", dot)} />
+        <StatusIcon className={cn("h-4 w-4 shrink-0", statusColor, status === "checking" && "animate-spin")} />
+        <div className="min-w-0">
+          <p className={cn("text-sm font-medium", statusColor)}>{statusLabel}</p>
+          <p className="truncate font-mono text-xs text-muted-foreground">
+            {printer.serial ? `SN ${printer.serial}` : "No serial"}
+            {printer.bambuMode === "cloud" ? " · cloud" : printer.ip ? ` · ${printer.ip}` : ""}
+          </p>
+          {error && <p className="truncate text-xs text-destructive">{error}</p>}
+          {simulated && (
+            <p className="text-xs text-muted-foreground">Self-host on the printer&apos;s LAN for real AMS data.</p>
+          )}
+        </div>
       </div>
     </div>
   )
@@ -380,7 +606,12 @@ function NozzleTempChip({
 function SpoolMeta({ spool }: { spool: Spool }) {
   return (
     <div className="mt-1">
-      <p className="text-lg font-semibold" style={{ color: isLightColor(spool.color) ? "#d4d4d8" : spool.color }}>
+      <p className="flex items-center gap-2 text-lg font-semibold text-foreground">
+        <span
+          className="h-3 w-3 shrink-0 rounded-full border border-border"
+          style={{ backgroundColor: spool.color }}
+          aria-hidden
+        />
         {spool.material} · {spool.colorName}
       </p>
       <p className="text-sm text-muted-foreground">

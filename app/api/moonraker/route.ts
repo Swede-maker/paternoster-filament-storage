@@ -66,14 +66,19 @@ export async function POST(req: NextRequest) {
     // Status + live temperatures (read-only). This route never sends commands.
     const heaters = Array.isArray(body.heaters) && body.heaters.length ? body.heaters : ["extruder"]
     // e.g. extruder=temperature,target&extruder1=temperature,target
-    const query = heaters.map((h) => `${encodeURIComponent(h)}=temperature,target`).join("&")
+    // Also read print_stats (filament_used mm + state) for live weight tracking
+    // and gcode_move/toolhead to know which extruder is currently active.
+    const heaterQuery = heaters.map((h) => `${encodeURIComponent(h)}=temperature,target`).join("&")
+    const query = `${heaterQuery}&print_stats&gcode_move&toolhead`
     const url = `${base}/printer/objects/query?${query}`
     const res = await fetchWithTimeout(url, { method: "GET", headers }, 5000)
     if (!res.ok) {
       return NextResponse.json({ ok: false, error: `Moonraker responded ${res.status}` }, { status: 502 })
     }
     const json = (await res.json()) as {
-      result?: { status?: Record<string, { temperature?: number; target?: number }> }
+      result?: {
+        status?: Record<string, any>
+      }
     }
     const status = json.result?.status ?? {}
     const temps: Record<string, { actual: number; target: number }> = {}
@@ -81,7 +86,18 @@ export async function POST(req: NextRequest) {
       const s = status[h]
       if (s) temps[h] = { actual: s.temperature ?? 0, target: s.target ?? 0 }
     }
-    return NextResponse.json({ ok: true, connected: true, temps })
+
+    const printStats = status["print_stats"] ?? {}
+    const printState: string = typeof printStats.state === "string" ? printStats.state : "unknown"
+    const filamentUsedMm: number = typeof printStats.filament_used === "number" ? printStats.filament_used : 0
+
+    // Which extruder is active. Klipper exposes the active extruder name on
+    // `toolhead.extruder` (e.g. "extruder", "extruder1"). Derive its index.
+    const toolhead = status["toolhead"] ?? {}
+    const activeName: string = typeof toolhead.extruder === "string" ? toolhead.extruder : "extruder"
+    const activeTool = activeName === "extruder" ? 0 : Number.parseInt(activeName.replace("extruder", ""), 10) || 0
+
+    return NextResponse.json({ ok: true, connected: true, temps, printState, filamentUsedMm, activeTool })
   } catch (err) {
     const message = err instanceof Error && err.name === "AbortError" ? "Printer did not respond (timeout)" : "Could not reach printer"
     return NextResponse.json({ ok: false, error: message }, { status: 504 })
