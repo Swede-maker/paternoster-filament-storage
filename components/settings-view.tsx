@@ -269,6 +269,11 @@ function NodeList() {
         const isMaster = node.role === "master"
         const isActive = node.id === state.activeNodeId
         const total = nodeSlotCount(node)
+        // Count only slots that resolve to a spool that still exists — the same
+        // occupancy definition the Library view uses. The raw slot array keeps
+        // its (now-empty) entries after a delete, so its length would report a
+        // stale count (the "still says 5 spools after deleting them" bug).
+        const librarySpools = (node.slots[0] ?? []).filter((id) => id && state.spools[id]).length
         return (
           <li
             key={node.id}
@@ -335,7 +340,9 @@ function NodeList() {
                     </span>
                   )}
                   <span className="font-mono">
-                    {isLibrary ? `${node.slots[0]?.length ?? 0} spools` : `${node.slots.length} shelves · ${total} slots`}
+                    {isLibrary
+                      ? `${librarySpools} ${librarySpools === 1 ? "spool" : "spools"}`
+                      : `${node.slots.length} shelves · ${total} slots`}
                   </span>
                 </p>
               </div>
