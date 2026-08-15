@@ -50,12 +50,13 @@ export type BambuStatus = {
 
 /** Whether we can read real AMS/RFID data for this printer over MQTT. */
 export function isBambuLinked(printer: Printer): boolean {
-  return (
-    printer.firmware === "bambu" &&
-    !!printer.serial?.trim() &&
-    !!printer.accessCode?.trim() &&
-    (printer.bambuMode !== "lan" || !!printer.ip?.trim())
-  )
+  if (printer.firmware !== "bambu" || !printer.serial?.trim()) return false
+  if (printer.bambuMode === "cloud") {
+    // Cloud needs an account token + uid (obtained by signing in).
+    return !!printer.bambuToken?.trim() && !!printer.bambuUid?.trim()
+  }
+  // LAN needs an access code and the printer's IP.
+  return !!printer.accessCode?.trim() && !!printer.ip?.trim()
 }
 
 function connectionPayload(printer: Printer) {
@@ -64,9 +65,119 @@ function connectionPayload(printer: Printer) {
     serial: printer.serial,
     accessCode: printer.accessCode,
     mode: printer.bambuMode ?? "lan",
+    region: printer.bambuRegion ?? "global",
+    token: printer.bambuToken,
+    uid: printer.bambuUid,
     amsUnits: Math.max(1, printer.amsUnits),
     slotsPerAms: Math.max(1, printer.slotsPerAms),
   }
+}
+
+// ---------------------------------------------------------------------------
+// Bambu cloud sign-in helpers (talk to /api/bambu/cloud-login).
+// ---------------------------------------------------------------------------
+
+export type BambuRegion = "global" | "china"
+
+/** A completed cloud sign-in: the tokens needed to stay connected. */
+export type BambuTokens = {
+  token: string
+  uid: string
+  /** Present when the account supports silent refresh. */
+  refreshToken?: string
+  /** Epoch-ms hint of when `token` stops working. */
+  expiresAt?: number
+}
+
+/** Result of a cloud login step. */
+export type BambuLoginResult =
+  | ({ ok: true } & BambuTokens)
+  | { ok: true; needVerify: true }
+  | { ok: true; needTfa: true; tfaKey: string }
+  | { ok: false; error: string }
+
+export type BambuCloudDevice = {
+  serial: string
+  name: string
+  model: string
+  online: boolean
+}
+
+async function postCloud(payload: Record<string, unknown>): Promise<any> {
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), 15000)
+  try {
+    const res = await fetch("/api/bambu/cloud-login", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+      signal: controller.signal,
+    })
+    const raw = await res.text()
+    try {
+      return raw ? JSON.parse(raw) : { ok: false, error: `Empty response (${res.status})` }
+    } catch {
+      return { ok: false, error: `Unexpected response (${res.status})` }
+    }
+  } catch (err) {
+    if (err instanceof DOMException && err.name === "AbortError") {
+      return { ok: false, error: "Sign-in timed out" }
+    }
+    const msg = err instanceof Error ? err.message : "Request failed"
+    return { ok: false, error: msg === "Failed to fetch" ? "Could not reach the app server" : msg }
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+/** Step 1: sign in with email + password. May require a follow-up code. */
+export async function bambuCloudLogin(region: BambuRegion, email: string, password: string): Promise<BambuLoginResult> {
+  return (await postCloud({ action: "login", region, email, password })) as BambuLoginResult
+}
+
+/** Step 2a: complete an email-verification-code login. */
+export async function bambuCloudVerify(
+  region: BambuRegion,
+  email: string,
+  password: string,
+  code: string,
+): Promise<BambuLoginResult> {
+  return (await postCloud({ action: "verify", region, email, password, code })) as BambuLoginResult
+}
+
+/** Step 2b: complete a 2FA (authenticator) login. */
+export async function bambuCloudTfa(region: BambuRegion, tfaKey: string, code: string): Promise<BambuLoginResult> {
+  return (await postCloud({ action: "tfa", region, tfaKey, code })) as BambuLoginResult
+}
+
+/** List the printers bound to the signed-in account. */
+export async function bambuCloudDevices(
+  region: BambuRegion,
+  token: string,
+): Promise<{ ok: true; devices: BambuCloudDevice[] } | { ok: false; error: string }> {
+  const json = await postCloud({ action: "devices", region, token })
+  if (json?.ok && Array.isArray(json.devices)) return { ok: true, devices: json.devices as BambuCloudDevice[] }
+  return { ok: false, error: json?.error ?? "Could not list devices" }
+}
+
+/** Silently exchange a refresh token for a fresh access token. */
+export async function bambuCloudRefresh(
+  region: BambuRegion,
+  refreshToken: string,
+): Promise<{ ok: true; tokens: BambuTokens } | { ok: false; error: string }> {
+  const json = await postCloud({ action: "refresh", region, refreshToken })
+  if (json?.ok && typeof json.token === "string") {
+    return {
+      ok: true,
+      tokens: {
+        token: json.token,
+        uid: String(json.uid ?? ""),
+        refreshToken: json.refreshToken,
+        expiresAt: json.expiresAt,
+      },
+    }
+  }
+  return { ok: false, error: json?.error ?? "Token refresh failed" }
 }
 
 /** Query the printer's AMS/RFID + print state. Never throws. */

@@ -175,6 +175,30 @@ export interface Printer {
   accessCode?: string
   /** Bambu Lab only: connect over the local network ("lan") or cloud ("cloud"). */
   bambuMode?: "lan" | "cloud"
+  /**
+   * Bambu Lab cloud only: which Bambu account region the token belongs to.
+   * "global" → api.bambulab.com / us.mqtt.bambulab.com,
+   * "china"  → api.bambulab.cn  / cn.mqtt.bambulab.com.
+   */
+  bambuRegion?: "global" | "china"
+  /**
+   * Bambu Lab cloud only: the account access token obtained from signing in.
+   * The user's password is never stored — only this token, used to connect to
+   * the cloud MQTT broker. Synced like the LAN access code.
+   */
+  bambuToken?: string
+  /** Bambu Lab cloud only: account user id, used as the MQTT username `u_<uid>`. */
+  bambuUid?: string
+  /** Bambu Lab cloud only: the signed-in account email, shown in the UI. */
+  bambuAccountEmail?: string
+  /**
+   * Bambu Lab cloud only: refresh token used to silently mint a new access
+   * token before the current one expires — so the printer stays linked without
+   * re-entering the password. Never the password itself.
+   */
+  bambuRefreshToken?: string
+  /** Bambu Lab cloud only: epoch-ms hint of when `bambuToken` stops working. */
+  bambuTokenExpiresAt?: number
   /** Live connection state for the optional printer link. */
   link?: PrinterLinkStatus
 }

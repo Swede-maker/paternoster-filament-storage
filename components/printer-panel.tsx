@@ -17,12 +17,13 @@ import {
 } from "@/lib/filament"
 import { klipperHeaterName } from "@/lib/printer-commands"
 import { fetchMoonrakerStatus, isKlipperLinked, type MoonrakerStatus } from "@/lib/moonraker"
-import { fetchBambuStatus, isBambuLinked, type BambuStatus } from "@/lib/bambu"
+import { fetchBambuStatus, isBambuLinked, bambuCloudRefresh, type BambuStatus } from "@/lib/bambu"
 import { Button } from "./ui/button"
 import { Input } from "./ui/field"
 import { AmsUnit, Toolhead } from "./ams-unit"
 import { SpoolDisc } from "./spool"
 import { AddPrinterDialog } from "./add-printer-dialog"
+import { BambuCloudSignIn } from "./bambu-cloud-sign-in"
 import type { Printer, Spool } from "@/lib/types"
 
 export function PrinterPanel({
@@ -129,7 +130,73 @@ function useBambuLive(printer: Printer): BambuStatus | undefined {
     () => fetchBambuStatus(printer),
     { refreshInterval: 4000, revalidateOnFocus: false, dedupingInterval: 3000 },
   )
+  useBambuTokenRefresh(printer)
   return enabled ? data : undefined
+}
+
+/**
+ * Keep a cloud-linked Bambu printer signed in without the user re-entering their
+ * password. Cloud access tokens expire; before that happens we exchange the
+ * stored refresh token for a fresh access token (and rotated refresh token) and
+ * persist them. Runs only for cloud printers that have a refresh token.
+ *
+ * Refreshes when the token is within REFRESH_LEAD_MS of expiring (or already
+ * expired). A per-printer ref guards against firing twice while a request is in
+ * flight or after a permanent failure, so a bad refresh token can't hammer the
+ * endpoint every tick.
+ */
+function useBambuTokenRefresh(printer: Printer) {
+  const { dispatch } = useStore()
+  // Guard: `true` while a refresh is in flight or has permanently failed for the
+  // current token, so the interval doesn't retry on every tick. Keyed by token
+  // so a freshly minted token clears the guard and can refresh again later.
+  const lockRef = useRef<string | null>(null)
+
+  const isCloud = printer.bambuMode === "cloud"
+  const refreshToken = printer.bambuRefreshToken
+  const expiresAt = printer.bambuTokenExpiresAt
+  const region = printer.bambuRegion ?? "global"
+  const printerId = printer.id
+  const token = printer.bambuToken
+
+  useEffect(() => {
+    if (!isCloud || !refreshToken) return
+    // Refresh this far ahead of expiry so a fresh token is ready before the
+    // MQTT poll needs it. If we have no expiry hint, treat it as "refresh soon".
+    const REFRESH_LEAD_MS = 5 * 60 * 1000
+
+    const maybeRefresh = async () => {
+      // Nothing to do until we're inside the lead window (or expiry unknown).
+      const due = expiresAt === undefined || Date.now() >= expiresAt - REFRESH_LEAD_MS
+      if (!due) return
+      // Already tried for this exact token — don't spam the endpoint.
+      if (lockRef.current === (token ?? refreshToken)) return
+      lockRef.current = token ?? refreshToken
+
+      const res = await bambuCloudRefresh(region, refreshToken)
+      if (!res.ok) {
+        // Leave the lock set so we don't retry a bad token every tick; a manual
+        // Re-link (new token) resets it via the effect's dependency change.
+        console.log("[v0] Bambu token refresh failed:", res.error)
+        return
+      }
+      dispatch({
+        type: "UPDATE_PRINTER",
+        id: printerId,
+        changes: {
+          bambuToken: res.tokens.token,
+          bambuUid: res.tokens.uid || undefined,
+          bambuRefreshToken: res.tokens.refreshToken ?? refreshToken,
+          bambuTokenExpiresAt: res.tokens.expiresAt,
+        },
+      })
+    }
+
+    // Check immediately on mount/token-change, then on a modest interval.
+    void maybeRefresh()
+    const iv = setInterval(maybeRefresh, 60 * 1000)
+    return () => clearInterval(iv)
+  }, [isCloud, refreshToken, expiresAt, region, printerId, token, dispatch])
 }
 
 /**
@@ -432,11 +499,17 @@ function PrinterLinkRow({ printer, live, bambu }: { printer: Printer; live?: Moo
  * simulation — surfaced honestly as "Simulated (preview)".
  */
 function BambuLinkRow({ printer, bambu }: { printer: Printer; bambu?: BambuStatus }) {
+  const { dispatch } = useStore()
+  const [signingIn, setSigningIn] = useState(false)
   const linked = isBambuLinked(printer)
   const connecting = linked && bambu === undefined
   const simulated = bambu?.connected === true && bambu.simulated === true
   const connected = bambu?.connected === true && !bambu.simulated
   const error = linked ? bambu?.error : undefined
+  const isCloud = printer.bambuMode === "cloud"
+  // Offer a cloud sign-in when this is a cloud printer that isn't linked yet
+  // (never signed in, or the saved token was cleared).
+  const needsCloudSignIn = isCloud && !linked
 
   const status: "online" | "checking" | "offline" = connected || simulated ? "online" : connecting ? "checking" : "offline"
   const dot =
@@ -461,22 +534,55 @@ function BambuLinkRow({ printer, bambu }: { printer: Printer; bambu?: BambuStatu
           : "Not reachable"
 
   return (
-    <div className="mb-3 flex items-center justify-between gap-2 rounded-xl border border-border bg-background/40 p-3">
-      <div className="flex min-w-0 items-center gap-2">
-        <span className={cn("h-2.5 w-2.5 shrink-0 rounded-full", dot)} />
-        <StatusIcon className={cn("h-4 w-4 shrink-0", statusColor, status === "checking" && "animate-spin")} />
-        <div className="min-w-0">
-          <p className={cn("text-sm font-medium", statusColor)}>{statusLabel}</p>
-          <p className="truncate font-mono text-xs text-muted-foreground">
-            {printer.serial ? `SN ${printer.serial}` : "No serial"}
-            {printer.bambuMode === "cloud" ? " · cloud" : printer.ip ? ` · ${printer.ip}` : ""}
-          </p>
-          {error && <p className="truncate text-xs text-destructive">{error}</p>}
-          {simulated && (
-            <p className="text-xs text-muted-foreground">Self-host on the printer&apos;s LAN for real AMS data.</p>
-          )}
+    <div className="mb-3 rounded-xl border border-border bg-background/40 p-3">
+      <div className="flex items-center justify-between gap-2">
+        <div className="flex min-w-0 items-center gap-2">
+          <span className={cn("h-2.5 w-2.5 shrink-0 rounded-full", dot)} />
+          <StatusIcon className={cn("h-4 w-4 shrink-0", statusColor, status === "checking" && "animate-spin")} />
+          <div className="min-w-0">
+            <p className={cn("text-sm font-medium", statusColor)}>{statusLabel}</p>
+            <p className="truncate font-mono text-xs text-muted-foreground">
+              {printer.serial ? `SN ${printer.serial}` : "No serial"}
+              {isCloud ? " · cloud" : printer.ip ? ` · ${printer.ip}` : ""}
+              {isCloud && printer.bambuAccountEmail ? ` · ${printer.bambuAccountEmail}` : ""}
+            </p>
+            {error && <p className="truncate text-xs text-destructive">{error}</p>}
+            {simulated && (
+              <p className="text-xs text-muted-foreground">Self-host on the printer&apos;s LAN for real AMS data.</p>
+            )}
+          </div>
         </div>
+        {isCloud && (
+          <Button variant="ghost" size="sm" className="shrink-0" onClick={() => setSigningIn((s) => !s)}>
+            {signingIn ? "Close" : linked ? "Re-link" : "Sign in"}
+          </Button>
+        )}
       </div>
+
+      {isCloud && (signingIn || needsCloudSignIn) && (
+        <div className="mt-3">
+          <BambuCloudSignIn
+            onLinked={(link) => {
+              dispatch({
+                type: "UPDATE_PRINTER",
+                id: printer.id,
+                changes: {
+                  bambuMode: "cloud",
+                  bambuRegion: link.region,
+                  bambuToken: link.token,
+                  bambuUid: link.uid,
+                  bambuAccountEmail: link.email,
+                  bambuRefreshToken: link.refreshToken,
+                  bambuTokenExpiresAt: link.expiresAt,
+                  serial: link.serial,
+                  link: "checking",
+                },
+              })
+              setSigningIn(false)
+            }}
+          />
+        </div>
+      )}
     </div>
   )
 }

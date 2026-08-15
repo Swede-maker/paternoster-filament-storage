@@ -8,6 +8,7 @@ import { Button } from "./ui/button"
 import { Field, Input, Segmented, NumberChips } from "./ui/field"
 import { newId, printerSlotCount, MAX_PRINTERS } from "@/lib/filament"
 import type { Printer, PrinterKind, PrinterFirmware } from "@/lib/types"
+import { BambuCloudSignIn, type BambuCloudLink } from "./bambu-cloud-sign-in"
 
 export function AddPrinterDialog({ open, onClose }: { open: boolean; onClose: () => void }) {
   const { state, dispatch } = useStore()
@@ -24,6 +25,8 @@ export function AddPrinterDialog({ open, onClose }: { open: boolean; onClose: ()
   const [serial, setSerial] = useState("")
   const [accessCode, setAccessCode] = useState("")
   const [bambuMode, setBambuMode] = useState<"lan" | "cloud">("lan")
+  // Result of a completed Bambu cloud sign-in (cloud mode only).
+  const [cloudLink, setCloudLink] = useState<BambuCloudLink | null>(null)
 
   const atLimit = state.printers.length >= MAX_PRINTERS
   const isBambu = firmware === "bambu"
@@ -41,11 +44,19 @@ export function AddPrinterDialog({ open, onClose }: { open: boolean; onClose: ()
     setSerial("")
     setAccessCode("")
     setBambuMode("lan")
+    setCloudLink(null)
   }
+
+  // Cloud Bambu printers are only ready once the user has signed in and picked
+  // a device; LAN printers just need their fields filled as before.
+  const isBambuCloud = isBambu && bambuMode === "cloud"
+  const canSubmit = !atLimit && (!isBambuCloud || !!cloudLink)
 
   function submit() {
     const draft = { kind, amsUnits, slotsPerAms, toolheads }
     const count = printerSlotCount(draft)
+    // For a cloud Bambu printer the serial comes from the chosen cloud device.
+    const bambuSerial = isBambuCloud ? cloudLink?.serial : serial.trim() || undefined
     const printer: Printer = {
       id: newId("printer"),
       name: name.trim() || `Printer ${state.printers.length + 1}`,
@@ -59,12 +70,19 @@ export function AddPrinterDialog({ open, onClose }: { open: boolean; onClose: ()
       firmware: kind === "toolchanger" || ip.trim() || isBambu ? firmware : undefined,
       loaded: Array.from({ length: count }, () => null),
       // Bambu LAN also uses the IP; cloud mode doesn't require it.
-      ip: ip.trim() || undefined,
+      ip: isBambuCloud ? undefined : ip.trim() || undefined,
       port: !isBambu && ip.trim() ? Number.parseInt(port) || 7125 : undefined,
       apiKey: !isBambu && ip.trim() && apiKey.trim() ? apiKey.trim() : undefined,
-      serial: isBambu && serial.trim() ? serial.trim() : undefined,
-      accessCode: isBambu && accessCode.trim() ? accessCode.trim() : undefined,
+      serial: isBambu ? bambuSerial : undefined,
+      accessCode: isBambu && !isBambuCloud && accessCode.trim() ? accessCode.trim() : undefined,
       bambuMode: isBambu ? bambuMode : undefined,
+      // Cloud account link (tokens only — never the password).
+      bambuRegion: isBambuCloud ? cloudLink?.region : undefined,
+      bambuToken: isBambuCloud ? cloudLink?.token : undefined,
+      bambuUid: isBambuCloud ? cloudLink?.uid : undefined,
+      bambuAccountEmail: isBambuCloud ? cloudLink?.email : undefined,
+      bambuRefreshToken: isBambuCloud ? cloudLink?.refreshToken : undefined,
+      bambuTokenExpiresAt: isBambuCloud ? cloudLink?.expiresAt : undefined,
       link: "offline",
     }
     dispatch({ type: "ADD_PRINTER", printer })
@@ -157,45 +175,65 @@ export function AddPrinterDialog({ open, onClose }: { open: boolean; onClose: ()
                   <Segmented
                     className="w-full [&>button]:flex-1"
                     value={bambuMode}
-                    onChange={(v) => setBambuMode(v as "lan" | "cloud")}
+                    onChange={(v) => {
+                      const next = v as "lan" | "cloud"
+                      setBambuMode(next)
+                      // Drop a stale cloud sign-in when switching back to LAN.
+                      if (next === "lan") setCloudLink(null)
+                    }}
                     options={[
                       { value: "lan", label: "LAN (local)" },
                       { value: "cloud", label: "Cloud" },
                     ]}
                   />
                 </Field>
-                <Field label="Serial number">
-                  <Input
-                    value={serial}
-                    onChange={(e) => setSerial(e.target.value)}
-                    placeholder="e.g. 01P00A1234567890"
-                    spellCheck={false}
-                    className="font-mono"
-                  />
-                </Field>
-                <Field label="Access code">
-                  <Input
-                    value={accessCode}
-                    onChange={(e) => setAccessCode(e.target.value)}
-                    placeholder="8-digit code from the printer screen"
-                    spellCheck={false}
-                    className="font-mono"
-                  />
-                </Field>
-                {bambuMode === "lan" && (
-                  <Field label="Printer IP address">
-                    <Input
-                      value={ip}
-                      onChange={(e) => setIp(e.target.value)}
-                      placeholder="e.g. 192.168.1.50"
-                      inputMode="decimal"
+
+                {bambuMode === "lan" ? (
+                  <>
+                    <Field label="Serial number">
+                      <Input
+                        value={serial}
+                        onChange={(e) => setSerial(e.target.value)}
+                        placeholder="e.g. 01P00A1234567890"
+                        spellCheck={false}
+                        className="font-mono"
+                      />
+                    </Field>
+                    <Field label="Access code">
+                      <Input
+                        value={accessCode}
+                        onChange={(e) => setAccessCode(e.target.value)}
+                        placeholder="8-digit code from the printer screen"
+                        spellCheck={false}
+                        className="font-mono"
+                      />
+                    </Field>
+                    <Field label="Printer IP address">
+                      <Input
+                        value={ip}
+                        onChange={(e) => setIp(e.target.value)}
+                        placeholder="e.g. 192.168.1.50"
+                        inputMode="decimal"
+                      />
+                    </Field>
+                    <p className="text-xs text-muted-foreground">
+                      Find the access code and serial under Settings → WLAN / Device on the printer. Real AMS reads work
+                      when the app is self-hosted on the printer&apos;s network; the preview shows simulated trays.
+                    </p>
+                  </>
+                ) : (
+                  <>
+                    <BambuCloudSignIn
+                      linkedEmail={cloudLink ? `${cloudLink.email} · ${cloudLink.deviceName}` : undefined}
+                      onLinked={setCloudLink}
+                      onSignOut={() => setCloudLink(null)}
                     />
-                  </Field>
+                    <p className="text-xs text-muted-foreground">
+                      Sign in with your Bambu account to link a printer over the cloud — no LAN Mode required, and you
+                      keep Bambu&apos;s cloud features. Only an access token is stored, never your password.
+                    </p>
+                  </>
                 )}
-                <p className="text-xs text-muted-foreground">
-                  Find the access code and serial under Settings → WLAN / Device on the printer. Real AMS reads work when
-                  the app is self-hosted on the printer&apos;s network; the preview shows simulated trays.
-                </p>
               </div>
             ) : (
               <>
@@ -243,7 +281,7 @@ export function AddPrinterDialog({ open, onClose }: { open: boolean; onClose: ()
         <Button variant="ghost" onClick={onClose}>
           Cancel
         </Button>
-        <Button onClick={submit} disabled={atLimit}>
+        <Button onClick={submit} disabled={!canSubmit}>
           Add printer
         </Button>
       </DialogFooter>

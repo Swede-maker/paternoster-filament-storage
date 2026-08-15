@@ -26,6 +26,10 @@ type Body = {
   amsUnits?: number
   slotsPerAms?: number
   action?: "status"
+  // Cloud mode only:
+  region?: "global" | "china"
+  token?: string
+  uid?: string
 }
 
 type Tray = {
@@ -131,22 +135,45 @@ function simulate(serial: string, amsUnits: number, slotsPerAms: number): { tray
   return { trays, activeTray: 0, printState: "RUNNING" }
 }
 
+/** How to reach the printer's MQTT: directly on the LAN, or via Bambu cloud. */
+type MqttTarget =
+  | { transport: "lan"; ip: string; accessCode: string }
+  | { transport: "cloud"; region: "global" | "china"; uid: string; token: string }
+
+/** Cloud MQTT broker host per account region. */
+function cloudBroker(region: "global" | "china"): string {
+  return region === "china" ? "cn.mqtt.bambulab.com" : "us.mqtt.bambulab.com"
+}
+
 /** Read one full report over MQTT, or reject on timeout. */
-async function readOverMqtt(ip: string, serial: string, accessCode: string, amsUnits: number, slotsPerAms: number, ms: number) {
+async function readOverMqtt(
+  target: MqttTarget,
+  serial: string,
+  amsUnits: number,
+  slotsPerAms: number,
+  ms: number,
+) {
   // Import mqtt lazily so a bundling/load problem with this Node-only package
   // can't crash the whole route module at import time (which would make EVERY
   // request fail with "Could not reach the app server"). If it can't load, this
   // throws and the caller falls back to the simulation.
   const mqtt = (await import("mqtt")).default
   return new Promise<{ trays: Tray[]; activeTray: number | null; printState?: string }>((resolve, reject) => {
-    const url = `mqtts://${ip.replace(/^mqtts?:\/\//, "").replace(/\/+$/, "")}:8883`
+    // LAN: connect straight to the printer with `bblp` + access code.
+    // Cloud: connect to the regional broker with `u_<uid>` + account token.
+    const url =
+      target.transport === "lan"
+        ? `mqtts://${target.ip.replace(/^mqtts?:\/\//, "").replace(/\/+$/, "")}:8883`
+        : `mqtts://${cloudBroker(target.region)}:8883`
     const client = mqtt.connect(url, {
-      username: "bblp",
-      password: accessCode,
-      // Bambu printers present a self-signed certificate on the LAN.
+      username: target.transport === "lan" ? "bblp" : `u_${target.uid}`,
+      password: target.transport === "lan" ? target.accessCode : target.token,
+      // The LAN printer presents a self-signed cert; the cloud broker's cert is
+      // valid but we keep verification relaxed for resilience across regions.
       rejectUnauthorized: false,
       reconnectPeriod: 0,
       connectTimeout: ms,
+      protocolVersion: 4,
     })
     const reportTopic = `device/${serial}/report`
     const requestTopic = `device/${serial}/request`
@@ -194,19 +221,34 @@ export async function POST(req: NextRequest) {
   }
 
   const serial = body.serial?.trim() ?? ""
-  const accessCode = body.accessCode?.trim() ?? ""
   const amsUnits = Math.max(1, body.amsUnits ?? 1)
   const slotsPerAms = Math.max(1, body.slotsPerAms ?? 4)
-  if (!serial || !accessCode) {
-    return NextResponse.json({ ok: false, error: "Missing serial or access code" }, { status: 400 })
+  const mode = body.mode === "cloud" ? "cloud" : "lan"
+
+  // Build the MQTT target for whichever mode we're in, validating just the
+  // fields that mode needs. A `null` target means we lack the info to try a
+  // real connection and should serve the simulation instead.
+  let target: MqttTarget | null = null
+  if (mode === "cloud") {
+    const token = body.token?.trim() ?? ""
+    const uid = body.uid?.trim() ?? ""
+    const region = body.region === "china" ? "china" : "global"
+    if (!serial) return NextResponse.json({ ok: false, error: "Missing serial" }, { status: 400 })
+    if (token && uid) target = { transport: "cloud", region, uid, token }
+  } else {
+    const accessCode = body.accessCode?.trim() ?? ""
+    const ip = body.ip?.trim() ?? ""
+    if (!serial || !accessCode) {
+      return NextResponse.json({ ok: false, error: "Missing serial or access code" }, { status: 400 })
+    }
+    if (ip) target = { transport: "lan", ip, accessCode }
   }
 
-  const ip = body.ip?.trim() ?? ""
-  const canTryReal = body.mode !== "cloud" && !!ip
-
-  if (canTryReal) {
+  if (target) {
     try {
-      const parsed = await readOverMqtt(ip, serial, accessCode, amsUnits, slotsPerAms, 5000)
+      // Cloud round-trips (auth + broker hop) need a bit longer than LAN.
+      const timeout = target.transport === "cloud" ? 9000 : 5000
+      const parsed = await readOverMqtt(target, serial, amsUnits, slotsPerAms, timeout)
       return NextResponse.json({ ok: true, connected: true, simulated: false, ...parsed })
     } catch {
       // Fall through to the simulation so the UI still has data in preview.
