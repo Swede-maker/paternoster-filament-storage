@@ -208,7 +208,7 @@ export interface Printer {
  * commands; Klipper (Moonraker) and Bambu (MQTT) additionally support live reads
  * of temperature, filament usage, and — for Bambu — AMS tray / RFID data.
  */
-export type PrinterFirmware = "marlin" | "klipper" | "bambu"
+export type PrinterFirmware = "marlin" | "klipper" | "bambu" | "prusalink"
 
 export type PrinterLinkStatus = "offline" | "checking" | "online"
 
@@ -452,6 +452,35 @@ export interface HistoryEvent {
   days?: number
 }
 
+/**
+ * A saved filament-usage tally, archived whenever the running total is reset.
+ * Resetting the counter never loses data — the finished tally is preserved here
+ * (shown under History) so the lifetime record is complete.
+ */
+export interface FilamentUsageArchive {
+  id: string
+  /** Grams consumed during this tally. */
+  grams: number
+  /** When the tally started (ms epoch). */
+  from: number
+  /** When it was reset/archived (ms epoch). */
+  to: number
+}
+
+/**
+ * Lifetime filament-consumption tracking. Every gram the printers extrude is
+ * added to `currentG`; the user can reset it (which archives the current tally)
+ * without losing the historical totals.
+ */
+export interface FilamentUsage {
+  /** Grams consumed since the current tally began (resettable). */
+  currentG: number
+  /** When the current tally started (ms epoch). */
+  since: number
+  /** Previous tallies, preserved on reset — the lifetime record. */
+  archived: FilamentUsageArchive[]
+}
+
 export interface AppState {
   /** Whether first-run setup has been completed. */
   configured: boolean
@@ -467,6 +496,8 @@ export interface AppState {
   job: ActiveJob | null
   /** Filament usage/movement log, newest first, capped in the reducer. */
   history: HistoryEvent[]
+  /** Lifetime + resettable filament-consumption tracking. */
+  usage: FilamentUsage
 }
 
 /**
@@ -485,4 +516,6 @@ export interface PersistedState {
   activePrinterId: string | null
   /** Filament usage/movement log (shared + synced across devices). */
   history: HistoryEvent[]
+  /** Lifetime + resettable filament-consumption tracking (shared + synced). */
+  usage: FilamentUsage
 }

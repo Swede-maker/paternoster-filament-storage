@@ -13,6 +13,7 @@ import type {
   AppState,
   FilamentOrder,
   FilamentProfile,
+  FilamentUsage,
   HistoryEvent,
   HistoryEventKind,
   Machine,
@@ -58,6 +59,28 @@ const SYNC_POLL_MS = 4000
  */
 const HISTORY_CAP = 1000
 
+/** Cap on archived usage tallies kept, so the synced doc stays small. */
+const USAGE_ARCHIVE_CAP = 500
+
+/** A fresh, empty filament-usage tracker. */
+function defaultUsage(): FilamentUsage {
+  return { currentG: 0, since: Date.now(), archived: [] }
+}
+
+/**
+ * Coerce an unknown persisted value into a valid FilamentUsage, tolerating
+ * older saves that predate usage tracking (returns a fresh tracker).
+ */
+function coerceUsage(u: unknown): FilamentUsage {
+  if (!u || typeof u !== "object") return defaultUsage()
+  const raw = u as Partial<FilamentUsage>
+  return {
+    currentG: typeof raw.currentG === "number" && raw.currentG >= 0 ? raw.currentG : 0,
+    since: typeof raw.since === "number" ? raw.since : Date.now(),
+    archived: Array.isArray(raw.archived) ? raw.archived.slice(0, USAGE_ARCHIVE_CAP) : [],
+  }
+}
+
 /** Pull the durable, shareable subset out of the full runtime state. */
 function toPersisted(state: AppState): PersistedState {
   return {
@@ -87,6 +110,7 @@ function toPersisted(state: AppState): PersistedState {
     printers: state.printers,
     activePrinterId: state.activePrinterId,
     history: state.history ?? [],
+    usage: state.usage ?? defaultUsage(),
   }
 }
 
@@ -148,9 +172,20 @@ function mergeCatalog(local: PersistedState, remote: PersistedState, baseline: P
   const history = mergeByKey(local.history, remote.history, baseline?.history, (e) => e.id)
     .sort((a, b) => b.at - a.at)
     .slice(0, HISTORY_CAP)
+  // Archived usage tallies are append-only like history: preserve tallies saved
+  // on another device, but let a local reset/clear win over the baseline. The
+  // live running total (currentG/since) is per-shared-doc last-write-wins.
+  const localUsage = local.usage ?? defaultUsage()
+  const usage: FilamentUsage = {
+    ...localUsage,
+    archived: mergeByKey(localUsage.archived, remote.usage?.archived, baseline?.usage?.archived, (a) => a.id)
+      .sort((a, b) => b.to - a.to)
+      .slice(0, USAGE_ARCHIVE_CAP),
+  }
   return {
     ...local,
     history,
+    usage,
     settings: {
       ...ls,
       filamentProfiles: mergeByKey(ls.filamentProfiles, rs.filamentProfiles, bs?.filamentProfiles, (p) => p.id),
@@ -270,6 +305,7 @@ function makeInitialState(): AppState {
     activePrinterId: null,
     job: null,
     history: [],
+    usage: defaultUsage(),
   }
 }
 
@@ -333,6 +369,7 @@ type Action =
   | { type: "DELETE_SPOOL"; id: string }
   /** Subtract consumed filament (g) from a spool, clamped at 0. */
   | { type: "CONSUME_FILAMENT"; spoolId: string; grams: number }
+  | { type: "RESET_FILAMENT_USAGE" }
   /**
    * Upsert a spool auto-created from a Bambu AMS tray (matched by RFID uid) and
    * seat it in the given printer slot. Idempotent: an existing spool with the
@@ -726,9 +763,32 @@ function coreReducer(state: AppState, action: Action): AppState {
     case "CONSUME_FILAMENT": {
       const existing = state.spools[action.spoolId]
       if (!existing || !(action.grams > 0)) return state
+      // Track every extruded gram against the lifetime usage counter, even if the
+      // spool's own remaining weight is already at zero — the printer still used
+      // that filament.
+      const usage: FilamentUsage = {
+        ...(state.usage ?? defaultUsage()),
+        currentG: (state.usage?.currentG ?? 0) + action.grams,
+      }
       const grams = Math.max(0, existing.grams - action.grams)
-      if (grams === existing.grams) return state
-      return { ...state, spools: { ...state.spools, [action.spoolId]: { ...existing, grams } } }
+      const spools =
+        grams === existing.grams ? state.spools : { ...state.spools, [action.spoolId]: { ...existing, grams } }
+      return { ...state, spools, usage }
+    }
+
+    case "RESET_FILAMENT_USAGE": {
+      const usage = state.usage ?? defaultUsage()
+      const now = Date.now()
+      // Archive the finished tally (only if it actually recorded something) so the
+      // lifetime total is never lost, then start a fresh counter.
+      const archived =
+        usage.currentG > 0
+          ? [{ id: newId(), grams: usage.currentG, from: usage.since, to: now }, ...usage.archived].slice(
+              0,
+              USAGE_ARCHIVE_CAP,
+            )
+          : usage.archived
+      return { ...state, usage: { currentG: 0, since: now, archived } }
     }
 
     case "INGEST_AMS_TRAY": {
@@ -1392,6 +1452,7 @@ function migrate(parsed: any): AppState {
     activePrinterId: parsed.activePrinterId ?? null,
     job: null,
     history: Array.isArray(parsed.history) ? parsed.history.slice(0, HISTORY_CAP) : [],
+    usage: coerceUsage(parsed.usage),
   }
 }
 

@@ -17,6 +17,7 @@ import {
 } from "@/lib/filament"
 import { klipperHeaterName } from "@/lib/printer-commands"
 import { fetchMoonrakerStatus, isKlipperLinked, type MoonrakerStatus } from "@/lib/moonraker"
+import { fetchPrusaLinkStatus, isPrusaLinked } from "@/lib/prusalink"
 import { fetchBambuStatus, isBambuLinked, bambuCloudRefresh, type BambuStatus } from "@/lib/bambu"
 import { Button } from "./ui/button"
 import { Input } from "./ui/field"
@@ -24,6 +25,7 @@ import { AmsUnit, Toolhead } from "./ams-unit"
 import { SpoolDisc } from "./spool"
 import { AddPrinterDialog } from "./add-printer-dialog"
 import { BambuCloudSignIn } from "./bambu-cloud-sign-in"
+import { FilamentUsedCard } from "./filament-used-card"
 import type { Printer, Spool } from "@/lib/types"
 
 export function PrinterPanel({
@@ -49,7 +51,9 @@ export function PrinterPanel({
   }
 
   return (
-    <section className="flex flex-col rounded-2xl border border-border bg-card p-4 lg:min-h-0">
+    <div className="flex flex-col gap-4 lg:min-h-0">
+      <FilamentUsedCard />
+      <section className="flex flex-col rounded-2xl border border-border bg-card p-4 lg:min-h-0">
       <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
         <h2 className="text-base font-semibold">AMS / Toolchanger Status</h2>
         <div className="flex items-center gap-2">
@@ -95,7 +99,8 @@ export function PrinterPanel({
       )}
 
       <AddPrinterDialog open={addOpen} onClose={() => setAddOpen(false)} />
-    </section>
+      </section>
+    </div>
   )
 }
 
@@ -145,6 +150,23 @@ function useMoonrakerLive(printer: Printer): MoonrakerStatus | undefined {
   const { data } = useSWR<MoonrakerStatus>(
     enabled ? ["moonraker", printer.id, printer.ip, printer.port] : null,
     () => fetchMoonrakerStatus(printer),
+    { refreshInterval: 3000, revalidateOnFocus: false, dedupingInterval: 2000, keepPreviousData: true },
+  )
+  const smoothRef = useRef<SmoothState<MoonrakerStatus>>({ fails: 0 })
+  const smoothed = smoothConnection(smoothRef, data, CONNECTION_FAILURE_GRACE)
+  return enabled ? smoothed : undefined
+}
+
+/**
+ * Poll a Prusa printer over PrusaLink via the /api/prusalink proxy. Returns the
+ * same `MoonrakerStatus` shape as Klipper, so temperature display and live
+ * weight tracking work identically. Disabled unless it's a linked Prusa machine.
+ */
+function usePrusaLinkLive(printer: Printer): MoonrakerStatus | undefined {
+  const enabled = isPrusaLinked(printer)
+  const { data } = useSWR<MoonrakerStatus>(
+    enabled ? ["prusalink", printer.id, printer.ip, printer.port] : null,
+    () => fetchPrusaLinkStatus(printer),
     { refreshInterval: 3000, revalidateOnFocus: false, dedupingInterval: 2000, keepPreviousData: true },
   )
   const smoothRef = useRef<SmoothState<MoonrakerStatus>>({ fails: 0 })
@@ -253,7 +275,7 @@ function useBambuTokenRefresh(printer: Printer) {
  */
 function useLiveConsumption(
   printer: Printer,
-  moonraker: MoonrakerStatus | undefined,
+  live: MoonrakerStatus | undefined,
   bambu: BambuStatus | undefined,
 ) {
   const { state, dispatch } = useStore()
@@ -262,10 +284,12 @@ function useLiveConsumption(
   const prevMm = useRef<number | null>(null)
   const prevRemain = useRef<Record<number, number>>({})
 
-  // Klipper: mm of filament → grams off the active tool's spool.
+  // Klipper (Moonraker) and Prusa (PrusaLink) both report cumulative mm of
+  // filament used in the same shape (`live`), so one effect converts that into
+  // grams off the active tool's spool for either transport.
   useEffect(() => {
-    if (!moonraker?.connected || typeof moonraker.filamentUsedMm !== "number") return
-    const mm = moonraker.filamentUsedMm
+    if (!live?.connected || typeof live.filamentUsedMm !== "number") return
+    const mm = live.filamentUsedMm
     if (prevMm.current === null || mm < prevMm.current) {
       prevMm.current = mm // first read, or a new print reset the counter
       return
@@ -273,14 +297,14 @@ function useLiveConsumption(
     const delta = mm - prevMm.current
     prevMm.current = mm
     if (delta <= 0) return
-    const slot = printer.kind === "toolchanger" ? moonraker.activeTool ?? 0 : 0
+    const slot = printer.kind === "toolchanger" ? live.activeTool ?? 0 : 0
     const id = printer.loaded[slot]
     const spool = id ? spools[id] : null
     if (!spool) return
     const grams = lengthToGrams(delta, spoolDiameter(spool, defaultDiameter), spoolDensity(spool))
     if (grams > 0) dispatch({ type: "CONSUME_FILAMENT", spoolId: spool.id, grams })
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [moonraker])
+  }, [live])
 
   // Bambu: remaining-% decrements on the active tray → grams.
   useEffect(() => {
@@ -388,9 +412,13 @@ function PrinterCard({
   onRemove: () => void
   queuedPrinterSlots?: number[]
 }) {
-  // Live status/temps are read-only: we poll Moonraker and display the nozzle
-  // temperature the printer reports. The app never commands the heaters.
-  const live = useMoonrakerLive(printer)
+  // Live status/temps are read-only: we poll the printer's controller (Klipper
+  // via Moonraker, or Prusa via PrusaLink) and display the nozzle temperature it
+  // reports. Both return the same shape; only one is ever active per printer.
+  // The app never commands the heaters.
+  const moonraker = useMoonrakerLive(printer)
+  const prusa = usePrusaLinkLive(printer)
+  const live = moonraker ?? prusa
   const bambu = useBambuLive(printer)
   // Subtract filament from the actively-printing spool, and auto-ingest AMS
   // trays (RFID) so scanned Bambu spools can be stored afterwards.
@@ -436,7 +464,9 @@ function PrinterLinkRow({ printer, live, bambu }: { printer: Printer; live?: Moo
   const { dispatch } = useStore()
   const [ip, setIp] = useState(printer.ip ?? "")
   const [editing, setEditing] = useState(!printer.ip)
-  const klipperLinked = isKlipperLinked(printer)
+  // Both Klipper (Moonraker) and Prusa (PrusaLink) provide real live status over
+  // an IP, so either one drives the Connected / Not reachable indicator.
+  const liveLinked = isKlipperLinked(printer) || isPrusaLinked(printer)
 
   // Bambu printers link via serial + access code (set when adding the printer),
   // so show a live MQTT/AMS status row instead of the Klipper IP editor.
@@ -484,11 +514,11 @@ function PrinterLinkRow({ printer, live, bambu }: { printer: Printer; live?: Moo
     )
   }
 
-  // Derive the display status. Real for Klipper (from live polling), otherwise
-  // a neutral note since we can only actually reach Moonraker/Klipper.
-  const connecting = klipperLinked && live === undefined
-  const connected = klipperLinked && live?.connected === true
-  const error = klipperLinked ? live?.error : undefined
+  // Derive the display status. Real for Klipper/PrusaLink (from live polling),
+  // otherwise a neutral note since those are the transports we can actually read.
+  const connecting = liveLinked && live === undefined
+  const connected = liveLinked && live?.connected === true
+  const error = liveLinked ? live?.error : undefined
 
   const status: "online" | "checking" | "offline" = connected ? "online" : connecting ? "checking" : "offline"
   const dot =
@@ -496,7 +526,7 @@ function PrinterLinkRow({ printer, live, bambu }: { printer: Printer; live?: Moo
   const StatusIcon = status === "online" ? Wifi : status === "checking" ? Loader2 : WifiOff
   const statusColor =
     status === "online" ? "text-success" : status === "checking" ? "text-warning" : "text-muted-foreground"
-  const statusLabel = !klipperLinked
+  const statusLabel = !liveLinked
     ? "Linked (no live status)"
     : connected
       ? "Connected"
@@ -516,8 +546,8 @@ function PrinterLinkRow({ printer, live, bambu }: { printer: Printer; live?: Moo
             {printer.port && printer.port !== 7125 ? `:${printer.port}` : ""}
           </p>
           {error && <p className="truncate text-xs text-destructive">{error}</p>}
-          {!klipperLinked && printer.firmware !== "klipper" && (
-            <p className="text-xs text-muted-foreground">Live status needs a Klipper printer.</p>
+          {!liveLinked && (
+            <p className="text-xs text-muted-foreground">Live status needs a Klipper or Prusa (PrusaLink) printer.</p>
           )}
         </div>
       </div>

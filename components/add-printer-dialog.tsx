@@ -30,6 +30,7 @@ export function AddPrinterDialog({ open, onClose }: { open: boolean; onClose: ()
 
   const atLimit = state.printers.length >= MAX_PRINTERS
   const isBambu = firmware === "bambu"
+  const isPrusa = firmware === "prusalink"
 
   function reset() {
     setName("")
@@ -71,7 +72,7 @@ export function AddPrinterDialog({ open, onClose }: { open: boolean; onClose: ()
       loaded: Array.from({ length: count }, () => null),
       // Bambu LAN also uses the IP; cloud mode doesn't require it.
       ip: isBambuCloud ? undefined : ip.trim() || undefined,
-      port: !isBambu && ip.trim() ? Number.parseInt(port) || 7125 : undefined,
+      port: !isBambu && ip.trim() ? Number.parseInt(port) || (isPrusa ? 80 : 7125) : undefined,
       apiKey: !isBambu && ip.trim() && apiKey.trim() ? apiKey.trim() : undefined,
       serial: isBambu ? bambuSerial : undefined,
       accessCode: isBambu && !isBambuCloud && accessCode.trim() ? accessCode.trim() : undefined,
@@ -155,9 +156,17 @@ export function AddPrinterDialog({ open, onClose }: { open: boolean; onClose: ()
               <Segmented
                 className="w-full [&>button]:flex-1"
                 value={firmware}
-                onChange={(v) => setFirmware(v as PrinterFirmware)}
+                onChange={(v) => {
+                  const next = v as PrinterFirmware
+                  setFirmware(next)
+                  // Keep the port sensible for the chosen firmware's default,
+                  // unless the user already typed a custom one.
+                  if (next === "prusalink" && (port === "7125" || port === "")) setPort("80")
+                  if (next === "klipper" && (port === "80" || port === "")) setPort("7125")
+                }}
                 options={[
                   { value: "klipper", label: "Klipper" },
+                  { value: "prusalink", label: "PrusaLink" },
                   { value: "marlin", label: "Marlin" },
                   { value: "bambu", label: "Bambu Lab" },
                 ]}
@@ -165,7 +174,9 @@ export function AddPrinterDialog({ open, onClose }: { open: boolean; onClose: ()
               <p className="mt-1 text-xs text-muted-foreground">
                 {isBambu
                   ? "Bambu printers link over MQTT to read live AMS spools and RFID tags."
-                  : "Klipper links over Moonraker for live nozzle temperatures. Leave the fields blank to skip linking."}
+                  : isPrusa
+                    ? "PrusaLink links to Prusa printers (MINI, MK4, XL…) for live nozzle temperatures and filament usage."
+                    : "Klipper links over Moonraker for live nozzle temperatures. Leave the fields blank to skip linking."}
               </p>
             </Field>
 
@@ -252,23 +263,25 @@ export function AddPrinterDialog({ open, onClose }: { open: boolean; onClose: ()
 
                 {ip.trim() && (
                   <div className="grid grid-cols-2 gap-4 rounded-lg border border-border bg-background/40 p-3">
-                    <Field label="Moonraker port">
+                    <Field label={isPrusa ? "PrusaLink port" : "Moonraker port"}>
                       <Input
                         value={port}
                         onChange={(e) => setPort(e.target.value)}
-                        placeholder="7125"
+                        placeholder={isPrusa ? "80" : "7125"}
                         inputMode="numeric"
                       />
                     </Field>
-                    <Field label="API key (optional)">
+                    <Field label={isPrusa ? "PrusaLink password" : "API key (optional)"}>
                       <Input
                         value={apiKey}
                         onChange={(e) => setApiKey(e.target.value)}
-                        placeholder="Only if required"
+                        placeholder={isPrusa ? "From printer's PrusaLink screen" : "Only if required"}
                       />
                     </Field>
                     <p className="col-span-2 text-xs text-muted-foreground">
-                      For Klipper/Mainsail the default port is 7125 and no key is needed on a trusted LAN.
+                      {isPrusa
+                        ? "Enter the PrusaLink password shown under Settings → Network → PrusaLink (older firmware uses an API key). Default port is 80."
+                        : "For Klipper/Mainsail the default port is 7125 and no key is needed on a trusted LAN."}
                     </p>
                   </div>
                 )}

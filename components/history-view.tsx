@@ -11,12 +11,14 @@ import {
   RotateCcw,
   X,
   AlertTriangle,
+  Scale,
 } from "lucide-react"
 import { useStore } from "@/lib/store"
 import { reminderDueAt, isReminderDue } from "@/lib/selectors"
-import type { HistoryEvent, HistoryEventKind, Spool } from "@/lib/types"
+import type { FilamentUsageArchive, HistoryEvent, HistoryEventKind, Spool } from "@/lib/types"
 import { SpoolDisc } from "./spool"
-import { spoolFill } from "@/lib/filament"
+import { spoolFill, formatGrams } from "@/lib/filament"
+import { lifetimeGrams } from "./filament-used-card"
 import { Button } from "./ui/button"
 import { cn } from "@/lib/utils"
 
@@ -72,6 +74,7 @@ export function HistoryView() {
   const [confirmingReset, setConfirmingReset] = useState(false)
 
   const spools = state.spools
+  const usage = state.usage
 
   // Reminders split into overdue ("due to dry now") and still-scheduled.
   const { due, upcoming } = useMemo(() => {
@@ -126,6 +129,10 @@ export function HistoryView() {
           </Button>
         )}
       </header>
+
+      {/* Filament usage totals — the lifetime record plus every archived tally
+          saved when the "Total filament used" counter was reset. */}
+      <FilamentUsageSection archived={usage.archived} currentG={usage.currentG} since={usage.since} />
 
       {/* Dry alerts */}
       {due.length > 0 && (
@@ -210,6 +217,65 @@ export function HistoryView() {
     dispatch({ type: "CLEAR_HISTORY" })
     setConfirmingReset(false)
   }
+}
+
+/**
+ * Filament-usage totals for the History tab: a headline lifetime figure plus the
+ * list of archived tallies saved each time the "Total filament used" counter was
+ * reset, so resetting never loses the record.
+ */
+function FilamentUsageSection({
+  archived,
+  currentG,
+  since,
+}: {
+  archived: FilamentUsageArchive[]
+  currentG: number
+  since: number
+}) {
+  const lifetime = lifetimeGrams({ currentG, archived })
+  // Nothing tracked yet and never reset — keep the tab uncluttered.
+  if (lifetime <= 0 && archived.length === 0) return null
+
+  return (
+    <section aria-label="Filament used" className="mb-6">
+      <div className="mb-2 flex items-center gap-2">
+        <Scale className="h-4 w-4 text-muted-foreground" />
+        <h2 className="text-sm font-semibold text-foreground">Filament used</h2>
+      </div>
+      <div className="rounded-xl border border-border bg-card p-4">
+        <div className="flex flex-wrap items-end justify-between gap-x-8 gap-y-2">
+          <div>
+            <span className="text-[11px] uppercase tracking-wider text-muted-foreground">Lifetime total</span>
+            <p className="font-mono text-2xl font-bold text-foreground">{formatGrams(lifetime)}</p>
+          </div>
+          <div className="text-right">
+            <span className="text-[11px] uppercase tracking-wider text-muted-foreground">Current tally</span>
+            <p className="font-mono text-lg font-semibold text-primary">{formatGrams(currentG)}</p>
+            <p className="text-xs text-muted-foreground">since {fullTime(since)}</p>
+          </div>
+        </div>
+
+        {archived.length > 0 && (
+          <ol className="mt-3 flex flex-col border-t border-border/60 pt-2">
+            {archived.map((a) => (
+              <li key={a.id} className="flex items-center justify-between gap-3 border-b border-border/40 py-2 last:border-b-0">
+                <div className="min-w-0">
+                  <p className="truncate text-sm text-foreground">
+                    {new Date(a.from).toLocaleDateString(undefined, { month: "short", day: "numeric" })}
+                    {" – "}
+                    {new Date(a.to).toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" })}
+                  </p>
+                  <p className="text-xs text-muted-foreground">Archived tally</p>
+                </div>
+                <span className="shrink-0 font-mono text-sm font-semibold text-foreground">{formatGrams(a.grams)}</span>
+              </li>
+            ))}
+          </ol>
+        )}
+      </div>
+    </section>
+  )
 }
 
 /** A single dry-reminder row with reset / clear controls. */
