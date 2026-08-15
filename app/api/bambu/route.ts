@@ -1,5 +1,4 @@
 import { type NextRequest, NextResponse } from "next/server"
-import mqtt from "mqtt"
 
 /**
  * Server-side proxy to a Bambu Lab printer's MQTT interface.
@@ -133,7 +132,12 @@ function simulate(serial: string, amsUnits: number, slotsPerAms: number): { tray
 }
 
 /** Read one full report over MQTT, or reject on timeout. */
-function readOverMqtt(ip: string, serial: string, accessCode: string, amsUnits: number, slotsPerAms: number, ms: number) {
+async function readOverMqtt(ip: string, serial: string, accessCode: string, amsUnits: number, slotsPerAms: number, ms: number) {
+  // Import mqtt lazily so a bundling/load problem with this Node-only package
+  // can't crash the whole route module at import time (which would make EVERY
+  // request fail with "Could not reach the app server"). If it can't load, this
+  // throws and the caller falls back to the simulation.
+  const mqtt = (await import("mqtt")).default
   return new Promise<{ trays: Tray[]; activeTray: number | null; printState?: string }>((resolve, reject) => {
     const url = `mqtts://${ip.replace(/^mqtts?:\/\//, "").replace(/\/+$/, "")}:8883`
     const client = mqtt.connect(url, {
