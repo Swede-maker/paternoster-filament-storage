@@ -15,19 +15,24 @@ Put this commands in your terminal:
    git clone https://github.com/Swede-maker/paternoster-filament-storage.git && cd paternoster-filament-storage
    
 2. Install:
-
    ```bash
-   npm install
-   npm run build
+   sudo apt update
+   sudo apt install nodejs npm -y
+
+2.1 Then this:  
+
+    cd paternoster-filament-storage
+    npm install
+    npm run build
    
 
-3. Start the server
+4. Start the server
 
    ```bash
    export PATERNESTER_DB_PATH="$(pwd)/paternoster.db"
    npm run start
 
-4. systemd unit so the agent starts on boot and restarts on crash.
+5. systemd unit so the agent starts on boot and restarts on crash.
  NOTE! change "User" to the name your PI is using. Install:
 
        
