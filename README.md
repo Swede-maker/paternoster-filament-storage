@@ -17,7 +17,7 @@ Put this commands in your terminal:
 2. Install:
    ```bash
    sudo apt update
-   curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
+   curl -fsSL https://deb.nodesource.com/setup_24.x | sudo -E bash -
    sudo apt install -y nodejs
 
 2.1 Then this:  
