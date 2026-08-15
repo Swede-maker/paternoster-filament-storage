@@ -17,7 +17,8 @@ Put this commands in your terminal:
 2. Install:
    ```bash
    sudo apt update
-   sudo apt install nodejs npm -y
+   curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
+   sudo apt install -y nodejs
 
 2.1 Then this:  
 
@@ -33,7 +34,7 @@ Put this commands in your terminal:
    npm run start
 
 5. systemd unit so the agent starts on boot and restarts on crash.
- NOTE! change "User" to the name your PI is using. Install:
+ NOTE! change "raspberry" to the name your PI is using. Install:
 
        
        sudo nano /etc/systemd/system/paternoster.service
@@ -49,7 +50,7 @@ PASTE THIS
     User=raspberry
     WorkingDirectory=/home/raspberry/paternoster-filament-storage
     Environment=PATERNESTER_DB_PATH=/home/raspberry/paternoster-filament-storage/paternoster.db
-    ExecStart=/usr/bin/npm run start -- -H 0.0.0.0
+    ExecStart=/usr/bin/npx next start -H 0.0.0.0
     Restart=always
 
     [Install]
