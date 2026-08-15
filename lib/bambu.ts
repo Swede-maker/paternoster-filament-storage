@@ -71,14 +71,32 @@ function connectionPayload(printer: Printer) {
 
 /** Query the printer's AMS/RFID + print state. Never throws. */
 export async function fetchBambuStatus(printer: Printer): Promise<BambuStatus> {
+  // Guard against a hung request (e.g. a route that never responds) so the UI
+  // gets a clear timeout instead of spinning forever.
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), 12000)
   try {
     const res = await fetch("/api/bambu", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ ...connectionPayload(printer), action: "status" }),
+      signal: controller.signal,
     })
-    const json = await res.json()
-    if (!res.ok || !json.ok) {
+    // Read the body as text first so a non-JSON error page (e.g. an HTML 500)
+    // produces a legible message instead of an opaque JSON-parse failure.
+    const raw = await res.text()
+    let json: any = null
+    try {
+      json = raw ? JSON.parse(raw) : null
+    } catch {
+      const snippet = raw.replace(/\s+/g, " ").trim().slice(0, 120)
+      return {
+        connected: false,
+        trays: [],
+        error: `Server error ${res.status}${snippet ? `: ${snippet}` : ""}`,
+      }
+    }
+    if (!res.ok || !json?.ok) {
       return { connected: false, trays: [], error: json?.error ?? `Error ${res.status}` }
     }
     return {
@@ -89,6 +107,18 @@ export async function fetchBambuStatus(printer: Printer): Promise<BambuStatus> {
       simulated: json.simulated === true,
     }
   } catch (err) {
-    return { connected: false, trays: [], error: err instanceof Error ? err.message : "Request failed" }
+    if (err instanceof DOMException && err.name === "AbortError") {
+      return { connected: false, trays: [], error: "Printer request timed out" }
+    }
+    // A TypeError from fetch ("Failed to fetch") means the request never reached
+    // the app server — usually a crashed API route or the app being offline.
+    const msg = err instanceof Error ? err.message : "Request failed"
+    return {
+      connected: false,
+      trays: [],
+      error: msg === "Failed to fetch" ? "Could not reach the app server (/api/bambu)" : msg,
+    }
+  } finally {
+    clearTimeout(timer)
   }
 }
