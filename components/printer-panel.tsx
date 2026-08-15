@@ -103,14 +103,53 @@ export function PrinterPanel({
  * Poll a Klipper printer's live status/temps via the Moonraker proxy. Disabled
  * (returns undefined) for printers that aren't a Klipper machine with an IP.
  */
+// How many polls in a row must fail before we actually show "Not reachable".
+// Printers (especially a busy Klipper host or one on WiFi) drop the occasional
+// request; without this grace window the status bounces between Connected and
+// Failed to fetch on every transient blip.
+const CONNECTION_FAILURE_GRACE = 3
+
+type SmoothState<T> = { lastGood?: T; lastSeen?: T; fails: number }
+
+/**
+ * Smooth a polled connection status so a single failed poll doesn't flip the UI
+ * to an error. Keeps returning the last successful reading until we've seen
+ * `grace` consecutive failures, then surfaces the real failure. Safe to mutate
+ * the ref during render because each data object is only processed once (guarded
+ * by identity via `lastSeen`).
+ */
+function smoothConnection<T extends { connected: boolean }>(
+  ref: React.MutableRefObject<SmoothState<T>>,
+  data: T | undefined,
+  grace: number,
+): T | undefined {
+  if (data && data !== ref.current.lastSeen) {
+    ref.current.lastSeen = data
+    if (data.connected) {
+      ref.current.lastGood = data
+      ref.current.fails = 0
+    } else {
+      ref.current.fails += 1
+    }
+  }
+  if (!data) return undefined
+  // Within the grace window, keep showing the last good reading.
+  if (!data.connected && ref.current.fails < grace && ref.current.lastGood) {
+    return ref.current.lastGood
+  }
+  return data
+}
+
 function useMoonrakerLive(printer: Printer): MoonrakerStatus | undefined {
   const enabled = isKlipperLinked(printer)
   const { data } = useSWR<MoonrakerStatus>(
     enabled ? ["moonraker", printer.id, printer.ip, printer.port] : null,
     () => fetchMoonrakerStatus(printer),
-    { refreshInterval: 3000, revalidateOnFocus: false, dedupingInterval: 2000 },
+    { refreshInterval: 3000, revalidateOnFocus: false, dedupingInterval: 2000, keepPreviousData: true },
   )
-  return enabled ? data : undefined
+  const smoothRef = useRef<SmoothState<MoonrakerStatus>>({ fails: 0 })
+  const smoothed = smoothConnection(smoothRef, data, CONNECTION_FAILURE_GRACE)
+  return enabled ? smoothed : undefined
 }
 
 /** Live reading for a given tool slot (by Klipper heater name), if available. */
@@ -128,10 +167,12 @@ function useBambuLive(printer: Printer): BambuStatus | undefined {
   const { data } = useSWR<BambuStatus>(
     enabled ? ["bambu", printer.id, printer.ip, printer.serial] : null,
     () => fetchBambuStatus(printer),
-    { refreshInterval: 4000, revalidateOnFocus: false, dedupingInterval: 3000 },
+    { refreshInterval: 4000, revalidateOnFocus: false, dedupingInterval: 3000, keepPreviousData: true },
   )
   useBambuTokenRefresh(printer)
-  return enabled ? data : undefined
+  const smoothRef = useRef<SmoothState<BambuStatus>>({ fails: 0 })
+  const smoothed = smoothConnection(smoothRef, data, CONNECTION_FAILURE_GRACE)
+  return enabled ? smoothed : undefined
 }
 
 /**

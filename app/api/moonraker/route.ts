@@ -71,7 +71,9 @@ export async function POST(req: NextRequest) {
     const heaterQuery = heaters.map((h) => `${encodeURIComponent(h)}=temperature,target`).join("&")
     const query = `${heaterQuery}&print_stats&gcode_move&toolhead`
     const url = `${base}/printer/objects/query?${query}`
-    const res = await fetchWithTimeout(url, { method: "GET", headers }, 5000)
+    // 8s: a busy Klipper host (mid-print, homing, mesh) can be briefly slow to
+    // answer; too tight a timeout causes false "not reachable" flicker.
+    const res = await fetchWithTimeout(url, { method: "GET", headers }, 8000)
     if (!res.ok) {
       return NextResponse.json({ ok: false, error: `Moonraker responded ${res.status}` }, { status: 502 })
     }

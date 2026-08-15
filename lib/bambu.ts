@@ -105,7 +105,7 @@ export type BambuCloudDevice = {
 
 async function postCloud(payload: Record<string, unknown>): Promise<any> {
   const controller = new AbortController()
-  const timer = setTimeout(() => controller.abort(), 15000)
+  const timer = setTimeout(() => controller.abort(), 20000)
   try {
     const res = await fetch("/api/bambu/cloud-login", {
       method: "POST",
@@ -114,17 +114,47 @@ async function postCloud(payload: Record<string, unknown>): Promise<any> {
       signal: controller.signal,
     })
     const raw = await res.text()
+    // Happy path: the route always answers with JSON, even for failures.
+    let json: any = null
     try {
-      return raw ? JSON.parse(raw) : { ok: false, error: `Empty response (${res.status})` }
+      json = raw ? JSON.parse(raw) : null
     } catch {
-      return { ok: false, error: `Unexpected response (${res.status})` }
+      json = null
     }
+    if (json && typeof json === "object") return json
+
+    // Non-JSON response — translate the status into an actionable message so
+    // the user knows whether it's a missing route, a server crash, etc.
+    if (res.status === 404) {
+      return {
+        ok: false,
+        error:
+          "Sign-in endpoint not found (404). This deployment is running an older build — rebuild and redeploy the app to enable cloud sign-in.",
+      }
+    }
+    if (res.status >= 500) {
+      return { ok: false, error: `The app server errored (${res.status}). Check the server logs.` }
+    }
+    return { ok: false, error: `Unexpected response from the app server (${res.status}).` }
   } catch (err) {
+    console.log("[v0] Bambu cloud sign-in request failed:", err)
     if (err instanceof DOMException && err.name === "AbortError") {
-      return { ok: false, error: "Sign-in timed out" }
+      return {
+        ok: false,
+        error:
+          "Sign-in timed out. The app server may not be able to reach Bambu's cloud — check the server's internet access.",
+      }
     }
     const msg = err instanceof Error ? err.message : "Request failed"
-    return { ok: false, error: msg === "Failed to fetch" ? "Could not reach the app server" : msg }
+    // A bare fetch TypeError means the browser got no response at all.
+    if (msg === "Failed to fetch" || msg === "Load failed" || msg === "NetworkError when attempting to fetch resource.") {
+      return {
+        ok: false,
+        error:
+          "Could not reach the app server at /api/bambu/cloud-login. Make sure the app is running and has been rebuilt/redeployed with the latest code.",
+      }
+    }
+    return { ok: false, error: msg }
   } finally {
     clearTimeout(timer)
   }
