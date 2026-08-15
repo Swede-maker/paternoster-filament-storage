@@ -30,7 +30,7 @@ Put this commands in your terminal:
 4. Start the server
 
    ```bash
-   export PATERNESTER_DB_PATH="$(pwd)/paternoster.db"
+   export PATERNOSTER_DB_PATH="$(pwd)/paternoster.db"
    npm run start
 
 5. systemd unit so the agent starts on boot and restarts on crash.
