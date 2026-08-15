@@ -49,7 +49,7 @@ PASTE THIS
     Type=simple
     User=raspberry
     WorkingDirectory=/home/raspberry/paternoster-filament-storage
-    Environment=PATERNESTER_DB_PATH=/home/raspberry/paternoster-filament-storage/paternoster.db
+    Environment=PATERNOSTER_DB_PATH=/home/raspberry/paternoster-filament-storage/paternoster.db
     ExecStart=/usr/bin/npx next start -H 0.0.0.0
     Restart=always
 
