@@ -205,7 +205,12 @@ export function storedSpools(state: AppState): StoredEntry[] {
 export function searchSpools(entries: StoredEntry[], query: string): StoredEntry[] {
   const q = query.trim().toLowerCase()
   if (!q) return entries
-  return entries.filter(({ spool, nodeName, shelfName, area, loc }) => {
+  return entries.filter(({ spool, nodeName, shelfName, loc }) => {
+    // Only match on fields that are actually shown on the result card, so every
+    // hit visibly relates to the query. Notably we do NOT search the shelf/node
+    // `area` here: it isn't displayed in the picker, and users often name an
+    // area after the materials they keep there (e.g. a "PLA/ABS" zone), which
+    // made a material search surface unrelated spools stored in that area.
     const haystack = [
       spool.material,
       spool.brand,
@@ -213,7 +218,6 @@ export function searchSpools(entries: StoredEntry[], query: string): StoredEntry
       spool.color,
       nodeName,
       shelfName,
-      area ?? "",
       `shelf ${loc.shelf + 1}`,
       `slot ${loc.slot + 1}`,
     ]
