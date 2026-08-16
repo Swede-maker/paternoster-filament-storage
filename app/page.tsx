@@ -24,13 +24,46 @@ export default function Page() {
 }
 
 function AppShell() {
-  const { state, ready } = useStore()
+  const { state, ready, loadError } = useStore()
   const [tab, setTab] = useState<NavTab>("home")
 
   if (!ready) {
     return (
       <div className="flex min-h-dvh items-center justify-center bg-background text-muted-foreground">
         <span className="animate-pulse text-sm">Starting PAX…</span>
+      </div>
+    )
+  }
+
+  // The database could not be read. We must NOT show the setup wizard here —
+  // doing so would risk overwriting the user's real saved data with an empty
+  // setup. Show a recoverable error instead. The most common cause after an
+  // update is the better-sqlite3 native module needing a rebuild.
+  if (loadError) {
+    return (
+      <div className="flex min-h-dvh items-center justify-center bg-background p-6">
+        <div className="max-w-md rounded-2xl border border-border bg-card p-6 text-center">
+          <h1 className="text-lg font-semibold text-foreground">Could not load your data</h1>
+          <p className="mt-2 text-sm text-muted-foreground text-pretty">
+            Your saved setup is safe on disk, but the app could not read the database. This often happens after an
+            update when the database module needs rebuilding on the server.
+          </p>
+          <p className="mt-3 rounded-lg bg-muted px-3 py-2 text-left font-mono text-xs text-muted-foreground break-words">
+            {loadError}
+          </p>
+          <button
+            type="button"
+            onClick={() => window.location.reload()}
+            className="mt-4 w-full rounded-lg bg-primary px-4 py-2 text-sm font-medium text-primary-foreground"
+          >
+            Try again
+          </button>
+          <p className="mt-3 text-xs text-muted-foreground">
+            {"If it persists, run "}
+            <span className="font-mono">pnpm rebuild better-sqlite3</span>
+            {" on the server and restart."}
+          </p>
+        </div>
       </div>
     )
   }
