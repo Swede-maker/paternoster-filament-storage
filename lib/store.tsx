@@ -6,6 +6,7 @@ import {
   useEffect,
   useReducer,
   useRef,
+  useState,
   type ReactNode,
 } from "react"
 import type {
@@ -1464,6 +1465,13 @@ interface StoreContextValue {
   state: AppState
   dispatch: React.Dispatch<Action>
   ready: boolean
+  /**
+   * Set when the initial load from the database FAILED (as opposed to the DB
+   * being genuinely empty). Critical distinction: on failure we must NOT show
+   * the setup wizard and must NOT enable saving, because an empty local state
+   * would otherwise overwrite the user's real saved data.
+   */
+  loadError: string | null
 }
 
 const StoreContext = createContext<StoreContextValue | null>(null)
@@ -1472,6 +1480,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const [state, dispatch] = useReducer(machineReducer, undefined, makeInitialState)
   const readyRef = useRef(false)
   const [ready, setReady] = useReducer(() => true, false)
+  const [loadError, setLoadError] = useState<string | null>(null)
   const timers = useRef<Record<string, ReturnType<typeof setTimeout>>>({})
 
   // Sync bookkeeping. `dbVersion` is the last version we've seen from the
@@ -1530,11 +1539,22 @@ export function StoreProvider({ children }: { children: ReactNode }) {
             }
           }
         }
-      } catch (e) {
-        console.log("[v0] initial system load failed:", (e as Error).message)
-      } finally {
+        // Load genuinely succeeded (data hydrated above, or DB confirmed empty
+        // → first-run setup). Only NOW is it safe to enable saving.
         if (!cancelled) {
           readyRef.current = true
+          setReady()
+        }
+      } catch (e) {
+        // The load FAILED (e.g. DB locked, disk error, or better-sqlite3 native
+        // binding mismatch after an update — run `pnpm rebuild better-sqlite3`).
+        // We deliberately do NOT set readyRef=true here: leaving saving disabled
+        // prevents the empty initial state from overwriting the user's real data
+        // in the database. We surface an error screen instead of the setup wizard.
+        const msg = (e as Error).message
+        console.log("[v0] initial system load failed:", msg)
+        if (!cancelled) {
+          setLoadError(msg || "Could not load your data")
           setReady()
         }
       }
@@ -1702,7 +1722,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     for (const key of Object.keys(timers.current)) clearTimeout(timers.current[key])
   }, [])
 
-  return <StoreContext.Provider value={{ state, dispatch, ready }}>{children}</StoreContext.Provider>
+  return <StoreContext.Provider value={{ state, dispatch, ready, loadError }}>{children}</StoreContext.Provider>
 }
 
 export function useStore() {
