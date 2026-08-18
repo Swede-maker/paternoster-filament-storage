@@ -102,6 +102,7 @@ cd pax
 cp paternoster.db paternoster.db.backup   # optional but recommended
 git pull
 pnpm install                              # auto-rebuilds the SQLite module
+pnpm approve-builds                       # If you get error "ERR_PNPM_IGNORED_BUILDS] Ignored build scripts: better-sqlite3" then arrow to "better-sqlite3" and space to mark and then enter and y. And do pnpm install again in case.
 pnpm build
 pnpm start                                # or restart your service
 ```
