@@ -22,7 +22,7 @@ Raspberry Pi 4/5):
 - **Node.js 20 or newer** — https://nodejs.org (LTS is fine)
 - **pnpm** — the package manager. After installing Node, run:
   ```bash
-  npm install -g pnpm
+  sudo npm install -g pnpm
   ```
 - **git** — https://git-scm.com
   ```bash
