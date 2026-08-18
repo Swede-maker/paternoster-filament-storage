@@ -6,15 +6,7 @@ import { Plus, Trash2, Printer as PrinterIcon, Wifi, WifiOff, Loader2, Flame } f
 import { useStore } from "@/lib/store"
 import { cn } from "@/lib/utils"
 import { activePrinter } from "@/lib/selectors"
-import {
-  formatRemaining,
-  spoolFill,
-  lengthToGrams,
-  spoolDensity,
-  spoolDiameter,
-  densityFor,
-  newId,
-} from "@/lib/filament"
+import { formatRemaining, spoolFill, densityFor, newId } from "@/lib/filament"
 import { klipperHeaterName } from "@/lib/printer-commands"
 import { fetchMoonrakerStatus, isKlipperLinked, type MoonrakerStatus } from "@/lib/moonraker"
 import { fetchPrusaLinkStatus, isPrusaLinked } from "@/lib/prusalink"
@@ -263,69 +255,6 @@ function useBambuTokenRefresh(printer: Printer) {
 }
 
 /**
- * Live weight tracking. Watches the printer's reported filament usage and
- * subtracts grams from *only the spool that is actually printing* — idle loaded
- * spools are never touched.
- *
- * - Klipper: `filament_used` is cumulative millimetres; each increase is
- *   converted to mass via the active spool's diameter + density and subtracted.
- *   A counter reset (new print) just re-baselines without consuming.
- * - Bambu: the active tray's remaining-% decrements are applied against the
- *   spool's full-spool capacity.
- */
-function useLiveConsumption(
-  printer: Printer,
-  live: MoonrakerStatus | undefined,
-  bambu: BambuStatus | undefined,
-) {
-  const { state, dispatch } = useStore()
-  const spools = state.spools
-  const defaultDiameter = state.settings.defaultDiameter
-  const prevMm = useRef<number | null>(null)
-  const prevRemain = useRef<Record<number, number>>({})
-
-  // Klipper (Moonraker) and Prusa (PrusaLink) both report cumulative mm of
-  // filament used in the same shape (`live`), so one effect converts that into
-  // grams off the active tool's spool for either transport.
-  useEffect(() => {
-    if (!live?.connected || typeof live.filamentUsedMm !== "number") return
-    const mm = live.filamentUsedMm
-    if (prevMm.current === null || mm < prevMm.current) {
-      prevMm.current = mm // first read, or a new print reset the counter
-      return
-    }
-    const delta = mm - prevMm.current
-    prevMm.current = mm
-    if (delta <= 0) return
-    const slot = printer.kind === "toolchanger" ? live.activeTool ?? 0 : 0
-    const id = printer.loaded[slot]
-    const spool = id ? spools[id] : null
-    if (!spool) return
-    const grams = lengthToGrams(delta, spoolDiameter(spool, defaultDiameter), spoolDensity(spool))
-    if (grams > 0) dispatch({ type: "CONSUME_FILAMENT", spoolId: spool.id, grams })
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [live])
-
-  // Bambu: remaining-% decrements on the active tray → grams.
-  useEffect(() => {
-    if (!bambu?.connected) return
-    for (const tray of bambu.trays) {
-      if (!tray.present || typeof tray.remainPct !== "number") continue
-      const prev = prevRemain.current[tray.globalIndex]
-      prevRemain.current[tray.globalIndex] = tray.remainPct
-      if (prev === undefined || tray.remainPct >= prev) continue
-      const id = printer.loaded[tray.globalIndex]
-      const spool = id ? spools[id] : null
-      if (!spool) continue
-      const cap = spool.capacity && spool.capacity > 0 ? spool.capacity : tray.capacityG ?? 1000
-      const grams = ((prev - tray.remainPct) / 100) * cap
-      if (grams > 0) dispatch({ type: "CONSUME_FILAMENT", spoolId: spool.id, grams })
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [bambu])
-}
-
-/**
  * Auto-create spools from Bambu AMS trays via their RFID uid and seat them in
  * the matching AMS slot, so a spool scanned by the printer can later be selected
  * and stored in the paternoster. Idempotent: a slot already holding the tray's
@@ -420,9 +349,10 @@ function PrinterCard({
   const prusa = usePrusaLinkLive(printer)
   const live = moonraker ?? prusa
   const bambu = useBambuLive(printer)
-  // Subtract filament from the actively-printing spool, and auto-ingest AMS
-  // trays (RFID) so scanned Bambu spools can be stored afterwards.
-  useLiveConsumption(printer, live, bambu)
+  // Filament consumption is tracked server-side by the Pi (see
+  // lib/server/consumption-poller) so weights keep updating even with no browser
+  // open — the browser no longer subtracts. We still auto-ingest AMS trays
+  // (RFID) here so scanned Bambu spools can be stored afterwards.
   useAmsRfidIngest(printer, bambu)
 
   return (
