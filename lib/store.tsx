@@ -151,6 +151,43 @@ function mergeByKey<T>(
 }
 
 /**
+ * Fold server-side filament consumption into the outgoing spool map.
+ *
+ * The Pi decrements spool `grams` in the database as printers extrude, even with
+ * no browser open. When a browser later saves its (possibly stale) state, a
+ * plain local-wins merge would overwrite that decrement. For each spool we
+ * instead apply the server's gram DECREASE since the `baseline` on top of the
+ * local grams:
+ *   merged = clamp(local - max(0, baseline - remote))
+ * This preserves background consumption while letting a deliberate local change
+ * (refilling, editing weight, swapping the spool) win, since that moves the
+ * local value independently of the server delta. Spools not present locally are
+ * left to the normal last-write-wins map (handled by the caller's spread).
+ */
+function mergeServerConsumption(
+  local: Record<string, Spool>,
+  remote: Record<string, Spool> | undefined,
+  baseline: Record<string, Spool> | undefined,
+): Record<string, Spool> {
+  if (!remote || !baseline) return local
+  let changed = false
+  const out: Record<string, Spool> = { ...local }
+  for (const id of Object.keys(local)) {
+    const base = baseline[id]
+    const rem = remote[id]
+    if (!base || !rem) continue // new/edited spool — leave local as-is
+    const serverConsumed = Math.max(0, base.grams - rem.grams)
+    if (serverConsumed <= 0) continue
+    const merged = Math.max(0, local[id].grams - serverConsumed)
+    if (merged !== local[id].grams) {
+      out[id] = { ...local[id], grams: merged }
+      changed = true
+    }
+  }
+  return changed ? out : local
+}
+
+/**
  * Merge the additive "catalog" registries — saved filament profiles, barcode
  * links, containers, custom materials/brands, orders, and the history log —
  * from a remote snapshot into our outgoing document, using `baseline` (the last
@@ -177,14 +214,34 @@ function mergeCatalog(local: PersistedState, remote: PersistedState, baseline: P
   // on another device, but let a local reset/clear win over the baseline. The
   // live running total (currentG/since) is per-shared-doc last-write-wins.
   const localUsage = local.usage ?? defaultUsage()
+  // The Pi tracks filament consumption server-side and writes it straight to the
+  // database, bumping `usage.currentG` and decrementing spool grams while a
+  // browser may be holding stale values. A plain local-wins save would clobber
+  // that server progress. So we fold in the server's DELTA since our baseline:
+  //   merged = local + (remote_since_baseline - baseline)
+  // which preserves background consumption yet still lets an explicit local edit
+  // (loading a spool, manually setting weight, resetting usage) win, because
+  // those change the local value independently of the server delta.
+  const usageDelta = Math.max(0, (remote.usage?.currentG ?? 0) - (baseline?.usage?.currentG ?? 0))
   const usage: FilamentUsage = {
     ...localUsage,
+    // Only apply the running-total delta when we didn't locally reset (a reset
+    // sets currentG below baseline); otherwise honor the local value + server delta.
+    currentG:
+      localUsage.currentG < (baseline?.usage?.currentG ?? 0)
+        ? localUsage.currentG
+        : localUsage.currentG + usageDelta,
     archived: mergeByKey(localUsage.archived, remote.usage?.archived, baseline?.usage?.archived, (a) => a.id)
       .sort((a, b) => b.to - a.to)
       .slice(0, USAGE_ARCHIVE_CAP),
   }
+  // Same idea for spool weights: apply any server-side gram DECREASE since the
+  // baseline on top of the local value, so background consumption survives a
+  // concurrent local save. A local refill/edit that raises grams still wins.
+  const spools = mergeServerConsumption(local.spools, remote.spools, baseline?.spools)
   return {
     ...local,
+    spools,
     history,
     usage,
     settings: {

@@ -6,7 +6,8 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint ."
+    "lint": "eslint .",
+    "postinstall": "node scripts/ensure-native-modules.mjs"
   },
   "dependencies": {
     "@base-ui/react": "^1.5.0",
@@ -42,6 +43,10 @@
   "pnpm": {
     "overrides": {
       "hono": "4.12.25"
-    }
+    },
+    "onlyBuiltDependencies": [
+      "better-sqlite3",
+      "sharp"
+    ]
   }
 }
