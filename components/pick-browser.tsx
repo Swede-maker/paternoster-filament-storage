@@ -5,7 +5,7 @@ import { Search, X, PackagePlus } from "lucide-react"
 import { useStore } from "@/lib/store"
 import { Dialog, DialogHeader, DialogBody } from "./ui/dialog"
 import { Input } from "./ui/field"
-import { SpoolDisc } from "./spool"
+import { SpoolDisc, discColor2 } from "./spool"
 import { storedSpools, searchSpools } from "@/lib/selectors"
 import { formatGrams, isLightColor, spoolFill } from "@/lib/filament"
 import type { Spool } from "@/lib/types"
@@ -133,7 +133,7 @@ export function PickBrowser({
                     (!onPick && !onInspect ? "cursor-default" : "hover:border-primary/60 hover:bg-primary/5")
                   }
                 >
-                  <SpoolDisc color={spool.color} size={56} fill={spoolFill(spool)} boxed={!!spool.containerId} />
+                  <SpoolDisc color={spool.color} color2={discColor2(spool)} size={56} fill={spoolFill(spool)} boxed={!!spool.containerId} />
                   <span
                     className="text-sm font-semibold"
                     style={{ color: isLightColor(spool.color) ? "#d4d4d8" : spool.color }}

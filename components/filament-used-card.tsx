@@ -29,6 +29,11 @@ export function FilamentUsedCard() {
   const lifetime = useMemo(() => lifetimeGrams(usage), [usage])
   const hasArchive = usage.archived.length > 0
 
+  // Home-view visibility is user-controlled (chosen at setup, editable in
+  // Settings). When off, the totals live only under History, so render nothing
+  // here. Defaults to shown when the setting is absent (older saves).
+  if (state.settings.showUsageCardOnHome === false) return null
+
   return (
     <section
       aria-label="Total filament used"

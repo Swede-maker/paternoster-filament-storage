@@ -7,6 +7,7 @@ import { SetupWizard } from "@/components/setup-wizard"
 import { HomeView } from "@/components/home-view"
 import { OrdersView } from "@/components/orders-view"
 import { HistoryView } from "@/components/history-view"
+import { FilamentDryingView } from "@/components/filament-drying-view"
 import { SettingsView } from "@/components/settings-view"
 import { MotionOverlay } from "@/components/motion-overlay"
 import { BottomNav, type NavTab } from "@/components/bottom-nav"
@@ -81,6 +82,8 @@ function AppShell() {
           <OrdersView />
         ) : tab === "history" ? (
           <HistoryView />
+        ) : tab === "drying" ? (
+          <FilamentDryingView />
         ) : (
           <SettingsView />
         )}

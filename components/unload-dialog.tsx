@@ -1,7 +1,7 @@
 "use client"
 
 import { useEffect, useState } from "react"
-import { PackageMinus, Archive, Trash2, Server, Package, Library, MapPin } from "lucide-react"
+import { PackageMinus, Archive, Trash2, Server, Package, Library, MapPin, Pencil, Save, ArrowLeft } from "lucide-react"
 import { useStore } from "@/lib/store"
 import { printerSlotLabel } from "@/lib/selectors"
 import { nodeFreeSlots } from "@/lib/balance"
@@ -9,7 +9,8 @@ import { formatGrams, formatRemaining, isLightColor, spoolFill } from "@/lib/fil
 import { Dialog, DialogHeader, DialogBody, DialogFooter } from "./ui/dialog"
 import { Button } from "./ui/button"
 import { Field, Input, Select } from "./ui/field"
-import { SpoolDisc } from "./spool"
+import { SpoolDisc, discColor2 } from "./spool"
+import { SpoolForm, emptyDraft, type SpoolDraft } from "./spool-form"
 import type { Printer, Spool } from "@/lib/types"
 
 /**
@@ -34,6 +35,11 @@ export function UnloadDialog({
   onPlace?: (printer: Printer, slot: number, spool: Spool, grams?: number) => void
 }) {
   const { state, dispatch } = useStore()
+  // "unload" = the normal store/delete sheet; "edit" = the full spool editor so
+  // the user can fix a spool's details (material, colors, dual-color, etc.)
+  // without first taking it off the printer.
+  const [view, setView] = useState<"unload" | "edit">("unload")
+  const [draft, setDraft] = useState<SpoolDraft>(() => emptyDraft())
   const [grams, setGrams] = useState("")
   // Which storage unit to store into. Seeded to the unit the user is viewing, but
   // they can redirect to any unit with room (e.g. paternoster vs a dumb shelf).
@@ -62,6 +68,24 @@ export function UnloadDialog({
 
   useEffect(() => {
     if (!target) return
+    setView("unload")
+    // Seed the full editor from the loaded spool so "Edit details" opens ready.
+    const s = target.spool
+    setDraft({
+      material: s.material,
+      brand: s.brand,
+      color: s.color,
+      color2: s.color2,
+      dualColor: s.dualColor,
+      colorName: s.colorName,
+      grams: Math.round(s.grams),
+      capacity: Math.round(s.capacity ?? s.grams),
+      nozzleTemp: s.nozzleTemp,
+      containerId: s.containerId,
+      density: s.density,
+      diameter: s.diameter,
+      barcode: s.barcode,
+    })
     setGrams(String(Math.round(target.spool.grams)))
     // A library never fills up; fixed grids need a free slot. Prefer the active
     // unit (the section the user is on) when it has room, else the first unit
@@ -106,6 +130,39 @@ export function UnloadDialog({
     }
   }
 
+  // Persist full-editor changes onto the loaded spool in place. `quantity` is a
+  // form-only field and must never be written to a spool.
+  function saveEdit() {
+    const { quantity: _q, ...changes } = draft
+    dispatch({ type: "UPDATE_SPOOL", id: spool.id, changes })
+    setView("unload")
+  }
+
+  // Full spool editor — reachable via "Edit details" from the unload sheet, so
+  // a spool can be corrected while it's still loaded on the printer.
+  if (view === "edit") {
+    return (
+      <Dialog open={target !== null} onClose={onClose}>
+        <DialogHeader
+          icon={<Pencil className="h-5 w-5" />}
+          title="Edit spool details"
+          description={`${printer.name} · slot ${printerSlotLabel(printer, slot)}`}
+        />
+        <DialogBody>
+          <SpoolForm value={draft} onChange={setDraft} />
+        </DialogBody>
+        <DialogFooter>
+          <Button variant="ghost" onClick={() => setView("unload")}>
+            <ArrowLeft className="h-4 w-4" /> Back
+          </Button>
+          <Button onClick={saveEdit}>
+            <Save className="h-4 w-4" /> Save changes
+          </Button>
+        </DialogFooter>
+      </Dialog>
+    )
+  }
+
   return (
     <Dialog open={target !== null} onClose={onClose}>
       <DialogHeader
@@ -119,7 +176,7 @@ export function UnloadDialog({
       />
       <DialogBody className="space-y-5">
         <div className="flex items-center gap-4">
-          <SpoolDisc color={spool.color} size={72} fill={spoolFill(spool)} />
+          <SpoolDisc color={spool.color} color2={discColor2(spool)} size={72} fill={spoolFill(spool)} />
           <div>
             <p className="text-lg font-semibold" style={{ color: isLightColor(spool.color) ? "#d4d4d8" : spool.color }}>
               {spool.material} · {spool.colorName}
@@ -216,6 +273,9 @@ export function UnloadDialog({
       <DialogFooter>
         <Button variant="destructive" onClick={del}>
           <Trash2 className="h-4 w-4" /> Delete
+        </Button>
+        <Button variant="outline" onClick={() => setView("edit")}>
+          <Pencil className="h-4 w-4" /> Edit details
         </Button>
         <Button onClick={store} disabled={placing ? false : storageFull || !destNodeId}>
           <Archive className="h-4 w-4" /> {placing ? "Place here" : "Store spool"}

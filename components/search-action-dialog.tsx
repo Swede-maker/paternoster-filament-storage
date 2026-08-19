@@ -3,7 +3,7 @@
 import { PackageCheck, HandMetal, Printer as PrinterIcon } from "lucide-react"
 import { Dialog, DialogHeader, DialogBody } from "./ui/dialog"
 import { Button } from "./ui/button"
-import { SpoolDisc } from "./spool"
+import { SpoolDisc, discColor2 } from "./spool"
 import { formatGrams, isLightColor, spoolFill } from "@/lib/filament"
 import { useStore } from "@/lib/store"
 import { getNode, shelfLabel } from "@/lib/selectors"
@@ -51,7 +51,7 @@ export function SearchActionDialog({
       <DialogBody className="space-y-5">
         {spool && (
           <div className="flex items-center gap-4">
-            <SpoolDisc color={spool.color} size={64} fill={spoolFill(spool)} />
+            <SpoolDisc color={spool.color} color2={discColor2(spool)} size={64} fill={spoolFill(spool)} />
             <div className="min-w-0">
               <p
                 className="text-base font-semibold"

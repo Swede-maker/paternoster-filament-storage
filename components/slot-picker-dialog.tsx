@@ -5,7 +5,7 @@ import { Boxes, Plus, X } from "lucide-react"
 import { Dialog, DialogHeader, DialogBody } from "./ui/dialog"
 import { printerSlotLabel } from "@/lib/selectors"
 import { spoolFill, isLightColor } from "@/lib/filament"
-import { SpoolDisc } from "./spool"
+import { SpoolDisc, discColor2 } from "./spool"
 import { useStore } from "@/lib/store"
 import { cn } from "@/lib/utils"
 import type { Printer } from "@/lib/types"
@@ -133,7 +133,7 @@ export function SlotPickerDialog({
                     className="flex w-full flex-col items-center gap-2 rounded-xl border border-border bg-background/50 p-3 transition-colors hover:border-primary/60 hover:bg-primary/5"
                   >
                     {spool ? (
-                      <SpoolDisc color={spool.color} size={48} fill={spoolFill(spool)} />
+                      <SpoolDisc color={spool.color} color2={discColor2(spool)} size={48} fill={spoolFill(spool)} />
                     ) : (
                       <span className="flex h-12 w-12 items-center justify-center rounded-full border border-dashed border-border bg-background/60 text-muted-foreground/60">
                         <Plus className="h-5 w-5" />

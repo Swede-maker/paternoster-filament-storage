@@ -8,7 +8,7 @@ import { SpoolSelectionBar, SelectModeButton } from "./spool-selection-bar"
 import { activeNode, shelfArea, shelfLabel } from "@/lib/selectors"
 import { cn } from "@/lib/utils"
 import { formatRemaining, spoolFill } from "@/lib/filament"
-import { SpoolDisc, EmptySlot } from "./spool"
+import { SpoolDisc, EmptySlot, discColor2 } from "./spool"
 
 /**
  * Static rack view for manual (no-hardware) shelf storage. Unlike the
@@ -133,7 +133,7 @@ export function ShelfStorageView({
                     )}
                     <span className="font-mono text-[11px] text-muted-foreground">{slot + 1}</span>
                     {spool ? (
-                      <SpoolDisc color={spool.color} size={52} fill={spoolFill(spool)} boxed={!!spool.containerId} />
+                      <SpoolDisc color={spool.color} color2={discColor2(spool)} size={52} fill={spoolFill(spool)} boxed={!!spool.containerId} />
                     ) : (
                       <EmptySlot size={52} />
                     )}

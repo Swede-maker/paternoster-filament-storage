@@ -5,7 +5,7 @@ import { Play, X, Plus, ListChecks, ChevronDown, ChevronUp } from "lucide-react"
 import { useFlow } from "./flow-controller"
 import { useStore } from "@/lib/store"
 import { Button } from "./ui/button"
-import { SpoolDisc } from "./spool"
+import { SpoolDisc, discColor2 } from "./spool"
 import { printerSlotLabel, getNode, shelfLabel, orderQueueItems } from "@/lib/selectors"
 import { nodeFreeSlots } from "@/lib/balance"
 import { isLightColor, spoolFill } from "@/lib/filament"
@@ -93,7 +93,7 @@ export function QueueTray({ onAddMore }: { onAddMore: () => void }) {
                 className="flex shrink-0 flex-col items-center gap-1 rounded-xl border border-border bg-background/50 p-2"
               >
                 <span className="font-mono text-[10px] text-muted-foreground">#{i + 1}</span>
-                <SpoolDisc color={it.spool.color} size={44} fill={spoolFill(it.spool)} />
+                <SpoolDisc color={it.spool.color} color2={discColor2(it.spool)} size={44} fill={spoolFill(it.spool)} />
                 <span
                   className="text-[11px] font-semibold"
                   style={{ color: isLightColor(it.spool.color) ? "#d4d4d8" : it.spool.color }}

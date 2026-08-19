@@ -6,7 +6,7 @@ import { useStore } from "@/lib/store"
 import { useFlow } from "./flow-controller"
 import { newId, densityFor, formatGrams, DEFAULT_DIAMETER } from "@/lib/filament"
 import type { FilamentOrder, OrderItem } from "@/lib/types"
-import { SpoolDisc } from "./spool"
+import { SpoolDisc, discColor2 } from "./spool"
 import { Button } from "./ui/button"
 import { Input } from "./ui/field"
 import { SpoolForm, emptyDraft, type SpoolDraft } from "./spool-form"
@@ -19,6 +19,8 @@ function draftToItem(draft: SpoolDraft): OrderItem {
     material: draft.material,
     brand: draft.brand,
     color: draft.color,
+    color2: draft.dualColor ? draft.color2 : undefined,
+    dualColor: draft.dualColor,
     colorName: draft.colorName,
     capacity: draft.capacity,
     nozzleTemp: draft.nozzleTemp,
@@ -35,6 +37,8 @@ function itemToDraft(item: OrderItem, fallbackDiameter: number): SpoolDraft {
     material: item.material,
     brand: item.brand,
     color: item.color,
+    color2: item.color2,
+    dualColor: item.dualColor,
     colorName: item.colorName,
     grams: item.capacity,
     capacity: item.capacity,
@@ -183,7 +187,7 @@ function OrderCard({ order }: { order: FilamentOrder }) {
             <ul className="mb-4 space-y-2">
               {order.items.map((item) => (
                 <li key={item.id} className="flex items-center gap-3 rounded-xl border border-border bg-background/60 p-3">
-                  <SpoolDisc color={item.color} size={40} fill={1} boxed={!!item.containerId} />
+                  <SpoolDisc color={item.color} color2={discColor2(item)} size={40} fill={1} boxed={!!item.containerId} />
                   <div className="min-w-0 flex-1">
                     <p className="truncate text-sm font-medium text-foreground">
                       {item.colorName || item.material}

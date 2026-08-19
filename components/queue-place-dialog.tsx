@@ -3,7 +3,7 @@
 import { PackagePlus, ListChecks } from "lucide-react"
 import { Dialog, DialogHeader, DialogBody, DialogFooter } from "./ui/dialog"
 import { Button } from "./ui/button"
-import { SpoolDisc } from "./spool"
+import { SpoolDisc, discColor2 } from "./spool"
 import { isLightColor, spoolFill } from "@/lib/filament"
 import type { PendingItem } from "./flow-controller"
 
@@ -55,6 +55,7 @@ export function QueuePlaceDialog({
                   >
                     <SpoolDisc
                       color={it.spool.color}
+                      color2={discColor2(it.spool)}
                       size={48}
                       fill={spoolFill(it.spool)}
                       boxed={!!it.spool.containerId}

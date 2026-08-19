@@ -31,7 +31,7 @@ import { newId, formatGrams } from "@/lib/filament"
 import type { Container, StorageNode } from "@/lib/types"
 import { Button } from "./ui/button"
 import { Field, Input, Select, Checkbox } from "./ui/field"
-import { SpoolDisc } from "./spool"
+import { SpoolDisc, discColor2 } from "./spool"
 import { BarcodeScanner } from "./barcode-scanner"
 import {
   draftFromNode,
@@ -122,6 +122,13 @@ export function SettingsView() {
             Pre-selected on new spools and used to convert print length into grams consumed.
           </p>
         </Field>
+
+        <Checkbox
+          checked={state.settings.showUsageCardOnHome !== false}
+          onChange={(v) => dispatch({ type: "UPDATE_SETTINGS", settings: { showUsageCardOnHome: v } })}
+          label={'Show "Total filament used" on Home'}
+          description="When on, the running weight counter appears on the Paternoster, Shelf and Library views. When off, it lives only under the History tab."
+        />
       </Section>
 
       {/* Filament presets */}
@@ -749,7 +756,7 @@ function ProfileManager() {
               key={p.id}
               className="flex items-center gap-3 rounded-xl border border-border bg-background/50 p-3"
             >
-              <SpoolDisc color={p.color} size={40} fill={1} boxed={!!p.containerId} />
+              <SpoolDisc color={p.color} color2={discColor2(p)} size={40} fill={1} boxed={!!p.containerId} />
               <div className="min-w-0 flex-1">
                 <p className="truncate text-sm font-semibold text-foreground">{p.name}</p>
                 <p className="truncate font-mono text-xs text-muted-foreground">

@@ -5,7 +5,7 @@ import { Loader2, CheckCircle2, ArrowUpCircle, ArrowDownCircle, MapPin } from "l
 import { useStore } from "@/lib/store"
 import { Button } from "./ui/button"
 import { Input, Field } from "./ui/field"
-import { SpoolDisc } from "./spool"
+import { SpoolDisc, discColor2 } from "./spool"
 import { formatGrams, isLightColor } from "@/lib/filament"
 import { printerSlotLabel, shelfLabel, getNode } from "@/lib/selectors"
 import type { Printer, StorageNode } from "@/lib/types"
@@ -80,7 +80,7 @@ export function MotionOverlay() {
         {/* spool identity */}
         {spool && (
           <div className="mb-5 flex items-center gap-4">
-            <SpoolDisc color={spool.color} size={72} />
+            <SpoolDisc color={spool.color} color2={discColor2(spool)} size={72} />
             <div>
               <p className="text-lg font-semibold" style={{ color: isLightColor(spool.color) ? "#d4d4d8" : spool.color }}>
                 {spool.material} · {spool.colorName}

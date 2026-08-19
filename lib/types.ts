@@ -14,6 +14,13 @@ export interface Spool {
   brand: string
   /** Hex color used for rendering the spool. */
   color: string
+  /**
+   * Optional second hex color for dual-color / co-extruded / gradient spools.
+   * Only meaningful when `dualColor` is true; ignored otherwise.
+   */
+  color2?: string
+  /** Whether this spool is a two-tone spool that should render `color2` too. */
+  dualColor?: boolean
   /** Human readable color name, e.g. "Galaxy Red". */
   colorName: string
   /** Grams of filament remaining. */
@@ -80,6 +87,10 @@ export interface FilamentProfile {
   material: FilamentMaterial
   brand: string
   color: string
+  /** Optional second color for a dual-color spool. */
+  color2?: string
+  /** Whether this profile describes a two-tone spool. */
+  dualColor?: boolean
   colorName: string
   /** Full-spool weight (g) to seed a new spool with. */
   capacity: number
@@ -95,6 +106,10 @@ export interface OrderItem {
   material: FilamentMaterial
   brand: string
   color: string
+  /** Optional second color for a dual-color spool. */
+  color2?: string
+  /** Whether this item describes a two-tone spool. */
+  dualColor?: boolean
   colorName: string
   capacity: number
   nozzleTemp?: number
@@ -303,6 +318,19 @@ export interface Settings {
   barcodes?: { code: string; profileId: string }[]
   /** Incoming filament orders / carts waiting to be received into storage. */
   orders?: FilamentOrder[]
+  /**
+   * User-saved custom colors (name + hex) that appear as reusable swatches in
+   * the spool editor, alongside the built-in presets. Optional for
+   * backwards-compat with old saves.
+   */
+  customColors?: { name: string; hex: string }[]
+  /**
+   * Whether the "Total filament used" card is shown on the Home storage views
+   * (paternoster / shelf / library). When false it lives only under the
+   * Filament Drying/History tabs. Chosen during first-time setup and editable
+   * here. Defaults to true when absent.
+   */
+  showUsageCardOnHome?: boolean
 }
 
 export interface StorageConfig {

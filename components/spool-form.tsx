@@ -1,7 +1,7 @@
 "use client"
 
-import { useState } from "react"
-import { Barcode, Save } from "lucide-react"
+import { useEffect, useState } from "react"
+import { Barcode, Save, X } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { useStore } from "@/lib/store"
 import { Field, Input, Label, Select } from "./ui/field"
@@ -27,6 +27,10 @@ export interface SpoolDraft {
   material: FilamentMaterial
   brand: string
   color: string
+  /** Optional second color for a dual-color spool. */
+  color2?: string
+  /** Whether this spool is a two-tone spool (renders `color2`). */
+  dualColor?: boolean
   colorName: string
   grams: number
   /** Full-spool weight (grams) used as the 100% reference. */
@@ -61,6 +65,82 @@ export function emptyDraft(defaultGrams = 1000, defaultDiameter = DEFAULT_DIAMET
 }
 
 const HEX_RE = /^#[0-9a-fA-F]{6}$/
+
+/**
+ * A numeric text input that can be genuinely empty while editing. It keeps its
+ * own display string, so clearing the field shows a blank box (not a forced 0).
+ * `onValue` reports `null` while the field is empty; the parent decides what to
+ * store for that. Values are clamped to [min, max] when they parse. When the
+ * external `value` changes (e.g. a profile is applied) the display resyncs, but
+ * only while the field isn't focused so it never fights the user's typing.
+ */
+function NumField({
+  value,
+  onValue,
+  min,
+  max,
+  integer = true,
+  placeholder,
+  className,
+  ariaLabel,
+}: {
+  value: number | undefined
+  onValue: (n: number | null) => void
+  min?: number
+  max?: number
+  integer?: boolean
+  placeholder?: string
+  className?: string
+  ariaLabel?: string
+}) {
+  const fmt = (v: number | undefined) => (v == null || Number.isNaN(v) ? "" : String(v))
+  const [text, setText] = useState(() => fmt(value))
+  const [focused, setFocused] = useState(false)
+
+  // Resync the display when the model changes from outside (profile apply,
+  // material change, etc.) — but not mid-typing.
+  useEffect(() => {
+    if (!focused) setText(fmt(value))
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [value, focused])
+
+  const clamp = (n: number) => {
+    let v = n
+    if (min != null) v = Math.max(min, v)
+    if (max != null) v = Math.min(max, v)
+    return v
+  }
+
+  return (
+    <Input
+      type="number"
+      inputMode={integer ? "numeric" : "decimal"}
+      min={min}
+      max={max}
+      value={text}
+      placeholder={placeholder}
+      aria-label={ariaLabel}
+      className={className}
+      onFocus={() => setFocused(true)}
+      onBlur={() => {
+        setFocused(false)
+        // Snap the display back to the committed model value on blur so a
+        // left-empty field doesn't stay blank forever.
+        setText(fmt(value))
+      }}
+      onChange={(e) => {
+        const raw = e.target.value
+        setText(raw)
+        if (raw.trim() === "") {
+          onValue(null)
+          return
+        }
+        const n = integer ? Number.parseInt(raw) : Number.parseFloat(raw)
+        if (Number.isFinite(n)) onValue(clamp(n))
+      }}
+    />
+  )
+}
 
 /**
  * Change the material and re-suggest the nozzle temp, but only when the user
@@ -102,10 +182,14 @@ export function SpoolForm({
   const containers = state.settings.containers ?? []
   const profiles = state.settings.filamentProfiles ?? []
   const barcodes = state.settings.barcodes ?? []
+  const customColors = state.settings.customColors ?? []
   const defaultDiameter = state.settings.defaultDiameter ?? DEFAULT_DIAMETER
 
   const [scannerOpen, setScannerOpen] = useState(false)
   const [scanNote, setScanNote] = useState<string | null>(null)
+  // Saved-color delete affordance is gated behind an explicit "Edit" toggle so
+  // the small X can't be hit by mistake while just picking a color.
+  const [editingColors, setEditingColors] = useState(false)
 
   /** Apply a saved profile's attributes to the current draft (keeps quantity). */
   function applyProfile(id: string) {
@@ -115,6 +199,8 @@ export function SpoolForm({
       material: p.material,
       brand: p.brand,
       color: p.color,
+      color2: p.color2,
+      dualColor: p.dualColor,
       colorName: p.colorName,
       capacity: p.capacity,
       grams: p.capacity,
@@ -136,6 +222,8 @@ export function SpoolForm({
         material: value.material,
         brand: value.brand,
         color: value.color,
+        color2: value.dualColor ? value.color2 : undefined,
+        dualColor: value.dualColor,
         colorName: value.colorName,
         capacity: value.capacity,
         nozzleTemp: value.nozzleTemp,
@@ -162,22 +250,42 @@ export function SpoolForm({
   }
 
   // Normalize free-typed hex input to `#RRGGBB`.
-  function setHex(raw: string) {
+  function normalizeHex(raw: string) {
     let v = raw.replace(/[^#0-9a-fA-F]/g, "")
     if (!v.startsWith("#")) v = "#" + v
-    v = "#" + v.slice(1).slice(0, 6)
-    set({ color: v })
+    return "#" + v.slice(1).slice(0, 6)
+  }
+  const setHex = (raw: string) => set({ color: normalizeHex(raw) })
+  const setHex2 = (raw: string) => set({ color2: normalizeHex(raw) })
+
+  /** Save the current primary color as a reusable custom swatch. */
+  function saveCurrentColor() {
+    if (!validHex) return
+    dispatch({ type: "ADD_CUSTOM_COLOR", color: { name: value.colorName.trim() || value.color, hex: value.color } })
   }
 
   const validHex = HEX_RE.test(value.color)
-  const isPreset = COLOR_PRESETS.some((c) => c.hex.toLowerCase() === value.color.toLowerCase())
+  const validHex2 = HEX_RE.test(value.color2 ?? "")
+  const allPresetHexes = new Set([
+    ...COLOR_PRESETS.map((c) => c.hex.toLowerCase()),
+    ...customColors.map((c) => c.hex.toLowerCase()),
+  ])
+  const isPreset = allPresetHexes.has(value.color.toLowerCase())
+  const alreadySaved = customColors.some((c) => c.hex.toLowerCase() === value.color.toLowerCase())
   const pickerValue = validHex ? value.color : "#000000"
+  const pickerValue2 = validHex2 ? value.color2! : "#000000"
   const fill = spoolFill(value)
 
   return (
     <div className="space-y-5">
       <div className="flex items-center gap-4">
-        <SpoolDisc color={validHex ? value.color : "#1c1c1e"} size={72} fill={fill} boxed={!!value.containerId} />
+        <SpoolDisc
+          color={validHex ? value.color : "#1c1c1e"}
+          color2={value.dualColor && value.color2 && HEX_RE.test(value.color2) ? value.color2 : undefined}
+          size={72}
+          fill={fill}
+          boxed={!!value.containerId}
+        />
         <div className="min-w-0">
           <p
             className="truncate text-lg font-semibold"
@@ -282,7 +390,60 @@ export function SpoolForm({
           ))}
         </div>
 
-        {/* Custom hex color: swatch/native picker + text field */}
+        {/* Saved custom swatches — reusable colors the user has stored. */}
+        {customColors.length > 0 && (
+          <div className="mt-3">
+            <div className="mb-1.5 flex items-center justify-between">
+              <p className="text-xs font-medium text-muted-foreground">Your saved colors</p>
+              <button
+                type="button"
+                onClick={() => setEditingColors((v) => !v)}
+                className={cn(
+                  "text-xs font-medium transition-colors",
+                  editingColors ? "text-primary" : "text-muted-foreground hover:text-foreground",
+                )}
+                aria-pressed={editingColors}
+              >
+                {editingColors ? "Done" : "Edit"}
+              </button>
+            </div>
+            <div className="flex flex-wrap gap-2">
+              {customColors.map((c) => (
+                <span key={c.hex} className="relative">
+                  <button
+                    type="button"
+                    title={c.name}
+                    onClick={() =>
+                      editingColors
+                        ? dispatch({ type: "REMOVE_CUSTOM_COLOR", hex: c.hex })
+                        : set({ color: c.hex, colorName: c.name })
+                    }
+                    className={cn(
+                      "h-9 w-9 rounded-full border-2 transition-transform hover:scale-110",
+                      editingColors
+                        ? "border-destructive/60"
+                        : value.color.toLowerCase() === c.hex.toLowerCase()
+                          ? "border-primary"
+                          : "border-black/40",
+                    )}
+                    style={{ backgroundColor: c.hex }}
+                    aria-label={editingColors ? `Remove saved color ${c.name}` : `${c.name} (saved)`}
+                  />
+                  {editingColors && (
+                    <span
+                      className="pointer-events-none absolute -right-1.5 -top-1.5 flex h-5 w-5 items-center justify-center rounded-full bg-background text-destructive shadow ring-1 ring-border"
+                      aria-hidden="true"
+                    >
+                      <X className="h-3 w-3" />
+                    </span>
+                  )}
+                </span>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {/* Custom hex color: swatch/native picker + text field + save action */}
         <div className="mt-3 flex items-center gap-2">
           <label
             className="relative h-11 w-12 shrink-0 cursor-pointer overflow-hidden rounded-lg border-2 border-black/40"
@@ -305,13 +466,63 @@ export function SpoolForm({
             className={cn("font-mono uppercase", !validHex && "border-warning focus-visible:ring-warning")}
             aria-label="Hex color"
           />
-          {isPreset && validHex ? (
-            <span className="shrink-0 text-xs text-muted-foreground">Preset</span>
-          ) : validHex ? (
-            <span className="shrink-0 text-xs text-primary">Custom</span>
-          ) : null}
+          <button
+            type="button"
+            onClick={saveCurrentColor}
+            disabled={!validHex || alreadySaved || isPreset}
+            title={alreadySaved ? "Already saved" : isPreset ? "Built-in color" : "Save this color for reuse"}
+            className="flex h-11 shrink-0 items-center gap-1.5 rounded-lg border border-border px-3 text-sm font-medium text-foreground transition-colors hover:bg-secondary disabled:cursor-not-allowed disabled:opacity-40"
+          >
+            <Save className="h-4 w-4" /> Save
+          </button>
         </div>
         {!validHex && <p className="mt-1 text-xs text-warning">Enter a 6-digit hex like #1e88e5.</p>}
+
+        {/* Dual-color toggle + second color picker */}
+        <label className="mt-3 flex cursor-pointer items-center gap-2 text-sm text-foreground">
+          <input
+            type="checkbox"
+            checked={!!value.dualColor}
+            onChange={(e) =>
+              set({
+                dualColor: e.target.checked,
+                // Seed the second color so the preview shows a split immediately.
+                color2: e.target.checked ? value.color2 ?? "#f4f4f5" : value.color2,
+              })
+            }
+            className="h-4 w-4 accent-primary"
+          />
+          Dual-color spool (two-tone / co-extruded)
+        </label>
+
+        {value.dualColor && (
+          <div className="mt-2 flex items-center gap-2">
+            <label
+              className="relative h-11 w-12 shrink-0 cursor-pointer overflow-hidden rounded-lg border-2 border-black/40"
+              style={{ backgroundColor: validHex2 ? value.color2 : "transparent" }}
+              title="Pick the second color"
+            >
+              <input
+                type="color"
+                value={pickerValue2}
+                onChange={(e) => set({ color2: e.target.value })}
+                className="absolute inset-0 h-full w-full cursor-pointer opacity-0"
+                aria-label="Second color picker"
+              />
+            </label>
+            <Input
+              value={value.color2 ?? ""}
+              onChange={(e) => setHex2(e.target.value)}
+              placeholder="#RRGGBB (second color)"
+              spellCheck={false}
+              className={cn("font-mono uppercase", !validHex2 && "border-warning focus-visible:ring-warning")}
+              aria-label="Second hex color"
+            />
+          </div>
+        )}
+        {value.dualColor && !validHex2 && (
+          <p className="mt-1 text-xs text-warning">Enter a 6-digit hex for the second color.</p>
+        )}
       </div>
 
       <Field label="Color name">
@@ -324,14 +535,14 @@ export function SpoolForm({
 
       <div className="grid grid-cols-2 gap-4">
         <Field label="Full spool weight (grams)">
-          <Input
-            type="number"
-            inputMode="numeric"
+          <NumField
+            value={value.capacity}
             min={1}
             max={5000}
-            value={value.capacity}
-            onChange={(e) => {
-              const cap = Math.max(1, Number.parseInt(e.target.value) || 0)
+            ariaLabel="Full spool weight"
+            onValue={(n) => {
+              if (n == null) return // left empty while typing — keep the last value
+              const cap = Math.max(1, n)
               // Keep remaining within the new full weight.
               set({ capacity: cap, grams: Math.min(value.grams, cap) })
             }}
@@ -339,15 +550,15 @@ export function SpoolForm({
           <p className="mt-1 text-xs text-muted-foreground">Weight of a brand-new spool (the 100% mark).</p>
         </Field>
         <Field label="Remaining (grams)">
-          <Input
-            type="number"
-            inputMode="numeric"
+          <NumField
+            value={value.grams}
             min={0}
             max={value.capacity}
-            value={value.grams}
-            onChange={(e) =>
-              set({ grams: Math.max(0, Math.min(value.capacity, Number.parseInt(e.target.value) || 0)) })
-            }
+            ariaLabel="Remaining grams"
+            onValue={(n) => {
+              if (n == null) return // left empty while typing — keep the last value
+              set({ grams: Math.max(0, Math.min(value.capacity, n)) })
+            }}
           />
           <p className="mt-1 text-xs text-muted-foreground">{Math.round(fill * 100)}% left on the spool.</p>
         </Field>
@@ -355,17 +566,13 @@ export function SpoolForm({
 
       <Field label="Nozzle temperature (optional)">
         <div className="flex items-center gap-2">
-          <Input
-            type="number"
-            inputMode="numeric"
-            min={150}
+          <NumField
+            value={value.nozzleTemp}
+            min={0}
             max={350}
-            value={value.nozzleTemp ?? ""}
-            onChange={(e) => {
-              const raw = e.target.value.trim()
-              set({ nozzleTemp: raw === "" ? undefined : Math.max(0, Number.parseInt(raw) || 0) })
-            }}
+            ariaLabel="Nozzle temperature"
             placeholder={`e.g. ${nozzleTempFor(value.material)}`}
+            onValue={(n) => set({ nozzleTemp: n == null ? undefined : n })}
           />
           <span className="text-sm text-muted-foreground">°C</span>
         </div>
@@ -408,18 +615,14 @@ export function SpoolForm({
           <p className="mt-1 text-xs text-muted-foreground">Used to convert print length into grams.</p>
         </Field>
         <Field label="Density (g/cm³)">
-          <Input
-            type="number"
-            inputMode="decimal"
-            step="0.01"
-            min={0.5}
+          <NumField
+            value={value.density}
+            min={0}
             max={3}
-            value={value.density ?? ""}
-            onChange={(e) => {
-              const raw = e.target.value.trim()
-              set({ density: raw === "" ? undefined : Math.max(0, Number.parseFloat(raw) || 0) })
-            }}
+            integer={false}
+            ariaLabel="Density"
             placeholder={`e.g. ${densityFor(value.material)}`}
+            onValue={(n) => set({ density: n == null ? undefined : n })}
           />
           <p className="mt-1 text-xs text-muted-foreground">Defaults from the material.</p>
         </Field>

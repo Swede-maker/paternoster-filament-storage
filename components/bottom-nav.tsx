@@ -1,11 +1,11 @@
 "use client"
 
-import { Home, Settings, ShoppingCart, History } from "lucide-react"
+import { Home, Settings, ShoppingCart, History, Droplets } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { useStore } from "@/lib/store"
 import { dueReminders } from "@/lib/selectors"
 
-export type NavTab = "home" | "orders" | "history" | "settings"
+export type NavTab = "home" | "orders" | "history" | "drying" | "settings"
 
 export function BottomNav({
   tab,
@@ -17,13 +17,15 @@ export function BottomNav({
   const { state } = useStore()
 
   const orderCount = (state.settings.orders ?? []).length
-  // Surface overdue dry reminders as an alert badge on the History tab.
+  // Surface overdue dry reminders as an alert badge on the Filament Drying tab —
+  // like the Orders badge, but colored as an alert since it's time-sensitive.
   const dueCount = dueReminders(state).length
 
   const items: { id: NavTab; label: string; icon: typeof Home; badge?: number; alert?: boolean }[] = [
     { id: "home", label: "Home", icon: Home },
     { id: "orders", label: "Orders", icon: ShoppingCart, badge: orderCount || undefined },
-    { id: "history", label: "History", icon: History, badge: dueCount || undefined, alert: dueCount > 0 },
+    { id: "history", label: "History", icon: History },
+    { id: "drying", label: "Filament Drying", icon: Droplets, badge: dueCount || undefined, alert: dueCount > 0 },
     { id: "settings", label: "Settings", icon: Settings },
   ]
 

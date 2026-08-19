@@ -1,14 +1,18 @@
 "use client"
 
 import { useState } from "react"
-import { Boxes, Check } from "lucide-react"
+import { Boxes, Check, Scale } from "lucide-react"
 import { useStore } from "@/lib/store"
+import { cn } from "@/lib/utils"
 import { Button } from "./ui/button"
 import { draftToConfig, makeDraft, StorageLayoutEditor } from "./storage-layout-editor"
 
 export function SetupWizard() {
   const { dispatch } = useStore()
   const [draft, setDraft] = useState(() => makeDraft("paternoster"))
+  // Where to surface the "Total filament used" totals. Chosen here at setup,
+  // editable later under Settings.
+  const [showUsageCardOnHome, setShowUsageCardOnHome] = useState(true)
 
   const isShelf = draft.nodeType === "shelf"
   const isLibrary = draft.nodeType === "library"
@@ -25,7 +29,7 @@ export function SetupWizard() {
       area: draft.area,
       storage,
       shelfMeta,
-      settings: { systemName: draft.name.trim() || "PAX System" },
+      settings: { systemName: draft.name.trim() || "PAX System", showUsageCardOnHome },
     })
   }
 
@@ -45,6 +49,50 @@ export function SetupWizard() {
         </div>
 
         <StorageLayoutEditor draft={draft} onChange={setDraft} />
+
+        {/* Filament-usage visibility preference. */}
+        <div className="mt-6 rounded-xl border border-border bg-background/60 p-4">
+          <div className="mb-3 flex items-center gap-2">
+            <span className="flex h-8 w-8 items-center justify-center rounded-lg bg-secondary">
+              <Scale className="h-4 w-4 text-muted-foreground" />
+            </span>
+            <div>
+              <h2 className="text-sm font-semibold text-foreground">Total filament used</h2>
+              <p className="text-xs text-muted-foreground">Where should the running weight counter show?</p>
+            </div>
+          </div>
+          <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+            <button
+              type="button"
+              onClick={() => setShowUsageCardOnHome(true)}
+              className={cn(
+                "rounded-lg border p-3 text-left transition-colors",
+                showUsageCardOnHome
+                  ? "border-primary bg-primary/10 text-foreground"
+                  : "border-border text-muted-foreground hover:text-foreground",
+              )}
+            >
+              <span className="block text-sm font-medium">On every view</span>
+              <span className="mt-0.5 block text-xs text-muted-foreground">
+                Paternoster, shelf &amp; library — plus History
+              </span>
+            </button>
+            <button
+              type="button"
+              onClick={() => setShowUsageCardOnHome(false)}
+              className={cn(
+                "rounded-lg border p-3 text-left transition-colors",
+                !showUsageCardOnHome
+                  ? "border-primary bg-primary/10 text-foreground"
+                  : "border-border text-muted-foreground hover:text-foreground",
+              )}
+            >
+              <span className="block text-sm font-medium">History only</span>
+              <span className="mt-0.5 block text-xs text-muted-foreground">Keep the storage views clean</span>
+            </button>
+          </div>
+          <p className="mt-2 text-xs text-muted-foreground">You can change this later under Settings.</p>
+        </div>
 
         <div className="mt-6 space-y-3">
           <Button size="lg" className="w-full" onClick={build}>
