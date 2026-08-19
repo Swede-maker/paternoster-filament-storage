@@ -8,7 +8,7 @@ import { SpoolSelectionBar, SelectModeButton } from "./spool-selection-bar"
 import { activeNode } from "@/lib/selectors"
 import { cn } from "@/lib/utils"
 import { formatRemaining, spoolFill } from "@/lib/filament"
-import { SpoolDisc } from "./spool"
+import { SpoolDisc, discColor2 } from "./spool"
 import { Button } from "./ui/button"
 import type { Spool } from "@/lib/types"
 
@@ -256,7 +256,7 @@ export function LibraryView({
                       {isSel && <Check className="h-3 w-3" />}
                     </span>
                   )}
-                  <SpoolDisc color={spool.color} size={52} fill={spoolFill(spool)} boxed={!!spool.containerId} />
+                  <SpoolDisc color={spool.color} color2={discColor2(spool)} size={52} fill={spoolFill(spool)} boxed={!!spool.containerId} />
                   <span className="mt-0.5 flex w-full flex-col items-center leading-tight">
                     {/* Material always uses the foreground token so it stays
                         legible no matter how dark/light the spool colour is. */}

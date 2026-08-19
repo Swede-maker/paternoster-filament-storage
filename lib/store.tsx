@@ -252,6 +252,7 @@ function mergeCatalog(local: PersistedState, remote: PersistedState, baseline: P
       customMaterials: mergeByKey(ls.customMaterials, rs.customMaterials, bs?.customMaterials, (m) => m),
       customBrands: mergeByKey(ls.customBrands, rs.customBrands, bs?.customBrands, (b) => b),
       orders: mergeByKey(ls.orders, rs.orders, bs?.orders, (o) => o.id),
+      customColors: mergeByKey(ls.customColors, rs.customColors, bs?.customColors, (c) => c.hex.toLowerCase()),
     },
   }
 }
@@ -274,6 +275,8 @@ const defaultSettings: Settings = {
   filamentProfiles: [],
   barcodes: [],
   orders: [],
+  customColors: [],
+  showUsageCardOnHome: true,
 }
 
 /** Per-shelf slot counts for a config (jagged when `slotCounts` is present). */
@@ -437,6 +440,9 @@ type Action =
   // Filament profiles
   | { type: "ADD_PROFILE"; profile: FilamentProfile }
   | { type: "REMOVE_PROFILE"; id: string }
+  // Saved custom colors (reusable swatches in the spool editor)
+  | { type: "ADD_CUSTOM_COLOR"; color: { name: string; hex: string } }
+  | { type: "REMOVE_CUSTOM_COLOR"; hex: string }
   // Barcode → profile mappings
   | { type: "ADD_BARCODE"; code: string; profileId: string }
   | { type: "REMOVE_BARCODE"; code: string }
@@ -886,6 +892,29 @@ function coreReducer(state: AppState, action: Action): AppState {
       return {
         ...state,
         settings: { ...state.settings, filamentProfiles: list.filter((p) => p.id !== action.id), barcodes },
+      }
+    }
+
+    // ----- saved custom colors -----
+    case "ADD_CUSTOM_COLOR": {
+      const hex = action.color.hex.trim().toLowerCase()
+      if (!/^#[0-9a-f]{6}$/.test(hex)) return state
+      const list = (state.settings.customColors ?? []).filter((c) => c.hex.toLowerCase() !== hex)
+      return {
+        ...state,
+        settings: {
+          ...state.settings,
+          customColors: [...list, { name: action.color.name.trim() || hex, hex }],
+        },
+      }
+    }
+
+    case "REMOVE_CUSTOM_COLOR": {
+      const hex = action.hex.toLowerCase()
+      const list = state.settings.customColors ?? []
+      return {
+        ...state,
+        settings: { ...state.settings, customColors: list.filter((c) => c.hex.toLowerCase() !== hex) },
       }
     }
 

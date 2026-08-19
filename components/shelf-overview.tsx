@@ -5,7 +5,7 @@ import { useStore } from "@/lib/store"
 import { activeNode, shelfLabel } from "@/lib/selectors"
 import { cn } from "@/lib/utils"
 import { spoolFill } from "@/lib/filament"
-import { SpoolDisc, EmptySlot } from "./spool"
+import { SpoolDisc, EmptySlot, discColor2 } from "./spool"
 
 export function ShelfOverview() {
   const { state, dispatch } = useStore()
@@ -70,7 +70,7 @@ export function ShelfOverview() {
                       return (
                         <span key={slot} className="flex flex-col items-center gap-0.5">
                           {spool ? (
-                            <SpoolDisc color={spool.color} size={14} fill={spoolFill(spool)} />
+                            <SpoolDisc color={spool.color} color2={discColor2(spool)} size={14} fill={spoolFill(spool)} />
                           ) : (
                             <EmptySlot size={14} />
                           )}

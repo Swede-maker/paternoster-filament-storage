@@ -14,7 +14,7 @@ import { fetchBambuStatus, isBambuLinked, bambuCloudRefresh, type BambuStatus } 
 import { Button } from "./ui/button"
 import { Input } from "./ui/field"
 import { AmsUnit, Toolhead } from "./ams-unit"
-import { SpoolDisc } from "./spool"
+import { SpoolDisc, discColor2 } from "./spool"
 import { AddPrinterDialog } from "./add-printer-dialog"
 import { BambuCloudSignIn } from "./bambu-cloud-sign-in"
 import { FilamentUsedCard } from "./filament-used-card"
@@ -615,7 +615,7 @@ function PrinterBody({
             queuedPrinterSlots?.includes(0) ? "border-primary/60 bg-primary/10" : "border-transparent",
           )}
         >
-          {spool ? <SpoolDisc color={spool.color} size={84} fill={spoolFill(spool)} /> : <EmptyDisc />}
+                {spool ? <SpoolDisc color={spool.color} color2={discColor2(spool)} size={84} fill={spoolFill(spool)} /> : <EmptyDisc />}
         </button>
         <div>
           <p className="text-xs uppercase tracking-wider text-muted-foreground">Loaded spool</p>

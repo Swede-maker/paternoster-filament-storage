@@ -3,11 +3,21 @@
 import { cn } from "@/lib/utils"
 
 /**
+ * Resolve the optional second color for any spool-like object with
+ * `dualColor` / `color2` fields. Returns undefined for single-color spools so
+ * callers can spread it straight into <SpoolDisc color2={...} />.
+ */
+export function discColor2(s: { dualColor?: boolean; color2?: string } | null | undefined): string | undefined {
+  return s?.dualColor && s.color2 ? s.color2 : undefined
+}
+
+/**
  * Front-facing filament spool rendered purely with CSS: a wound colored
  * filament ring, a dark plastic hub with mounting holes, and a center bore.
  */
 export function SpoolDisc({
   color,
+  color2,
   size = 72,
   className,
   dim,
@@ -16,6 +26,8 @@ export function SpoolDisc({
   fit = false,
 }: {
   color: string
+  /** Optional second color for a dual-color spool: the winding splits in two. */
+  color2?: string
   size?: number
   className?: string
   dim?: boolean
@@ -63,13 +75,16 @@ export function SpoolDisc({
           boxShadow: `inset 0 0 ${d * 0.1}px rgba(0,0,0,0.7)`,
         }}
       />
-      {/* Wound filament (shrinks + fades with remaining amount) */}
+      {/* Wound filament (shrinks + fades with remaining amount). A dual-color
+          spool splits the winding diagonally into its two tones. */}
       <div
         className="absolute rounded-full transition-all"
         style={{
           inset: filamentInset,
           opacity: colorOpacity,
-          background: `radial-gradient(circle at 34% 28%, ${color}, ${color} 55%, rgba(0,0,0,0.35) 100%)`,
+          background: color2
+            ? `linear-gradient(135deg, ${color} 0%, ${color} 48%, ${color2} 52%, ${color2} 100%)`
+            : `radial-gradient(circle at 34% 28%, ${color}, ${color} 55%, rgba(0,0,0,0.35) 100%)`,
           boxShadow: `inset 0 0 ${d * 0.08}px rgba(0,0,0,0.45)`,
         }}
       />

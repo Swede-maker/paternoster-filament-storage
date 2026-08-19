@@ -28,7 +28,7 @@ import { cn } from "@/lib/utils"
 import { Dialog, DialogHeader, DialogBody, DialogFooter } from "./ui/dialog"
 import { Button } from "./ui/button"
 import { SpoolForm, emptyDraft, type SpoolDraft } from "./spool-form"
-import { SpoolDisc } from "./spool"
+import { SpoolDisc, discColor2 } from "./spool"
 import { newId, spoolFill } from "@/lib/filament"
 import type { NodeLocation } from "./flow-controller"
 import type { Printer, Spool } from "@/lib/types"
@@ -92,6 +92,8 @@ export function SlotActionDialog({
         material: existing.material,
         brand: existing.brand,
         color: existing.color,
+        color2: existing.color2,
+        dualColor: existing.dualColor,
         colorName: existing.colorName,
         grams: Math.round(existing.grams),
         capacity: Math.round(existing.capacity ?? existing.grams),
@@ -463,7 +465,7 @@ function reminderStatus(spool: Spool): string {
 function SpoolSummary({ spool }: { spool: Spool }) {
   return (
     <div className="flex items-center gap-3">
-      <SpoolDisc color={spool.color} size={48} fill={spoolFill(spool)} />
+      <SpoolDisc color={spool.color} color2={discColor2(spool)} size={48} fill={spoolFill(spool)} />
       <div className="min-w-0">
         <p className="truncate text-sm font-semibold">
           {spool.material} · {spool.colorName}

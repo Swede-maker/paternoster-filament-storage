@@ -6,7 +6,7 @@ import { useStore } from "@/lib/store"
 import { activeNode } from "@/lib/selectors"
 import { cn } from "@/lib/utils"
 import { formatRemaining, spoolFill } from "@/lib/filament"
-import { SpoolDisc, EmptySlot } from "./spool"
+import { SpoolDisc, EmptySlot, discColor2 } from "./spool"
 
 const ROW_HEIGHT = 156
 
@@ -163,6 +163,7 @@ export function CarouselView({
                         {spool ? (
                           <SpoolDisc
                             color={spool.color}
+                            color2={discColor2(spool)}
                             size={size}
                             fill={spoolFill(spool)}
                             boxed={!!spool.containerId}

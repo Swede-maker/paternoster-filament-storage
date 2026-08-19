@@ -10,19 +10,14 @@ import {
   Droplets,
   RotateCcw,
   X,
-  AlertTriangle,
   Scale,
 } from "lucide-react"
 import { useStore } from "@/lib/store"
-import { reminderDueAt, isReminderDue } from "@/lib/selectors"
-import type { FilamentUsageArchive, HistoryEvent, HistoryEventKind, Spool } from "@/lib/types"
-import { SpoolDisc } from "./spool"
-import { spoolFill, formatGrams } from "@/lib/filament"
+import type { FilamentUsageArchive, HistoryEvent, HistoryEventKind } from "@/lib/types"
+import { formatGrams } from "@/lib/filament"
 import { lifetimeGrams } from "./filament-used-card"
 import { Button } from "./ui/button"
 import { cn } from "@/lib/utils"
-
-const DAY_MS = 86_400_000
 
 /** Relative "time ago" label, coarse but readable for a log. */
 function timeAgo(then: number, now: number): string {
@@ -73,20 +68,7 @@ export function HistoryView() {
   const [filter, setFilter] = useState<FilterKey>("all")
   const [confirmingReset, setConfirmingReset] = useState(false)
 
-  const spools = state.spools
   const usage = state.usage
-
-  // Reminders split into overdue ("due to dry now") and still-scheduled.
-  const { due, upcoming } = useMemo(() => {
-    const withReminder = Object.values(spools).filter((s) => s.dryReminder)
-    const due = withReminder
-      .filter((s) => isReminderDue(s, now))
-      .sort((a, b) => (reminderDueAt(a) ?? 0) - (reminderDueAt(b) ?? 0))
-    const upcoming = withReminder
-      .filter((s) => !isReminderDue(s, now))
-      .sort((a, b) => (reminderDueAt(a) ?? 0) - (reminderDueAt(b) ?? 0))
-    return { due, upcoming }
-  }, [spools, now])
 
   const events = state.history ?? []
   const filtered = useMemo(() => {
@@ -101,7 +83,7 @@ export function HistoryView() {
         <div className="min-w-0">
           <h1 className="text-balance text-2xl font-semibold text-foreground">History</h1>
           <p className="mt-1 text-pretty text-sm text-muted-foreground">
-            Every load, unload, and placement of your filament — plus reminders to dry spools before they go brittle.
+            Every load, unload, and placement of your filament. Dry reminders now live in the Filament Drying tab.
           </p>
         </div>
         {/* Reset the activity log. Two-step confirm since it can't be undone.
@@ -133,32 +115,6 @@ export function HistoryView() {
       {/* Filament usage totals — the lifetime record plus every archived tally
           saved when the "Total filament used" counter was reset. */}
       <FilamentUsageSection archived={usage.archived} currentG={usage.currentG} since={usage.since} />
-
-      {/* Dry alerts */}
-      {due.length > 0 && (
-        <section aria-label="Filament that needs drying" className="mb-6">
-          <div className="mb-2 flex items-center gap-2">
-            <AlertTriangle className="h-4 w-4 text-warning" />
-            <h2 className="text-sm font-semibold text-foreground">Time to dry ({due.length})</h2>
-          </div>
-          <ul className="flex flex-col gap-2">
-            {due.map((s) => (
-              <ReminderRow key={s.id} spool={s} now={now} due onReset={reset} onClear={clear} />
-            ))}
-          </ul>
-        </section>
-      )}
-
-      {upcoming.length > 0 && (
-        <section aria-label="Scheduled dry reminders" className="mb-6">
-          <h2 className="mb-2 text-sm font-semibold text-muted-foreground">Scheduled reminders ({upcoming.length})</h2>
-          <ul className="flex flex-col gap-2">
-            {upcoming.map((s) => (
-              <ReminderRow key={s.id} spool={s} now={now} onReset={reset} onClear={clear} />
-            ))}
-          </ul>
-        </section>
-      )}
 
       {/* Activity log */}
       <section aria-label="Filament activity log">
@@ -207,12 +163,6 @@ export function HistoryView() {
     </div>
   )
 
-  function reset(spoolId: string) {
-    dispatch({ type: "RESET_DRY_REMINDER", spoolId })
-  }
-  function clear(spoolId: string) {
-    dispatch({ type: "CLEAR_DRY_REMINDER", spoolId })
-  }
   function resetHistory() {
     dispatch({ type: "CLEAR_HISTORY" })
     setConfirmingReset(false)
@@ -275,65 +225,6 @@ function FilamentUsageSection({
         )}
       </div>
     </section>
-  )
-}
-
-/** A single dry-reminder row with reset / clear controls. */
-function ReminderRow({
-  spool,
-  now,
-  due,
-  onReset,
-  onClear,
-}: {
-  spool: Spool
-  now: number
-  due?: boolean
-  onReset: (id: string) => void
-  onClear: (id: string) => void
-}) {
-  const dueAt = reminderDueAt(spool) ?? 0
-  const diffDays = Math.round((dueAt - now) / DAY_MS)
-  const when = due
-    ? diffDays <= -1
-      ? `Overdue by ${Math.abs(diffDays)} day${Math.abs(diffDays) === 1 ? "" : "s"}`
-      : "Due today"
-    : diffDays <= 1
-      ? "Due tomorrow"
-      : `Due in ${diffDays} days`
-
-  return (
-    <li
-      className={cn(
-        "flex items-center gap-3 rounded-xl border p-3",
-        due ? "border-warning/40 bg-warning/10" : "border-border bg-card",
-      )}
-    >
-      <SpoolDisc color={spool.color} size={40} fill={spoolFill(spool)} />
-      <div className="min-w-0 flex-1">
-        <p className="truncate text-sm font-medium text-foreground">
-          {spool.material} · {spool.colorName}
-        </p>
-        <p className="truncate text-xs text-muted-foreground">
-          {spool.brand} · {when}
-        </p>
-      </div>
-      <div className="flex shrink-0 items-center gap-1">
-        <Button size="sm" variant="ghost" onClick={() => onReset(spool.id)} className="h-8 gap-1 px-2 text-xs">
-          <RotateCcw className="h-3.5 w-3.5" />
-          Reset
-        </Button>
-        <Button
-          size="sm"
-          variant="ghost"
-          onClick={() => onClear(spool.id)}
-          aria-label="Delete dry reminder"
-          className="h-8 w-8 p-0 text-muted-foreground hover:text-destructive"
-        >
-          <X className="h-4 w-4" />
-        </Button>
-      </div>
-    </li>
   )
 }
 
