@@ -22,9 +22,12 @@ Raspberry Pi 4/5):
 - **Node.js 20 or newer** — https://nodejs.org (LTS is fine)
 - **pnpm** — the package manager. After installing Node, run:
   ```bash
-  npm install -g pnpm
+  sudo npm install -g pnpm
   ```
 - **git** — https://git-scm.com
+  ```bash
+  sudo apt-get update && sudo apt-get install -y git
+  ```
 - A **C/C++ build toolchain** (needed to compile the SQLite module):
   - **Raspberry Pi / Debian / Ubuntu:** `sudo apt-get install -y build-essential python3`
   - **macOS:** `xcode-select --install`
@@ -34,11 +37,9 @@ Raspberry Pi 4/5):
 
 ## 2. Download and install
 
-Replace `YOUR-USERNAME/YOUR-REPO` with your GitHub repository.
-
 ```bash
 # 1. Download the code
-git clone https://github.com/YOUR-USERNAME/YOUR-REPO.git pax
+git clone https://github.com/Swede-maker/paternoster-filament-storage.git pax
 cd pax
 
 # 2. Install dependencies (also compiles the SQLite module automatically)
