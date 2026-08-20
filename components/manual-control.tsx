@@ -1,7 +1,7 @@
 "use client"
 
 import { useEffect, useRef, useState } from "react"
-import { ArrowUp, ArrowDown, Home, Loader2, Gauge } from "lucide-react"
+import { ArrowUp, ArrowDown, Home, Loader2, Gauge, OctagonX, Play } from "lucide-react"
 import { useStore } from "@/lib/store"
 import { activeNode } from "@/lib/selectors"
 import { DEFAULT_SEC_PER_SHELF, MIN_SEC_PER_SHELF, MAX_SEC_PER_SHELF, DEFAULT_RAMP_PCT } from "@/lib/filament"
@@ -46,48 +46,118 @@ export function ManualControl() {
         return "Ready to store"
       case "calibrating":
         return "Calibrating…"
+      case "stopped":
+        return "Emergency stopped"
       default:
         return homed ? "Positioning OK" : node.calibrated || !isCarousel ? "Not homed" : "Needs calibration"
     }
   })()
 
   const busy = status === "homing" || status === "moving" || status === "calibrating"
+  // Emergency-stopped: frozen in place until the operator resumes or re-homes.
+  const stopped = isCarousel && status === "stopped"
+  // What "Continue task" will pick back up, so we can label it meaningfully.
+  const resume = node.machine.resumeStatus
+  const canResume =
+    resume === "moving" ||
+    resume === "homing" ||
+    resume === "awaiting-move-confirm" ||
+    resume === "awaiting-pick-confirm" ||
+    resume === "awaiting-store-confirm"
+  const resumeLabel =
+    resume === "homing" ? "Resume homing" : resume === "moving" ? "Continue moving" : "Continue task"
 
   return (
     <section aria-label="Manual control" className="border-t border-border px-4 py-4">
       <h2 className="pb-3 text-xs font-semibold uppercase tracking-wider text-muted-foreground">Manual Control</h2>
 
-      <div className="grid grid-cols-2 gap-3">
-        <button
-          type="button"
-          disabled={!canJog}
-          onClick={() => dispatch({ type: "MANUAL_MOVE", nodeId: node.id, direction: "up" })}
-          className="flex h-20 flex-col items-center justify-center gap-1 rounded-xl border border-border bg-secondary/40 text-foreground transition-colors hover:border-primary/50 hover:bg-secondary/70 disabled:opacity-40"
-        >
-          <ArrowUp className="h-6 w-6 text-primary" />
-          <span className="text-xs font-medium">Move Up</span>
-        </button>
-        <button
-          type="button"
-          disabled={!canJog}
-          onClick={() => dispatch({ type: "MANUAL_MOVE", nodeId: node.id, direction: "down" })}
-          className="flex h-20 flex-col items-center justify-center gap-1 rounded-xl border border-border bg-secondary/40 text-foreground transition-colors hover:border-primary/50 hover:bg-secondary/70 disabled:opacity-40"
-        >
-          <ArrowDown className="h-6 w-6 text-primary" />
-          <span className="text-xs font-medium">Move Down</span>
-        </button>
-      </div>
+      {stopped ? (
+        /* Frozen after an emergency stop: the carousel stays put until the
+           operator explicitly resumes the task or re-homes. */
+        <div className="rounded-xl border-2 border-destructive bg-destructive/10 p-3">
+          <div className="flex items-center gap-2 text-destructive">
+            <OctagonX className="h-5 w-5 shrink-0" />
+            <div>
+              <p className="text-sm font-bold uppercase tracking-wider">Emergency stopped</p>
+              <p className="text-xs text-destructive/80">Carousel held at shelf {currentShelf + 1}. It won&apos;t move until you choose below.</p>
+            </div>
+          </div>
+          <div className="mt-3 grid grid-cols-1 gap-2">
+            {canResume && (
+              <Button size="md" className="w-full" onClick={() => dispatch({ type: "RESUME_MOVE", nodeId: node.id })}>
+                <Play className="h-4 w-4" />
+                {resumeLabel}
+              </Button>
+            )}
+            <Button
+              variant="outline"
+              size="md"
+              className="w-full"
+              onClick={() => {
+                // Homing abandons any in-progress task, so clear the job too.
+                if (state.job) dispatch({ type: "CANCEL_JOB" })
+                dispatch({ type: "HOME_START", nodeId: node.id })
+              }}
+            >
+              <Home className="h-4 w-4" />
+              Home Carousel
+            </Button>
+          </div>
+        </div>
+      ) : (
+        <>
+          {/* Emergency stop — paternoster only. Always available so it can halt
+              the carousel the instant something goes wrong; the carousel then
+              freezes in place until resumed or re-homed. */}
+          {isCarousel && (
+            <button
+              type="button"
+              onClick={() => dispatch({ type: "EMERGENCY_STOP", nodeId: node.id })}
+              aria-label="Emergency stop carousel"
+              className={cn(
+                "mb-3 flex w-full items-center justify-center gap-2 rounded-xl border-2 border-destructive py-3 text-sm font-bold uppercase tracking-wider text-destructive transition-colors",
+                "bg-destructive/10 hover:bg-destructive hover:text-destructive-foreground active:scale-[0.99]",
+                busy && "animate-pulse",
+              )}
+            >
+              <OctagonX className="h-5 w-5" />
+              Emergency Stop
+            </button>
+          )}
 
-      <Button
-        variant="outline"
-        size="md"
-        className="mt-3 w-full"
-        disabled={busy}
-        onClick={() => dispatch({ type: "HOME_START", nodeId: node.id })}
-      >
-        {status === "homing" ? <Loader2 className="h-4 w-4 animate-spin" /> : <Home className="h-4 w-4" />}
-        Home Carousel
-      </Button>
+          <div className="grid grid-cols-2 gap-3">
+            <button
+              type="button"
+              disabled={!canJog}
+              onClick={() => dispatch({ type: "MANUAL_MOVE", nodeId: node.id, direction: "up" })}
+              className="flex h-20 flex-col items-center justify-center gap-1 rounded-xl border border-border bg-secondary/40 text-foreground transition-colors hover:border-primary/50 hover:bg-secondary/70 disabled:opacity-40"
+            >
+              <ArrowUp className="h-6 w-6 text-primary" />
+              <span className="text-xs font-medium">Move Up</span>
+            </button>
+            <button
+              type="button"
+              disabled={!canJog}
+              onClick={() => dispatch({ type: "MANUAL_MOVE", nodeId: node.id, direction: "down" })}
+              className="flex h-20 flex-col items-center justify-center gap-1 rounded-xl border border-border bg-secondary/40 text-foreground transition-colors hover:border-primary/50 hover:bg-secondary/70 disabled:opacity-40"
+            >
+              <ArrowDown className="h-6 w-6 text-primary" />
+              <span className="text-xs font-medium">Move Down</span>
+            </button>
+          </div>
+
+          <Button
+            variant="outline"
+            size="md"
+            className="mt-3 w-full"
+            disabled={busy}
+            onClick={() => dispatch({ type: "HOME_START", nodeId: node.id })}
+          >
+            {status === "homing" ? <Loader2 className="h-4 w-4 animate-spin" /> : <Home className="h-4 w-4" />}
+            Home Carousel
+          </Button>
+        </>
+      )}
 
       {isCarousel && (
         <div className="mt-4 rounded-xl border border-border bg-background/50 p-3">

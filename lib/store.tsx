@@ -18,6 +18,7 @@ import type {
   HistoryEvent,
   HistoryEventKind,
   Machine,
+  MachineStatus,
   NodeDriver,
   NodeRole,
   NodeType,
@@ -365,6 +366,7 @@ function makeInitialState(): AppState {
     printers: [],
     activePrinterId: null,
     job: null,
+    pendingJobs: [],
     history: [],
     usage: defaultUsage(),
   }
@@ -466,6 +468,10 @@ type Action =
   | { type: "HOME_START"; nodeId: string }
   | { type: "HOME_DONE"; nodeId: string }
   | { type: "MANUAL_MOVE"; nodeId: string; direction: "up" | "down" }
+  /** Immediately halt a carousel mid-motion (paternoster e-stop). */
+  | { type: "EMERGENCY_STOP"; nodeId: string }
+  /** Resume exactly what an emergency-stopped carousel was doing. */
+  | { type: "RESUME_MOVE"; nodeId: string }
   | { type: "GOTO_SHELF"; nodeId: string; shelf: number }
   | { type: "MOVE_TICK"; nodeId: string }
   | { type: "ARRIVED"; nodeId: string }
@@ -479,6 +485,8 @@ type Action =
   | { type: "SET_NODE_RAMP"; nodeId: string; rampPct: number }
   // Jobs
   | { type: "START_JOB"; job: ActiveJob }
+  /** Queue several jobs to run back-to-back (first runs now, rest wait). */
+  | { type: "START_JOBS"; jobs: ActiveJob[] }
   | { type: "CONFIRM_STOP"; grams?: number }
   | { type: "CANCEL_JOB" }
 
@@ -1050,13 +1058,30 @@ function coreReducer(state: AppState, action: Action): AppState {
     case "HOME_START":
       return withNode(state, action.nodeId, (n) => ({
         ...n,
-        machine: { ...n.machine, status: "homing", homed: false, targetShelf: null, direction: null },
+        machine: {
+          ...n.machine,
+          status: "homing",
+          homed: false,
+          targetShelf: null,
+          direction: null,
+          moveFrom: null,
+          resumeStatus: null,
+        },
       }))
 
     case "HOME_DONE":
       return withNode(state, action.nodeId, (n) => ({
         ...n,
-        machine: { ...n.machine, status: "idle", homed: true, currentShelf: 0, targetShelf: null, direction: null },
+        machine: {
+          ...n.machine,
+          status: "idle",
+          homed: true,
+          currentShelf: 0,
+          targetShelf: null,
+          direction: null,
+          moveFrom: null,
+          resumeStatus: null,
+        },
       }))
 
     case "MANUAL_MOVE": {
@@ -1223,13 +1248,24 @@ function coreReducer(state: AppState, action: Action): AppState {
           machine: { ...n.machine, status: "idle", homed: false, targetShelf: null, direction: null },
         })),
         job: null,
+        pendingJobs: [],
       }
 
     // ----- jobs -----
     case "START_JOB": {
       const job = action.job
       if (job.items.length === 0) return state
-      const withJob = { ...state, job: { ...job, currentIndex: 0 } }
+      const withJob = { ...state, job: { ...job, currentIndex: 0 }, pendingJobs: [] }
+      return serviceCurrentItem(withJob)
+    }
+
+    case "START_JOBS": {
+      // Drop empty jobs, run the first, and stash the rest to run one whole job
+      // at a time as each finishes (see CONFIRM_STOP completion).
+      const jobs = action.jobs.filter((j) => j.items.length > 0)
+      if (jobs.length === 0) return state
+      const [first, ...rest] = jobs
+      const withJob = { ...state, job: { ...first, currentIndex: 0 }, pendingJobs: rest }
       return serviceCurrentItem(withJob)
     }
 
@@ -1310,10 +1346,55 @@ function coreReducer(state: AppState, action: Action): AppState {
       const items = job.items.map((it, i) => (i === idx ? { ...it, done: true } : it))
       const nextIndex = idx + 1
       if (nextIndex >= items.length) {
+        // This whole job is done. If another job is queued (e.g. take-out
+        // finished, now run place-in), start it; otherwise everything is done.
+        if (next.pendingJobs.length > 0) {
+          const [nextJob, ...rest] = next.pendingJobs
+          const chained = { ...next, job: { ...nextJob, currentIndex: 0 }, pendingJobs: rest }
+          return serviceCurrentItem(chained)
+        }
         return { ...next, job: null }
       }
       const advanced = { ...next, job: { ...job, items, currentIndex: nextIndex } }
       return serviceCurrentItem(advanced)
+    }
+
+    case "EMERGENCY_STOP": {
+      const node = getNode(state, action.nodeId)
+      if (!node) return state
+      // A real paternoster e-stop freezes the carousel EXACTLY where it is and
+      // keeps it there until the operator explicitly resumes or re-homes. We
+      // switch to the dedicated "stopped" status (not "idle"), which:
+      //   * halts the motion sim — it only arms timers for "moving"/"homing";
+      //   * blocks the auto-home effect — it only fires on an "idle" unmoved
+      //     unit, so the carousel will NOT drift back to shelf 1;
+      //   * preserves currentShelf/targetShelf/direction/moveFrom so the move
+      //     can pick up precisely where it left off.
+      // The active job is left untouched so "Continue task" can carry on.
+      if (node.machine.status === "stopped") return state
+      return withNode(state, action.nodeId, (n) => ({
+        ...n,
+        machine: { ...n.machine, status: "stopped", resumeStatus: n.machine.status },
+      }))
+    }
+
+    case "RESUME_MOVE": {
+      const node = getNode(state, action.nodeId)
+      if (!node || node.machine.status !== "stopped") return state
+      const prev = node.machine.resumeStatus
+      // Restore whatever it was doing. Calibration can't be safely resumed
+      // mid-pass, and anything with nothing left to do just parks idle.
+      const resumable =
+        prev === "moving" ||
+        prev === "homing" ||
+        prev === "awaiting-move-confirm" ||
+        prev === "awaiting-pick-confirm" ||
+        prev === "awaiting-store-confirm"
+      const next: MachineStatus = resumable ? prev! : "idle"
+      return withNode(state, action.nodeId, (n) => ({
+        ...n,
+        machine: { ...n.machine, status: next, resumeStatus: null },
+      }))
     }
 
     case "CANCEL_JOB": {
@@ -1322,24 +1403,44 @@ function coreReducer(state: AppState, action: Action): AppState {
         n.machine.status === "moving" ||
         n.machine.status === "awaiting-move-confirm" ||
         n.machine.status === "awaiting-pick-confirm" ||
-        n.machine.status === "awaiting-store-confirm"
-          ? { ...n, machine: { ...n.machine, status: "idle" as const, targetShelf: null, direction: null } }
+        n.machine.status === "awaiting-store-confirm" ||
+        n.machine.status === "stopped"
+          ? {
+              ...n,
+              machine: {
+                ...n.machine,
+                status: "idle" as const,
+                targetShelf: null,
+                direction: null,
+                moveFrom: null,
+                resumeStatus: null,
+              },
+            }
           : n,
       )
       // A store job registers its spool up front but only writes it into a slot
       // on confirm. If the job is cancelled, drop any spool that was created for
       // an unfinished store item so it doesn't linger unplaced in the registry.
+      // Cancelling stops the WHOLE run, so also sweep queued (not-yet-started)
+      // store jobs — a place-in job waiting behind a take-out job may already
+      // have created spools that were never placed.
       let spools = state.spools
-      if (state.job && state.job.mode === "store") {
+      const storeJobs = [state.job, ...state.pendingJobs].filter(
+        (j): j is ActiveJob => !!j && j.mode === "store",
+      )
+      if (storeJobs.length > 0) {
         const placed = new Set<string>()
         for (const n of nodes) for (const row of n.slots) for (const id of row) if (id) placed.add(id)
-        const orphans = state.job.items.filter((it) => !it.done && !placed.has(it.spoolId)).map((it) => it.spoolId)
+        const orphans = storeJobs
+          .flatMap((j) => j.items)
+          .filter((it) => !it.done && !placed.has(it.spoolId))
+          .map((it) => it.spoolId)
         if (orphans.length > 0) {
           spools = { ...state.spools }
           for (const id of orphans) delete spools[id]
         }
       }
-      return { ...state, nodes, spools, job: null }
+      return { ...state, nodes, spools, job: null, pendingJobs: [] }
     }
 
     default:
@@ -1538,6 +1639,7 @@ function migrate(parsed: any): AppState {
     printers: (parsed.printers ?? []).map((p: Printer) => ({ ...p, link: "offline" })),
     activePrinterId: parsed.activePrinterId ?? null,
     job: null,
+    pendingJobs: [],
     history: Array.isArray(parsed.history) ? parsed.history.slice(0, HISTORY_CAP) : [],
     usage: coerceUsage(parsed.usage),
   }

@@ -32,6 +32,7 @@ import type { Container, StorageNode } from "@/lib/types"
 import { Button } from "./ui/button"
 import { Field, Input, Select, Checkbox } from "./ui/field"
 import { SpoolDisc, discColor2 } from "./spool"
+import { NumField } from "./spool-form"
 import { BarcodeScanner } from "./barcode-scanner"
 import {
   draftFromNode,
@@ -46,10 +47,11 @@ export function SettingsView() {
   const stats = getStats(state)
 
   const [name, setName] = useState(state.settings.systemName)
-  const [weight, setWeight] = useState(state.settings.defaultSpoolWeight)
+  // Nullable so the field can be genuinely empty while editing (not a forced 0).
+  const [weight, setWeight] = useState<number | null>(state.settings.defaultSpoolWeight)
 
   const nameDirty = name !== state.settings.systemName
-  const weightDirty = weight !== state.settings.defaultSpoolWeight
+  const weightDirty = weight != null && weight !== state.settings.defaultSpoolWeight
 
   return (
     <div className="mx-auto w-full max-w-2xl space-y-4 overflow-y-auto p-4 scrollbar-thin">
@@ -86,17 +88,18 @@ export function SettingsView() {
 
         <Field label="Default full-spool weight (g)">
           <div className="flex gap-2">
-            <Input
-              type="number"
-              inputMode="numeric"
+            <NumField
+              value={weight ?? undefined}
               min={0}
               max={5000}
-              value={weight}
-              onChange={(e) => setWeight(Math.max(0, Number.parseInt(e.target.value) || 0))}
+              ariaLabel="Default full-spool weight in grams"
+              onValue={setWeight}
             />
             <Button
               disabled={!weightDirty}
-              onClick={() => dispatch({ type: "UPDATE_SETTINGS", settings: { defaultSpoolWeight: weight } })}
+              onClick={() =>
+                weight != null && dispatch({ type: "UPDATE_SETTINGS", settings: { defaultSpoolWeight: weight } })
+              }
             >
               <Save className="h-4 w-4" /> Save
             </Button>
@@ -658,20 +661,21 @@ function ContainerManager() {
   const { state, dispatch } = useStore()
   const containers = state.settings.containers ?? []
   const [name, setName] = useState("")
-  const [weight, setWeight] = useState<number>(0)
+  // Nullable so the field can be blank instead of a forced 0 while editing.
+  const [weight, setWeight] = useState<number | null>(null)
 
   const nameValid = name.trim().length > 0
-  const weightValid = weight > 0
+  const weightValid = weight != null && weight > 0
   const duplicate = containers.some((c) => c.name.toLowerCase() === name.trim().toLowerCase())
   const canAdd = nameValid && weightValid && !duplicate
 
   const save = (next: Container[]) => dispatch({ type: "UPDATE_SETTINGS", settings: { containers: next } })
 
   const add = () => {
-    if (!canAdd) return
+    if (!canAdd || weight == null) return
     save([...containers, { id: newId("box"), name: name.trim(), weightGrams: Math.round(weight) }])
     setName("")
-    setWeight(0)
+    setWeight(null)
   }
 
   return (
@@ -716,15 +720,13 @@ function ContainerManager() {
             />
           </Field>
           <Field label="Empty weight (g)" className="sm:w-40">
-            <Input
-              type="number"
-              inputMode="numeric"
+            <NumField
+              value={weight ?? undefined}
               min={0}
               max={10000}
-              value={weight || ""}
-              onChange={(e) => setWeight(Math.max(0, Number.parseInt(e.target.value) || 0))}
               placeholder="e.g. 850"
-              aria-label="Container empty weight in grams"
+              ariaLabel="Container empty weight in grams"
+              onValue={setWeight}
             />
           </Field>
         </div>
