@@ -235,6 +235,7 @@ export type MachineStatus =
   | "awaiting-pick-confirm" // stopped at a shelf, waiting for "confirm pick"
   | "awaiting-store-confirm" // stopped at a shelf, waiting to place a spool
   | "calibrating" // running the carousel speed auto-calibration routine
+  | "stopped" // emergency-stopped: frozen in place until resumed or homed
 
 export type RotationDirection = "up" | "down"
 
@@ -253,6 +254,12 @@ export interface Machine {
    * in at the beginning and out at the end. Null when idle.
    */
   moveFrom?: number | null
+  /**
+   * When emergency-stopped, the status the machine was in at the moment of the
+   * stop, so "Continue task" can pick up exactly where it left off. Undefined
+   * whenever `status` is not "stopped".
+   */
+  resumeStatus?: MachineStatus | null
 }
 
 /**
@@ -522,6 +529,13 @@ export interface AppState {
   printers: Printer[]
   activePrinterId: string | null
   job: ActiveJob | null
+  /**
+   * Jobs waiting to run after the current `job` finishes. Lets the user assemble
+   * a take-out queue and a place-in queue together; they execute one WHOLE job
+   * at a time (take-out first, then place-in) with no interleaving. Ephemeral,
+   * like `job` — never persisted.
+   */
+  pendingJobs: ActiveJob[]
   /** Filament usage/movement log, newest first, capped in the reducer. */
   history: HistoryEvent[]
   /** Lifetime + resettable filament-consumption tracking. */

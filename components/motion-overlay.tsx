@@ -70,7 +70,14 @@ export function MotionOverlay() {
         {/* progress */}
         <div className="mb-4 flex items-center justify-between text-xs text-muted-foreground">
           <span className="uppercase tracking-wider">
-            {job.mode === "pick" ? "Picking filament" : job.mode === "store" ? "Storing filament" : "Placing filament"}
+            {job.mode === "pick"
+              ? "Picking filament"
+              : // A single store-mode job can carry placements (brand-new spools),
+                // stores (off a printer), and moves. Label by the current item so
+                // the wording matches what's actually happening.
+                item && !item.from && item.printerId == null
+                ? "Placing filament"
+                : "Storing filament"}
           </span>
           <span className="font-mono">
             {step} / {total}
@@ -142,7 +149,7 @@ export function MotionOverlay() {
               showNodeName={multiNode}
               shelf={item.shelf}
               slot={item.slot}
-              verb={job.mode === "place" ? "Place spool in" : item.from ? "Move spool to" : "Store spool in"}
+              verb={item.from ? "Move spool to" : item.printerId != null ? "Store spool in" : "Place spool in"}
             />
             {item.from &&
               (() => {

@@ -1,6 +1,6 @@
 "use client"
 
-import { useState } from "react"
+import { useState, useEffect } from "react"
 import { Boxes, Package, Plus, Server, Loader2, MapPin } from "lucide-react"
 import { useStore } from "@/lib/store"
 import { useFlow, type NodeLocation } from "./flow-controller"
@@ -57,6 +57,19 @@ export function HomeView() {
   const [searchTarget, setSearchTarget] = useState<{ spool: Spool; loc: NodeLocation } | null>(null)
   const [printerPickTarget, setPrinterPickTarget] = useState<{ spool: Spool; loc: NodeLocation } | null>(null)
   const [searchLoad, setSearchLoad] = useState<{ spool: Spool; loc: NodeLocation; printer: Printer } | null>(null)
+
+  // Consume an "act on this spool" request handed off from the All Filament In
+  // Storage tab: focus that spool's unit and open the same action hub the search
+  // browser uses (load / take out). Runs once per request, then clears it.
+  useEffect(() => {
+    const req = flow.inspectRequest
+    if (!req) return
+    if (state.activeNodeId !== req.loc.nodeId) {
+      dispatch({ type: "SET_ACTIVE_NODE", id: req.loc.nodeId })
+    }
+    setSearchTarget({ spool: req.spool, loc: req.loc })
+    flow.consumeInspect()
+  }, [flow.inspectRequest, state.activeNodeId, dispatch, flow])
 
   const currentNode = activeNode(state)
   const isShelf = (currentNode.type ?? "paternoster") === "shelf"
@@ -167,7 +180,7 @@ export function HomeView() {
   // working with instead of resetting to the first tab. Fall back to the active
   // printer, then the first candidate.
   function preferredMorePrinter(candidates: Printer[]): Printer {
-    const lastId = [...(flow.flow?.items ?? [])].reverse().find((i) => i.printerId != null)?.printerId
+    const lastId = [...flow.inItems, ...flow.outItems].reverse().find((i) => i.printerId != null)?.printerId
     return (
       candidates.find((p) => p.id === lastId) ??
       candidates.find((p) => p.id === state.activePrinterId) ??
@@ -336,10 +349,7 @@ export function HomeView() {
             onSlotClick={(shelf, slot) => {
               if (state.job) return // don't open slot editor during an active operation
               const occupied = currentNode.slots[shelf]?.[slot] != null
-              const queueWaiting =
-                !!flow.flow &&
-                (flow.flow.mode === "store" || flow.flow.mode === "place") &&
-                flow.flow.items.length > 0
+              const queueWaiting = flow.inItems.length > 0
               // Empty slot + spools waiting → drop a queued spool here.
               // Otherwise → the slot editor. For an empty slot that's the create
               // form, which itself offers printer tabs to instead pull a spool
@@ -366,17 +376,25 @@ export function HomeView() {
         />
       </div>
 
-      {/* Queue tray (assembling a pick/store/place queue) */}
+      {/* Queue tray — assemble the place-in and take-out queues side by side. */}
       <QueueTray
-        onAddMore={() => {
-          if (flow.flow?.mode === "pick") {
-            // A retrieve-only flow (no printer targets) adds more via search;
-            // a printer-driven pick flow adds more empty slots to load.
-            const isRetrieve = flow.flow.items.every((i) => i.printerId == null)
-            if (isRetrieve) setBrowserOpen(true)
+        onAddMore={(view) => {
+          if (view === "out") {
+            // Take-out: a retrieve-only queue (or an empty one) adds more via the
+            // search browser; a printer-driven pick queue adds more slots to load.
+            const retrieveOnly =
+              flow.outItems.length === 0 || flow.outItems.every((i) => i.printerId == null)
+            if (retrieveOnly) setBrowserOpen(true)
             else handlePickMore()
-          } else if (flow.flow?.mode === "store") handleStoreMore()
-          else if (flow.flow?.mode === "place") setPlaceOpen(true)
+          } else {
+            // Place-in: if the queue is purely spools coming off printers, add
+            // another unload; otherwise add a brand-new spool to place.
+            const storeOnly =
+              flow.inItems.length > 0 &&
+              flow.inItems.every((i) => i.printerId != null && !i.isNew && !i.from)
+            if (storeOnly) handleStoreMore()
+            else setPlaceOpen(true)
+          }
         }}
       />
 
@@ -390,7 +408,7 @@ export function HomeView() {
         onPick={pickTarget ? handlePicked : undefined}
         onInspect={pickTarget ? undefined : handleInspect}
         onNew={pickTarget ? handleChooseNew : undefined}
-        excludeIds={flow.flow?.mode === "pick" ? flow.flow.items.map((i) => i.spool.id) : []}
+        excludeIds={flow.outItems.map((i) => i.spool.id)}
         title={pickTarget ? "Choose filament to load" : "Search filament"}
         readOnly={!pickTarget}
       />
@@ -469,7 +487,7 @@ export function HomeView() {
           or create a new one for it while the rest keep waiting. */}
       <QueuePlaceDialog
         target={queueFillTarget}
-        items={flow.flow ? flow.flow.items : []}
+        items={flow.inItems}
         slotLabel={
           queueFillTarget ? `${shelfLabel(currentNode, queueFillTarget.shelf)} · Slot ${queueFillTarget.slot + 1}` : ""
         }

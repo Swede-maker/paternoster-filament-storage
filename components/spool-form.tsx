@@ -74,7 +74,7 @@ const HEX_RE = /^#[0-9a-fA-F]{6}$/
  * external `value` changes (e.g. a profile is applied) the display resyncs, but
  * only while the field isn't focused so it never fights the user's typing.
  */
-function NumField({
+export function NumField({
   value,
   onValue,
   min,

@@ -6,7 +6,7 @@ import { bestSlotForNode, bestNodeSlot, containerWeight } from "@/lib/balance"
 import { activeNode, orderQueueItems } from "@/lib/selectors"
 import { newId } from "@/lib/filament"
 import type { AppState } from "@/lib/types"
-import type { Printer, QueueItem, Spool } from "@/lib/types"
+import type { ActiveJob, Printer, QueueItem, Spool } from "@/lib/types"
 import type { SpoolDraft } from "./spool-form"
 
 /** A storage location qualified by which node (paternoster unit) it lives in. */
@@ -33,17 +33,34 @@ export interface PendingItem {
   from?: NodeLocation
   /** grams override supplied while storing */
   grams?: number
+  /** true when this spool was freshly created by `startPlace` (for cancel rollback) */
+  isNew?: boolean
 }
 
-type Mode = "pick" | "store" | "place"
+/** Which queue the tray is currently showing. */
+export type QueueView = "in" | "out"
 
+/**
+ * Two coexisting draft queues the user assembles at once:
+ * - `inItems`  — things going INTO storage: place (new), store (from printer),
+ *   move (from another unit). All execute as one job with store semantics.
+ * - `outItems` — things coming OUT of storage: pick (onto a printer) and
+ *   retrieve (into the hand). All execute as one job with pick semantics.
+ * On run they execute one WHOLE job at a time (take-out first, then place-in).
+ */
 interface FlowState {
-  mode: Mode
-  items: PendingItem[]
+  inItems: PendingItem[]
+  outItems: PendingItem[]
+  view: QueueView
 }
 
 interface FlowContextValue {
+  /** null when nothing is queued at all. */
   flow: FlowState | null
+  inItems: PendingItem[]
+  outItems: PendingItem[]
+  view: QueueView
+  setView: (v: QueueView) => void
   /** queued printer slots for a given printer id (for highlighting) */
   queuedPrinterSlots: (printerId: string) => number[]
   /** queued storage locations for a given node (for highlighting) */
@@ -59,17 +76,24 @@ interface FlowContextValue {
    * Redirect a queued store/place item into a different storage unit. Recomputes
    * a slot in the chosen unit (balanced for a paternoster, linear for a shelf,
    * appended for a library) while reserving the other queued placements so they
-   * don't collide. No-op for pick, or if the chosen unit has no room. */
+   * don't collide. Only affects in-items (out-items have no storage destination). */
   reassignItemNode: (spoolId: string, nodeId: string) => void
   /**
-   * Manual shelf placement: immediately commit ONE queued store/place item into
-   * an explicit slot the user tapped — no motion, no "Start" press — and drop it
-   * from the queue. Leaves the remaining queued spools waiting. No-op for the
-   * pick flow (which targets printers, not storage). */
+   * Manual shelf placement: immediately commit ONE queued in-item into an
+   * explicit slot the user tapped — no motion, no "Start" press — and drop it
+   * from the queue. Leaves the remaining queued spools waiting. */
   assignItemToSlot: (spoolId: string, nodeId: string, shelf: number, slot: number) => void
   cancel: () => void
-  /** commit the assembled queue to the machine */
+  /** commit both assembled queues to the machine (take-out first, then place-in) */
   run: () => void
+  /**
+   * Cross-tab bridge for "act on this spool" from the All Filament In Storage
+   * tab: the inventory view records a spool+location here and switches to Home,
+   * where HomeView consumes it to open the action hub (load / take out).
+   */
+  inspectRequest: { spool: Spool; loc: NodeLocation } | null
+  requestInspect: (spool: Spool, loc: NodeLocation) => void
+  consumeInspect: () => void
 }
 
 const FlowContext = createContext<FlowContextValue | null>(null)
@@ -105,27 +129,40 @@ function pickDestination(
   return bestNodeSlot(state.nodes, state.spools, weight, reserved, containers)
 }
 
+/** Empty draft state: both queues empty, showing the place-in tab. */
+const EMPTY: FlowState = { inItems: [], outItems: [], view: "in" }
+
 export function FlowProvider({ children }: { children: ReactNode }) {
   const { state, dispatch } = useStore()
-  const [flow, setFlow] = useState<FlowState | null>(null)
+  const [draft, setDraft] = useState<FlowState>(EMPTY)
+  // Pending "act on this spool" request handed off from the inventory tab.
+  const [inspectRequest, setInspectRequest] = useState<{ spool: Spool; loc: NodeLocation } | null>(null)
 
   const value = useMemo<FlowContextValue>(() => {
+    const { inItems, outItems, view } = draft
+    const hasAny = inItems.length > 0 || outItems.length > 0
+    const allItems = [...inItems, ...outItems]
+
     return {
-      flow,
+      flow: hasAny ? draft : null,
+      inItems,
+      outItems,
+      view,
+      setView: (v) => setDraft((prev) => ({ ...prev, view: v })),
+
       queuedStorage: (nodeId: string) =>
-        flow?.items.filter((i) => i.nodeId === nodeId).map((i) => ({ shelf: i.shelf, slot: i.slot })) ?? [],
+        allItems.filter((i) => i.nodeId === nodeId).map((i) => ({ shelf: i.shelf, slot: i.slot })),
       queuedPrinterSlots: (printerId: string) =>
-        flow?.items.filter((i) => i.printerId === printerId && i.printerSlot != null).map((i) => i.printerSlot!) ??
-        [],
+        allItems.filter((i) => i.printerId === printerId && i.printerSlot != null).map((i) => i.printerSlot!),
 
       startPick(spool, from, printer, printerSlot) {
-        setFlow((prev) => {
-          const base = prev?.mode === "pick" ? prev.items : []
-          if (base.some((i) => i.spool.id === spool.id)) return prev
+        setDraft((prev) => {
+          if (prev.outItems.some((i) => i.spool.id === spool.id)) return prev
           return {
-            mode: "pick",
-            items: [
-              ...base,
+            ...prev,
+            view: "out",
+            outItems: [
+              ...prev.outItems,
               { spool, nodeId: from.nodeId, shelf: from.shelf, slot: from.slot, printerId: printer.id, printerSlot },
             ],
           }
@@ -133,27 +170,30 @@ export function FlowProvider({ children }: { children: ReactNode }) {
       },
 
       startRetrieve(spool, from) {
-        setFlow((prev) => {
-          const base = prev?.mode === "pick" ? prev.items : []
-          if (base.some((i) => i.spool.id === spool.id)) return prev
+        setDraft((prev) => {
+          if (prev.outItems.some((i) => i.spool.id === spool.id)) return prev
           // No printerId/printerSlot → the spool comes out to the user's hand.
-          return { mode: "pick", items: [...base, { spool, nodeId: from.nodeId, shelf: from.shelf, slot: from.slot }] }
+          return {
+            ...prev,
+            view: "out",
+            outItems: [...prev.outItems, { spool, nodeId: from.nodeId, shelf: from.shelf, slot: from.slot }],
+          }
         })
       },
 
       startStore(spool, printer, printerSlot, grams, nodeId) {
-        setFlow((prev) => {
-          const base = prev?.mode === "store" ? prev.items : []
-          if (base.some((i) => i.spool.id === spool.id)) return prev
-          const reserved = base.map((i) => ({ nodeId: i.nodeId, shelf: i.shelf, slot: i.slot }))
+        setDraft((prev) => {
+          if (prev.inItems.some((i) => i.spool.id === spool.id)) return prev
+          const reserved = prev.inItems.map((i) => ({ nodeId: i.nodeId, shelf: i.shelf, slot: i.slot }))
           // Size the destination search by the override the user just entered so a
           // paternoster balances around the real stored weight, not the old one.
           const dest = pickDestination(state, grams ?? spool.grams, reserved, nodeId, spool.containerId)
           if (!dest) return prev
           return {
-            mode: "store",
-            items: [
-              ...base,
+            ...prev,
+            view: "in",
+            inItems: [
+              ...prev.inItems,
               { spool, nodeId: dest.nodeId, shelf: dest.shelf, slot: dest.slot, printerId: printer.id, printerSlot, grams },
             ],
           }
@@ -161,55 +201,53 @@ export function FlowProvider({ children }: { children: ReactNode }) {
       },
 
       startMove(spool, from, destNodeId) {
-        setFlow((prev) => {
-          const base = prev?.mode === "store" ? prev.items : []
-          if (base.some((i) => i.spool.id === spool.id)) return prev
-          const reserved = base.map((i) => ({ nodeId: i.nodeId, shelf: i.shelf, slot: i.slot }))
+        setDraft((prev) => {
+          if (prev.inItems.some((i) => i.spool.id === spool.id)) return prev
+          const reserved = prev.inItems.map((i) => ({ nodeId: i.nodeId, shelf: i.shelf, slot: i.slot }))
           // Find a slot in the chosen destination unit; the source slot is still
           // occupied so it can never be picked as the destination.
           const dest = pickDestination(state, spool.grams, reserved, destNodeId, spool.containerId)
           if (!dest) return prev
           // A move is a store from the hand (no printer) that also clears `from`.
           return {
-            mode: "store",
-            items: [...base, { spool, nodeId: dest.nodeId, shelf: dest.shelf, slot: dest.slot, from }],
+            ...prev,
+            view: "in",
+            inItems: [...prev.inItems, { spool, nodeId: dest.nodeId, shelf: dest.shelf, slot: dest.slot, from }],
           }
         })
       },
 
-      startPlace(draft, preferredNodeId) {
+      startPlace(draftSpool, preferredNodeId) {
         // A draft may request several identical spools; queue each into its own
         // best slot for the chosen unit (or the balanced default when none is
         // given), reserving destinations as we go so they don't collide.
         // `preferredNodeId` defaults placement to the unit the user is on (the
         // active section) — including a library, which auto-placement otherwise
         // skips. `quantity` is a form-only field and never stored on a spool.
-        const count = Math.max(1, Math.round(draft.quantity ?? 1))
-        const { quantity: _q, ...spoolFields } = draft
-        setFlow((prev) => {
-          const base = prev?.mode === "place" ? prev.items : []
+        const count = Math.max(1, Math.round(draftSpool.quantity ?? 1))
+        const { quantity: _q, ...spoolFields } = draftSpool
+        setDraft((prev) => {
           const created: PendingItem[] = []
           for (let n = 0; n < count; n++) {
             const spool: Spool = { id: newId("spool"), createdAt: Date.now(), ...spoolFields }
             // Register the spool immediately so it exists during placement.
             dispatch({ type: "UPSERT_SPOOL", spool })
-            const reserved = [...base, ...created].map((i) => ({ nodeId: i.nodeId, shelf: i.shelf, slot: i.slot }))
+            const reserved = [...prev.inItems, ...created].map((i) => ({ nodeId: i.nodeId, shelf: i.shelf, slot: i.slot }))
             const dest = pickDestination(state, spool.grams, reserved, preferredNodeId, spool.containerId)
             if (!dest) break
-            created.push({ spool, nodeId: dest.nodeId, shelf: dest.shelf, slot: dest.slot, grams: spoolFields.grams })
+            created.push({ spool, nodeId: dest.nodeId, shelf: dest.shelf, slot: dest.slot, grams: spoolFields.grams, isNew: true })
           }
           if (created.length === 0) return prev
-          return { mode: "place", items: [...base, ...created] }
+          return { ...prev, view: "in", inItems: [...prev.inItems, ...created] }
         })
       },
 
       reassignItemNode(spoolId, nodeId) {
-        setFlow((prev) => {
-          if (!prev || prev.mode === "pick") return prev
-          const item = prev.items.find((i) => i.spool.id === spoolId)
+        setDraft((prev) => {
+          const item = prev.inItems.find((i) => i.spool.id === spoolId)
           if (!item || item.nodeId === nodeId) return prev
           // Reserve every OTHER queued placement so the new slot doesn't collide.
-          const reserved = prev.items
+          const reserved = prev.inItems
             .filter((i) => i.spool.id !== spoolId)
             .map((i) => ({ nodeId: i.nodeId, shelf: i.shelf, slot: i.slot }))
           const dest = pickDestination(state, item.grams ?? item.spool.grams, reserved, nodeId, item.spool.containerId)
@@ -217,7 +255,7 @@ export function FlowProvider({ children }: { children: ReactNode }) {
           if (!dest || dest.nodeId !== nodeId) return prev
           return {
             ...prev,
-            items: prev.items.map((i) =>
+            inItems: prev.inItems.map((i) =>
               i.spool.id === spoolId ? { ...i, nodeId: dest.nodeId, shelf: dest.shelf, slot: dest.slot } : i,
             ),
           }
@@ -225,55 +263,70 @@ export function FlowProvider({ children }: { children: ReactNode }) {
       },
 
       assignItemToSlot(spoolId, nodeId, shelf, slot) {
-        if (!flow || flow.mode === "pick") return
-        const item = flow.items.find((i) => i.spool.id === spoolId)
+        const item = draft.inItems.find((i) => i.spool.id === spoolId)
         if (!item) return
         // Replicate the single-item store/place commit (see CONFIRM_STOP): clear
         // the printer slot it was loaded on, empty the source slot if it's a move,
         // apply any weight override, then drop it into the tapped storage slot.
-        if (flow.mode === "store") {
-          if (item.printerId != null && item.printerSlot != null) {
-            dispatch({ type: "SET_PRINTER_SLOT", printerId: item.printerId, slot: item.printerSlot, spoolId: null })
-          }
-          if (item.from) {
-            dispatch({
-              type: "SET_STORAGE_SLOT",
-              nodeId: item.from.nodeId,
-              shelf: item.from.shelf,
-              slot: item.from.slot,
-              spoolId: null,
-            })
-          }
+        if (item.printerId != null && item.printerSlot != null) {
+          dispatch({ type: "SET_PRINTER_SLOT", printerId: item.printerId, slot: item.printerSlot, spoolId: null })
+        }
+        if (item.from) {
+          dispatch({
+            type: "SET_STORAGE_SLOT",
+            nodeId: item.from.nodeId,
+            shelf: item.from.shelf,
+            slot: item.from.slot,
+            spoolId: null,
+          })
         }
         if (typeof item.grams === "number") {
           dispatch({ type: "UPDATE_SPOOL", id: item.spool.id, changes: { grams: item.grams } })
         }
         dispatch({ type: "SET_STORAGE_SLOT", nodeId, shelf, slot, spoolId: item.spool.id })
-        const remaining = flow.items.filter((i) => i.spool.id !== spoolId)
-        setFlow(remaining.length === 0 ? null : { ...flow, items: remaining })
+        setDraft((prev) => ({ ...prev, inItems: prev.inItems.filter((i) => i.spool.id !== spoolId) }))
       },
 
       cancel() {
-        // Roll back any spools created for an un-run "place" flow.
-        if (flow?.mode === "place") {
-          for (const it of flow.items) {
-            const placed = state.nodes.some((n) => n.slots.some((row) => row.includes(it.spool.id)))
-            if (!placed) dispatch({ type: "DELETE_SPOOL", id: it.spool.id })
-          }
+        // Roll back any brand-new spools created for an un-run "place" that never
+        // made it into a slot, so cancelling leaves no orphans in the registry.
+        for (const it of inItems) {
+          if (!it.isNew) continue
+          const placed = state.nodes.some((n) => n.slots.some((row) => row.includes(it.spool.id)))
+          if (!placed) dispatch({ type: "DELETE_SPOOL", id: it.spool.id })
         }
-        setFlow(null)
+        setDraft(EMPTY)
       },
 
       run() {
-        if (!flow || flow.items.length === 0) return
+        if (!hasAny) return
 
-        // A library has no physical location to travel to and no slot to reach
-        // for by hand, so its store/place items commit INSTANTLY here — no
-        // motion overlay, no "Confirm store" tap (mirrors the Add-to-library
-        // flow). We clear the printer/source slot, apply any weight override,
-        // then append the spool. Pick jobs never target a library.
-        const jobItems = flow.items.filter((it) => {
-          if (flow.mode === "pick") return true
+        // Route a set of pending items by proximity within each motorized
+        // carousel so the job grabs the nearest queued shelf first; manual
+        // shelves/libraries keep a stable order.
+        const nodePos: Record<string, { currentShelf: number; shelves: number }> = {}
+        for (const n of state.nodes) {
+          if ((n.type ?? "paternoster") === "paternoster") {
+            nodePos[n.id] = { currentShelf: n.machine.currentShelf, shelves: n.storage.shelves }
+          }
+        }
+        const toQueueItems = (items: PendingItem[]): QueueItem[] =>
+          orderQueueItems(items, nodePos).map((i) => ({
+            spoolId: i.spool.id,
+            nodeId: i.nodeId,
+            shelf: i.shelf,
+            slot: i.slot,
+            printerId: i.printerId,
+            printerSlot: i.printerSlot,
+            from: i.from,
+            grams: i.grams,
+            done: false,
+          }))
+
+        // In-items into a library have no physical location to travel to, so they
+        // commit INSTANTLY here (no motion overlay, no confirm) — mirroring the
+        // Add-to-library flow. Everything else becomes a moving job item.
+        const inJobItems = inItems.filter((it) => {
           const node = state.nodes.find((n) => n.id === it.nodeId)
           if (!node || (node.type ?? "paternoster") !== "library") return true
           if (it.printerId != null && it.printerSlot != null) {
@@ -296,42 +349,20 @@ export function FlowProvider({ children }: { children: ReactNode }) {
           return false
         })
 
-        if (jobItems.length === 0) {
-          setFlow(null)
-          return
-        }
+        const jobs: ActiveJob[] = []
+        // Take-out first, then place-in — one whole job at a time, no interleaving.
+        if (outItems.length > 0) jobs.push({ mode: "pick", items: toQueueItems(outItems), currentIndex: 0 })
+        if (inJobItems.length > 0) jobs.push({ mode: "store", items: toQueueItems(inJobItems), currentIndex: 0 })
 
-        // Group the remaining queue by storage unit so the job finishes one
-        // location before moving on. Within each motorized carousel, route by
-        // proximity to where it's currently parked so it grabs the nearest queued
-        // shelf first instead of rotating past it. Manual shelves have no
-        // position, so they keep a stable shelf→slot order.
-        const nodePos: Record<string, { currentShelf: number; shelves: number }> = {}
-        for (const n of state.nodes) {
-          // Only motorized carousels have a position to route by; manual shelf and
-          // library units keep their stable insertion order.
-          if ((n.type ?? "paternoster") === "paternoster") {
-            nodePos[n.id] = { currentShelf: n.machine.currentShelf, shelves: n.storage.shelves }
-          }
-        }
-        const items: QueueItem[] = orderQueueItems(jobItems, nodePos).map((i) => ({
-          spoolId: i.spool.id,
-          nodeId: i.nodeId,
-          shelf: i.shelf,
-          slot: i.slot,
-          printerId: i.printerId,
-          printerSlot: i.printerSlot,
-          // Carry the source slot (moves) and per-spool weight override through to
-          // the job so the confirm step clears the right slot and keeps the weight.
-          from: i.from,
-          grams: i.grams,
-          done: false,
-        }))
-        dispatch({ type: "START_JOB", job: { mode: flow.mode, items, currentIndex: 0 } })
-        setFlow(null)
+        if (jobs.length > 0) dispatch({ type: "START_JOBS", jobs })
+        setDraft(EMPTY)
       },
+
+      inspectRequest,
+      requestInspect: (spool, loc) => setInspectRequest({ spool, loc }),
+      consumeInspect: () => setInspectRequest(null),
     }
-  }, [flow, state, dispatch])
+  }, [draft, state, dispatch, inspectRequest])
 
   return <FlowContext.Provider value={value}>{children}</FlowContext.Provider>
 }
