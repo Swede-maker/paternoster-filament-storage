@@ -129,17 +129,74 @@ motor and sensors so you can test the app end to end:
 python3 paternoster_agent.py --simulate --shelves 9 --port 8765
 ```
 
+## Where the web app must run
+
+**This is the most common cause of a stuck "offline" status.**
+
+The browser never talks to the Pi directly. The app server holds a single
+WebSocket to the agent and fans events out to every browser over SSE:
+
+```
+browser --SSE--> web app server --WebSocket--> Pi agent :8765
+```
+
+So **the machine that must reach the Pi is the app server**, not your phone or
+laptop. A cloud-hosted app server (Vercel, or the v0 preview) has no route to a
+private `192.168.x.x` address, so it can never connect no matter how healthy the
+agent is — you get `offline` forever while `systemctl status` shows the agent
+listening happily.
+
+Run the app on the LAN. Simplest is on the Pi itself:
+
+```bash
+# on the Pi, in the repo root
+pnpm install
+pnpm build
+# bind to all interfaces so other devices on the LAN can load the UI
+pnpm start -- --hostname 0.0.0.0 --port 3000
+```
+
+Then browse to `http://<pi-ip>:3000` from any device, and set the unit's address
+to `127.0.0.1` — the app server and the agent are now the same machine, so the
+connection is local and always works. Any other always-on LAN machine (NAS,
+mini-PC) works too; point it at the Pi's LAN IP instead.
+
+The app needs `DATABASE_URL` in a `.env.local` file to start, since the shared
+state lives in Postgres.
+
+> Exposing the Pi to a cloud-hosted app server (Tailscale, Cloudflare Tunnel)
+> also works, but the agent has **no authentication** — anyone who can reach the
+> port can drive the motor. Don't do it without putting auth in front.
+
 ## Connect it in the app
 
 1. Open the app → **Settings** → **Linked paternoster units**.
 2. Either **Link another unit** and choose **Real Pi**, or on an existing unit
    press **Connect real Pi**.
 3. Enter the Pi's **IP address / hostname** and the **agent port** (default 8765).
-   Find the Pi's IP with `hostname -I` on the Pi, or use its `raspberrypi.local`
-   name.
+   Use `127.0.0.1` when the app runs on the Pi itself; otherwise find the Pi's IP
+   with `hostname -I`, or use its `raspberrypi.local` name.
 4. The unit's status chip turns **connecting → online** once the socket is up,
-   then the app auto-homes it. If it shows **offline**, check the agent is
-   running and the IP/port are reachable (`ping`, firewall).
+   then the app auto-homes it.
+
+### If it stays offline
+
+The widget now prints the actual reason underneath the status. Read it first:
+
+| Message | Meaning | Fix |
+| --- | --- | --- |
+| Connection refused | Host reached, nothing on that port | Agent not running, or bound to `127.0.0.1` instead of `0.0.0.0`; check the port matches |
+| Host unreachable | No network route from the app server | The app server isn't on the Pi's LAN — see the section above |
+| Connection timed out | Packets dropped | Firewall (`sudo ufw allow 8765`), or wrong IP |
+| Hostname could not be resolved | mDNS failed | Use the numeric IP instead of `*.local` |
+| not a private address | Address rejected as non-LAN | The relay only permits private ranges; use the Pi's LAN IP |
+
+Confirm the agent is actually listening on all interfaces:
+
+```bash
+sudo systemctl status paternoster-agent
+sudo ss -ltnp | grep 8765     # want 0.0.0.0:8765, not 127.0.0.1:8765
+```
 
 ## Wire protocol
 

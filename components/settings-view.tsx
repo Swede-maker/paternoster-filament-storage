@@ -515,12 +515,16 @@ function NodeEndpointEditor({ node }: { node: StorageNode }) {
             node.link === "online" ? "bg-success" : node.link === "checking" ? "bg-warning" : "bg-destructive",
           )}
         />
-        {node.link === "online"
-          ? "Connected to Pi agent"
-          : node.link === "checking"
-            ? "Connecting…"
-            : "Offline — check the Pi agent is running, then Reconnect."}
+        {node.link === "online" ? "Connected to Pi agent" : node.link === "checking" ? "Connecting…" : "Offline"}
       </p>
+      {/*
+        The specific failure reason reported by the relay. This is the difference
+        between "offline" (useless) and "connection refused — nothing listening
+        on that port" (actionable), so it's shown verbatim whenever present.
+      */}
+      {node.link !== "online" && node.linkError && (
+        <p className="mt-1.5 text-xs leading-relaxed text-muted-foreground/80">{node.linkError}</p>
+      )}
       {ip && !ipValid && <p className="mt-1 text-xs text-destructive">Enter an IPv4 address or a *.local hostname.</p>}
     </div>
   )

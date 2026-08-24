@@ -415,6 +415,12 @@ export interface StorageNode {
    */
   link: PrinterLinkStatus
   /**
+   * Human-readable reason the link is offline (e.g. "Connection refused …"),
+   * reported by the server-side relay. Ephemeral and never persisted — it
+   * describes this session's connection attempt, not saved configuration.
+   */
+  linkError?: string
+  /**
    * Ephemeral, per-session counter bumped by a manual "Reconnect" action to
    * force the live WebSocket to close and reopen without changing ip/port. Not
    * persisted (stripped in toPersisted) so it never syncs between devices.
