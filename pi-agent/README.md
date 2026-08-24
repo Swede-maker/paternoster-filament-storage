@@ -17,29 +17,74 @@ physical paternoster carousel and connect it to the PAX web app.
 
 Each carousel uses:
 
-| Part                     | Purpose                                             |
-| ------------------------ | --------------------------------------------------- |
-| DC motor + H-bridge      | Rotates the carousel. PWM on ENABLE sets the speed. |
-| H-bridge (L298N / TB6612)| Direction + speed driver between the Pi and motor.  |
-| Inductive **shelf** sensor | Pulses once as **every** shelf passes the window. |
-| Inductive **index** sensor | Active **only at shelf 1** — the home reference.  |
+| Part                       | Purpose                                            |
+| -------------------------- | -------------------------------------------------- |
+| DC motor                   | Rotates the carousel.                              |
+| BTS7960 / IBT-2 43A        | Half-bridge driver. **Dual PWM**: RPWM vs LPWM picks direction. |
+| Inductive **shelf** sensor | Pulses once as **every** shelf passes the window.  |
+| Inductive **index** sensor | Active **only at shelf 1** — the home reference.   |
 
 ### Default wiring (BCM pin numbers)
 
 Edit the constants at the top of `paternoster_agent.py` to match your board.
 
-| Signal              | Pin (BCM) | Notes                                  |
-| ------------------- | --------- | -------------------------------------- |
-| Motor IN1 (dir)     | GPIO 17   | H-bridge input 1                       |
-| Motor IN2 (dir)     | GPIO 27   | H-bridge input 2                       |
-| Motor ENABLE (PWM)  | GPIO 22   | H-bridge enable — PWM speed control    |
-| Shelf sensor        | GPIO 23   | One pulse per shelf                    |
-| Index sensor        | GPIO 24   | Active only at shelf 1                 |
-| GND                 | any GND   | **Common ground** Pi ↔ H-bridge ↔ sensors |
+| BTS7960 pin  | Pin (BCM) | Notes                                          |
+| ------------ | --------- | ---------------------------------------------- |
+| RPWM         | GPIO 12   | PWM — drives one direction                     |
+| LPWM         | GPIO 13   | PWM — drives the other direction               |
+| R_EN + L_EN  | GPIO 22   | **Tie both to this one pin.** HIGH = armed     |
+| VCC          | 3.3 V     | Logic supply — **not** 5 V (see below)         |
+| GND          | any GND   | **Common ground** Pi ↔ driver ↔ sensors        |
+| R_IS / L_IS  | *unused*  | Current-sense outputs, leave disconnected      |
+| Shelf sensor | GPIO 23   | One pulse per shelf                            |
+| Index sensor | GPIO 24   | Active only at shelf 1                         |
+
+The screw terminals carry the power side: **B+ / B−** to your motor supply
+(with the big cap already on-board), **M+ / M−** to the motor. Swap M+/M− if the
+carousel runs the wrong way, or just flip `HOMING_DIRECTION`.
+
+**Key points for this board:**
+
+- **Never drive RPWM and LPWM high at the same time** — that shoots through the
+  bridge. The code uses gpiozero's `Motor` without an `enable` argument, which
+  guarantees only one of the two is ever given a duty cycle.
+- **Power VCC from 3.3 V, not 5 V.** The BTS7960's inputs are happy at 3.3 V
+  logic, and feeding VCC 5 V can make the on-board logic pull the input pins
+  above the Pi's 3.3 V limit.
+- GPIO 12/13 are the Pi's **hardware PWM** channels. For jitter-free speed
+  control install `pigpio` (`sudo apt install pigpio && sudo systemctl enable
+  --now pigpiod`) and export `GPIOZERO_PIN_FACTORY=pigpio`; otherwise gpiozero
+  falls back to software PWM, which can make the motor buzz.
+- Pulling **EN low is a hardware stop** — the outputs float regardless of the PWM
+  state. That's why `stop()` zeroes the PWM and then disarms EN.
 
 > Power the motor from its **own supply**, not the Pi's 5V rail. Tie all grounds
-> together. Inductive sensors are often 6–36 V — use a **level shifter or divider**
-> so their output never exceeds 3.3 V into a Pi GPIO.
+> together — the Pi's GND *must* be common with the driver's GND or the PWM
+> signals have no reference and the motor behaves erratically.
+
+### Sensor type: NPN vs PNP
+
+Set `SENSOR_TYPE` at the top of `paternoster_agent.py`. It defaults to `"NPN"`.
+Get this wrong and the sensors read as permanently inactive — homing spins until
+it faults with *"index sensor not found"*.
+
+| | Idle | Shelf detected | Pi input | Extra parts |
+| --- | --- | --- | --- | --- |
+| **NPN** (sinking, active-LOW) | open | pulls to **GND** | pull-**up** | none |
+| **PNP** (sourcing, active-HIGH) | open | sources **+V** | pull-**down** | level shifter / divider |
+
+**NPN is the recommended choice for a Raspberry Pi.** The sensor only ever pulls
+the line to GND, so with a pull-up to 3.3 V the GPIO sees 3.3 V or 0 V and never
+the sensor's 12/24 V supply — even though the sensor itself is powered from that
+higher rail.
+
+A 3-wire NPN sensor wires up as: brown → +12/24 V, blue → **common GND**,
+black (signal) → the GPIO. The Pi's internal pull-up is weak (~50 kΩ), so on long
+cable runs near a motor add an external **4.7 kΩ–10 kΩ pull-up to 3.3 V** on the
+signal line to keep inductive noise from causing phantom shelf pulses.
+
+> With **PNP** you must add a level shifter or divider, or the sensor will feed
+> 12/24 V straight into a 3.3 V GPIO and destroy the Pi.
 
 ## How motion works
 

@@ -3,7 +3,7 @@
 PAX paternoster — Raspberry Pi GPIO agent.
 
 This program runs ON a Raspberry Pi and drives one paternoster carousel:
-  * a DC motor via an H-bridge (e.g. L298N / TB6612) with PWM speed control, and
+  * a DC motor via a BTS7960 / IBT-2 half-bridge with PWM speed control, and
   * two inductive proximity sensors:
       - SHELF sensor: pulses once as every shelf passes the pick window,
       - INDEX sensor: active only at shelf 1 (the home / absolute reference).
@@ -36,9 +36,13 @@ from typing import Callable, Optional
 # --------------------------------------------------------------------------
 # Pin configuration (BCM numbering). Adjust to match your wiring.
 # --------------------------------------------------------------------------
-PIN_MOTOR_IN1 = 17   # H-bridge input 1 (direction)
-PIN_MOTOR_IN2 = 27   # H-bridge input 2 (direction)
-PIN_MOTOR_ENABLE = 22  # H-bridge enable / PWM (speed)
+# BTS7960 / IBT-2 43A dual half-bridge. Unlike an L298N there is no single
+# "enable = PWM" pin: RPWM and LPWM are BOTH PWM inputs and *which one* you drive
+# picks the direction. Drive only one at a time — driving both together shoots
+# through the bridge.
+PIN_MOTOR_RPWM = 12  # -> RPWM (PWM, drives one direction)
+PIN_MOTOR_LPWM = 13  # -> LPWM (PWM, drives the other direction)
+PIN_MOTOR_EN = 22    # -> R_EN + L_EN tied together (HIGH = bridge enabled)
 PIN_SHELF_SENSOR = 23  # inductive sensor: one pulse per shelf
 PIN_INDEX_SENSOR = 24  # inductive sensor: active only at shelf 1 (home)
 
@@ -48,6 +52,22 @@ MOVE_SPEED = 0.7      # 0..1 PWM duty during normal moves
 PULSE_TIMEOUT = 8.0   # seconds to wait for the next shelf pulse before faulting
 HOME_TIMEOUT = 30.0   # seconds to find the index sensor before faulting
 SENSOR_BOUNCE = 0.01  # debounce (s) for the inductive sensors
+
+# Output type of the inductive proximity sensors. This decides which logic level
+# counts as "shelf detected", so getting it wrong makes the sensors look dead and
+# homing fails with "index sensor not found".
+#
+#   "NPN" (sinking, active-LOW)  - output floats when idle and pulls to GND when
+#                                  triggered. Needs a pull-UP so the pin idles
+#                                  high. This is the safe choice for a Pi: the
+#                                  signal line only ever sees 3.3 V (from the
+#                                  pull-up) or GND, never the sensor's 12/24 V.
+#   "PNP" (sourcing, active-HIGH) - output floats when idle and sources +V when
+#                                  triggered. Needs a pull-DOWN, AND a level
+#                                  shifter/divider, because a 12/24 V sensor
+#                                  would otherwise feed 12/24 V straight into a
+#                                  3.3 V GPIO and destroy the Pi.
+SENSOR_TYPE = "NPN"
 
 # Which way the motor turns for "up" (decreasing shelf index). Flip if your
 # carousel runs backwards relative to the app's direction labels.
@@ -61,26 +81,43 @@ class RealHardware:
     """Drives real GPIO through gpiozero (Motor + two inductive sensors)."""
 
     def __init__(self) -> None:
-        from gpiozero import Motor, DigitalInputDevice  # imported lazily
+        from gpiozero import Motor, DigitalOutputDevice, DigitalInputDevice  # imported lazily
 
-        # H-bridge: forward/backward are the two direction inputs, enable is PWM.
+        # BTS7960: passing NO `enable` to Motor makes gpiozero PWM the two
+        # direction pins directly, which is exactly what RPWM/LPWM want — it
+        # drives one pin with the duty cycle and holds the other at 0.
         self.motor = Motor(
-            forward=PIN_MOTOR_IN1,
-            backward=PIN_MOTOR_IN2,
-            enable=PIN_MOTOR_ENABLE,
+            forward=PIN_MOTOR_RPWM,
+            backward=PIN_MOTOR_LPWM,
             pwm=True,
         )
-        self.shelf = DigitalInputDevice(PIN_SHELF_SENSOR, bounce_time=SENSOR_BOUNCE)
-        self.index = DigitalInputDevice(PIN_INDEX_SENSOR, bounce_time=SENSOR_BOUNCE)
+        # R_EN and L_EN tied to one GPIO: HIGH arms the bridge, LOW makes the
+        # outputs float. Pulling this LOW is a true hardware stop that works even
+        # if a PWM pin is stuck, so the estop path uses it.
+        self.enable = DigitalOutputDevice(PIN_MOTOR_EN, initial_value=True)
+        # An NPN (sinking) sensor pulls the line to GND when it detects a shelf,
+        # so we pull the pin up and let gpiozero treat LOW as active. A PNP
+        # (sourcing) sensor is the mirror image: pull down, HIGH is active.
+        # gpiozero derives `is_active` from pull_up, so the rest of this class
+        # stays level-agnostic and only this flag has to change.
+        pull_up = SENSOR_TYPE.upper() == "NPN"
+        self.shelf = DigitalInputDevice(PIN_SHELF_SENSOR, pull_up=pull_up, bounce_time=SENSOR_BOUNCE)
+        self.index = DigitalInputDevice(PIN_INDEX_SENSOR, pull_up=pull_up, bounce_time=SENSOR_BOUNCE)
 
     def forward(self, speed: float) -> None:
+        self.enable.on()   # re-arm in case an estop left the bridge disabled
         self.motor.forward(speed)
 
     def backward(self, speed: float) -> None:
+        self.enable.on()
         self.motor.backward(speed)
 
     def stop(self) -> None:
+        # Zero the PWM first so the bridge brakes cleanly, then disarm it. Doing
+        # it in this order avoids floating the outputs while a duty cycle is
+        # still applied.
         self.motor.stop()
+        self.enable.off()
 
     def wait_shelf_edge(self, timeout: float) -> bool:
         # Rising edge = a shelf entered the window.
@@ -95,7 +132,10 @@ class RealHardware:
 
     def cleanup(self) -> None:
         try:
+            self.motor.stop()
+            self.enable.off()  # leave the bridge disarmed on exit
             self.motor.close()
+            self.enable.close()
             self.shelf.close()
             self.index.close()
         except Exception:
