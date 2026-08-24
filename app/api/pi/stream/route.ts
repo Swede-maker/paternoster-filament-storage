@@ -21,14 +21,34 @@ export async function GET(req: NextRequest) {
   const port = Number(searchParams.get("port") ?? "")
   const shelves = Number(searchParams.get("shelves") ?? "0")
 
+  const encoder = new TextEncoder()
+
+  /**
+   * Reject a bad request as a one-shot SSE `link` frame rather than an HTTP
+   * error. An EventSource can't read the body of a failed response, so a bare
+   * 403 would leave the UI stuck on "checking…" with no explanation. Sending the
+   * reason down the stream makes the misconfiguration visible in the widget.
+   */
+  const refuse = (reason: string) =>
+    new Response(
+      encoder.encode(`event: link\ndata: ${JSON.stringify({ status: "offline", reason })}\n\n`),
+      {
+        headers: {
+          "Content-Type": "text/event-stream; charset=utf-8",
+          "Cache-Control": "no-cache, no-transform",
+          "X-Accel-Buffering": "no",
+        },
+      },
+    )
+
   if (!ip || !Number.isInteger(port) || port <= 0 || port > 65535) {
-    return new Response("Bad ip/port", { status: 400 })
+    return refuse("Invalid address or port.")
   }
   if (!isAllowedTarget(ip)) {
-    return new Response("Target not allowed (LAN addresses only)", { status: 403 })
+    return refuse(
+      `"${ip}" is not a private address. The Pi must be on the local network (10.x, 172.16–31.x, 192.168.x, 127.x or a .local name).`,
+    )
   }
-
-  const encoder = new TextEncoder()
 
   const stream = new ReadableStream<Uint8Array>({
     start(controller) {
@@ -44,7 +64,9 @@ export async function GET(req: NextRequest) {
 
       const onFrame = (frame: RelayFrame) => {
         if (frame.kind === "link") {
-          safeEnqueue(`event: link\ndata: ${JSON.stringify({ status: frame.status })}\n\n`)
+          safeEnqueue(
+            `event: link\ndata: ${JSON.stringify({ status: frame.status, reason: frame.reason })}\n\n`,
+          )
         } else {
           // Pi event payloads are already JSON strings; forward verbatim.
           safeEnqueue(`event: pi\ndata: ${frame.data}\n\n`)

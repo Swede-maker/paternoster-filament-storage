@@ -90,14 +90,17 @@ export function NodeConnection() {
         const conn = conns.current[nodeId]
         if (!conn) return
         let status: string | undefined
+        let reason: string | undefined
         try {
-          status = (JSON.parse((e as MessageEvent).data) as { status?: string }).status
+          const payload = JSON.parse((e as MessageEvent).data) as { status?: string; reason?: string }
+          status = payload.status
+          reason = payload.reason
         } catch {
           return
         }
         if (status === "online" || status === "checking" || status === "offline") {
           conn.online = status === "online"
-          dispatch({ type: "NODE_LINK", nodeId, link: status })
+          dispatch({ type: "NODE_LINK", nodeId, link: status, reason })
         }
       })
 
@@ -144,7 +147,14 @@ export function NodeConnection() {
         const conn = conns.current[nodeId]
         if (!conn) return
         conn.online = false
-        dispatch({ type: "NODE_LINK", nodeId, link: "checking" })
+        // This is the browser↔app-server hop failing, NOT the server↔Pi hop, so
+        // it needs its own wording — the Pi may well be fine.
+        dispatch({
+          type: "NODE_LINK",
+          nodeId,
+          link: "checking",
+          reason: "Lost the event stream from the app server — retrying…",
+        })
       }
     }
 

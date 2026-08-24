@@ -26,8 +26,40 @@ const HEARTBEAT_TICK_MS = 3000
 
 export type RelayLink = "checking" | "online" | "offline"
 
-/** A frame pushed to subscribers: either a link-status change or a Pi event. */
-export type RelayFrame = { kind: "link"; status: RelayLink } | { kind: "event"; data: string }
+/**
+ * A frame pushed to subscribers: either a link-status change or a Pi event.
+ * `reason` carries the human-readable cause of an "offline" status so the UI can
+ * explain *why* the handshake failed instead of just showing "offline".
+ */
+export type RelayFrame =
+  | { kind: "link"; status: RelayLink; reason?: string }
+  | { kind: "event"; data: string }
+
+/**
+ * Translate a raw socket error into something a human can act on. These are the
+ * failures that actually happen when the app server can't reach the Pi, and each
+ * one implies a different fix, so they're worth distinguishing.
+ */
+function describeSocketError(err: unknown): string {
+  const code = (err as { code?: string } | null)?.code
+  const msg = (err as { message?: string } | null)?.message ?? ""
+  switch (code) {
+    case "ECONNREFUSED":
+      return "Connection refused — the Pi is reachable but nothing is listening on that port. Check the agent is running and bound to 0.0.0.0."
+    case "EHOSTUNREACH":
+    case "ENETUNREACH":
+      return "Host unreachable — this server has no network route to that address. It must be on the same LAN as the Pi."
+    case "ETIMEDOUT":
+      return "Connection timed out — usually a firewall dropping the packets, or the wrong IP."
+    case "ENOTFOUND":
+    case "EAI_AGAIN":
+      return "Hostname could not be resolved. Try the Pi's numeric IP instead of a .local name."
+    case "ECONNRESET":
+      return "Connection reset by the Pi before the handshake finished."
+    default:
+      return msg ? `Connection failed: ${msg}` : "Connection failed for an unknown reason."
+  }
+}
 
 type Listener = (frame: RelayFrame) => void
 
@@ -44,6 +76,12 @@ interface Relay {
   pingSentAt: number | null
   /** Last `state` frame seen, replayed to new subscribers so they sync fast. */
   lastState: string | null
+  /**
+   * Why the last connection attempt failed. Kept so a browser that subscribes
+   * *after* the failure still learns the reason, and so the reason survives the
+   * offline → checking → offline retry cycle.
+   */
+  lastError: string | null
   closing: boolean
 }
 
@@ -94,7 +132,13 @@ function broadcast(relay: Relay, frame: RelayFrame) {
 function setLink(relay: Relay, link: RelayLink) {
   if (relay.link === link) return
   relay.link = link
-  broadcast(relay, { kind: "link", status: link })
+  // Only an offline status carries a reason; clear it once we're connected.
+  if (link === "online") relay.lastError = null
+  broadcast(relay, {
+    kind: "link",
+    status: link,
+    ...(link === "offline" && relay.lastError ? { reason: relay.lastError } : {}),
+  })
 }
 
 function stopHeartbeat(relay: Relay) {
@@ -148,7 +192,9 @@ function openSocket(relay: Relay) {
   let ws: WebSocket
   try {
     ws = new WebSocket(agentUrl(relay.ip, relay.port))
-  } catch {
+  } catch (err) {
+    // Malformed URL — surface it rather than silently retrying forever.
+    relay.lastError = describeSocketError(err)
     setLink(relay, "offline")
     scheduleReconnect(relay)
     return
@@ -185,7 +231,10 @@ function openSocket(relay: Relay) {
     if (!relay.closing) scheduleReconnect(relay)
   })
 
-  ws.on("error", () => {
+  // `ws` emits "error" BEFORE "close", so recording the reason here guarantees
+  // it's available when the close handler flips the link to offline.
+  ws.on("error", (err) => {
+    relay.lastError = describeSocketError(err)
     try {
       ws.close()
     } catch {
@@ -222,6 +271,7 @@ function getOrCreate(ip: string, port: number, shelves: number): Relay {
       lastRx: 0,
       pingSentAt: null,
       lastState: null,
+      lastError: null,
       closing: false,
     }
     registry.set(key, relay)
@@ -248,8 +298,13 @@ export function subscribe(ip: string, port: number, shelves: number, listener: L
   const relay = getOrCreate(ip, port, shelves)
   relay.listeners.add(listener)
 
-  // Immediately sync the newcomer with current status + last known state.
-  listener({ kind: "link", status: relay.link })
+  // Immediately sync the newcomer with current status + last known state. A
+  // browser that opens after the failure still gets the reason this way.
+  listener({
+    kind: "link",
+    status: relay.link,
+    ...(relay.link === "offline" && relay.lastError ? { reason: relay.lastError } : {}),
+  })
   if (relay.lastState) listener({ kind: "event", data: relay.lastState })
 
   return () => {

@@ -103,7 +103,10 @@ function toPersisted(state: AppState): PersistedState {
     // (mid-home) never broadcasts `homed:false` to peers and makes THEM home
     // too. Combined with migrate() trusting the persisted value, a remote client
     // simply follows the shared position and never spontaneously re-homes.
-    nodes: state.nodes.map(({ connSeq: _connSeq, ...n }) => ({
+    // `linkError` is stripped alongside `connSeq`: it describes THIS device's
+    // connection attempt, so syncing it would show a stale local network error
+    // on every other device.
+    nodes: state.nodes.map(({ connSeq: _connSeq, linkError: _linkError, ...n }) => ({
       ...n,
       link: n.driver === "hardware" ? "offline" : "online",
       machine: { ...n.machine, homed: true, status: "idle", targetShelf: null, direction: null, moveFrom: null },
@@ -416,7 +419,7 @@ type Action =
   | { type: "SET_MASTER"; id: string }
   | { type: "SET_ACTIVE_NODE"; id: string }
   // Hardware bridge (events reported by a real Pi agent over WebSocket)
-  | { type: "NODE_LINK"; nodeId: string; link: PrinterLinkStatus }
+  | { type: "NODE_LINK"; nodeId: string; link: PrinterLinkStatus; reason?: string }
   | { type: "NODE_POS"; nodeId: string; currentShelf: number }
   | { type: "NODE_ARRIVED"; nodeId: string; shelf: number }
   | { type: "NODE_HOMED"; nodeId: string; currentShelf?: number }
@@ -1208,7 +1211,18 @@ function coreReducer(state: AppState, action: Action): AppState {
 
     // ----- hardware bridge events (from a real Pi agent) -----
     case "NODE_LINK":
-      return withNode(state, action.nodeId, (n) => (n.driver === "hardware" ? { ...n, link: action.link } : n))
+      return withNode(state, action.nodeId, (n) =>
+        n.driver === "hardware"
+          ? // Keep the last known reason while retrying (checking) so the
+            // explanation doesn't flicker away on every reconnect attempt; clear
+            // it outright once the link is genuinely online.
+            {
+              ...n,
+              link: action.link,
+              linkError: action.link === "online" ? undefined : action.reason ?? n.linkError,
+            }
+          : n,
+      )
 
     case "NODE_POS":
       // Live position update as the carousel passes each shelf sensor.
