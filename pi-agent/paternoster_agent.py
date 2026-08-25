@@ -356,6 +356,9 @@ class Carousel:
 # ==========================================================================
 async def serve(args) -> None:
     import websockets
+    # Base class of ConnectionClosedOK/ConnectionClosedError, so catching it
+    # covers both a graceful close and an abrupt drop with no close frame.
+    from websockets.exceptions import ConnectionClosed
 
     shelves = max(1, args.shelves)
 
@@ -387,10 +390,15 @@ async def serve(args) -> None:
 
     async def handler(ws) -> None:
         clients.add(ws)
-        # Greet + send current state immediately.
-        await ws.send(json.dumps({"type": "hello", "name": args.name, "shelves": carousel.shelves, "firmware": "pax-agent-1.0"}))
-        await ws.send(json.dumps(carousel.snapshot()))
         try:
+            # Greet + send current state immediately. These MUST stay inside the
+            # try: the app closes the socket whenever its last browser tab goes
+            # away, and if that lands mid-greeting an unguarded send raises
+            # ConnectionClosedError straight out of the handler — which both
+            # prints a scary traceback and skips the `finally` below, leaking the
+            # dead socket in `clients` forever.
+            await ws.send(json.dumps({"type": "hello", "name": args.name, "shelves": carousel.shelves, "firmware": "pax-agent-1.0"}))
+            await ws.send(json.dumps(carousel.snapshot()))
             async for raw in ws:
                 try:
                     msg = json.loads(raw)
@@ -409,6 +417,13 @@ async def serve(args) -> None:
                     carousel.set_shelves(int(msg.get("shelves", carousel.shelves)))
                 elif t == "hello":
                     await ws.send(json.dumps({"type": "hello", "name": args.name, "shelves": carousel.shelves}))
+        except ConnectionClosed:
+            # Routine, not an error: the app drops the socket when its last
+            # viewer leaves, and a dev-server restart drops it abruptly (which
+            # surfaces as ConnectionClosedError "no close frame received or
+            # sent"). Either way the app reconnects on its own, so stay quiet and
+            # keep serving — the motor state lives in `carousel`, not the socket.
+            pass
         finally:
             clients.discard(ws)
 

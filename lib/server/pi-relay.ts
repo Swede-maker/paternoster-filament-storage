@@ -20,6 +20,8 @@ import { agentUrl, encodeCommand, type NodeCommand } from "@/lib/node-protocol"
  */
 
 const RECONNECT_MS = 3000
+/** How long to hold the agent socket open after the last browser disconnects. */
+const IDLE_TEARDOWN_MS = 15000
 const HEARTBEAT_IDLE_MS = 10000
 const HEARTBEAT_TIMEOUT_MS = 5000
 const HEARTBEAT_TICK_MS = 3000
@@ -310,10 +312,14 @@ export function subscribe(ip: string, port: number, shelves: number, listener: L
   return () => {
     relay.listeners.delete(listener)
     if (relay.listeners.size === 0) {
-      // No viewers — keep briefly then tear down to free the socket.
+      // No viewers — linger before tearing down. A page reload or navigation
+      // drops the SSE stream for a moment, and a 1s grace period was short
+      // enough that ordinary browsing churned the hardware socket: the agent saw
+      // a disconnect and reconnect every time. Holding the socket open across
+      // that gap keeps the link stable and preserves the cached state.
       setTimeout(() => {
         if (relay.listeners.size === 0) destroy(relay)
-      }, 1000)
+      }, IDLE_TEARDOWN_MS)
     }
   }
 }
