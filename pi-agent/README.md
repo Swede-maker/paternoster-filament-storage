@@ -179,6 +179,74 @@ state lives in Postgres.
 4. The unit's status chip turns **connecting → online** once the socket is up,
    then the app auto-homes it.
 
+### Adding more units
+
+Each unit stores its **own** address, and the app opens one independent socket per
+unit. Addresses are always resolved **from the app server**, so `127.0.0.1` only
+ever means "the machine running the web app":
+
+| Unit | Address |
+| --- | --- |
+| The Pi running the web app | `127.0.0.1` |
+| Every other Pi | its LAN IP, e.g. `192.168.1.51` |
+
+There is no master/slave relationship in the protocol: the app server is the only
+coordinator and every Pi is an equal peer running the same agent.
+
+> Give the extra Pis a **static IP or DHCP reservation**. If an address changes on
+> a router reboot, that unit goes offline until you re-enter it.
+
+#### Installing an agent-only ("slave") Pi
+
+`paternoster_agent.py` is **self-contained** — it imports only the Python standard
+library plus `gpiozero` and `websockets`, and nothing from the rest of the repo. So
+copy the `pi-agent/` folder and nothing else. You do **not** need Node.js, pnpm,
+`node_modules/`, `app/`, `components/`, `lib/`, Postgres, or `DATABASE_URL` on this
+Pi.
+
+Strictly, one file is mandatory (`paternoster_agent.py`); the other two just make
+installation and autostart easier:
+
+| File | Needed? | Why |
+| --- | --- | --- |
+| `paternoster_agent.py` | **required** | The whole agent |
+| `requirements.txt` | recommended | So `pip3 install -r` gets the right versions |
+| `paternoster-agent.service` | recommended | Starts on boot, restarts on crash |
+| `README.md` | optional | Documentation only |
+
+From your dev machine, copy just that folder:
+
+```bash
+scp -r pi-agent pi@192.168.1.51:/home/pi/
+```
+
+Then on the slave Pi:
+
+```bash
+cd /home/pi/pi-agent
+sudo apt update && sudo apt install -y python3-pip
+pip3 install -r requirements.txt --break-system-packages
+
+# Give this unit its own name and shelf count before installing the service.
+sudo cp paternoster-agent.service /etc/systemd/system/
+sudo nano /etc/systemd/system/paternoster-agent.service   # edit --name / --shelves
+sudo systemctl daemon-reload
+sudo systemctl enable --now paternoster-agent
+```
+
+Verify it's up and listening on **all** interfaces (`0.0.0.0`, which the agent
+always binds — not just loopback):
+
+```bash
+systemctl status paternoster-agent
+sudo ss -ltnp | grep 8765
+```
+
+Keep `--port 8765` on every unit. Since each Pi is a separate machine there's no
+port conflict, and the app defaults to 8765 for new units. Finally, add the unit in
+the app with **the slave's LAN IP** and wire its own BTS7960 + sensors exactly as
+described above — each unit is independent hardware.
+
 ### If it stays offline
 
 The widget now prints the actual reason underneath the status. Read it first:
