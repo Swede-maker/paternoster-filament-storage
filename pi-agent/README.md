@@ -200,6 +200,49 @@ This splits the problem in a single run:
   Check bridge power, then **common ground between Pi and driver** (the most common
   cause — without it the PWM signal has no reference), then the BCM pin numbers.
 
+## Design rule: sensors count, they never gate power
+
+**Sensor state must never decide whether the motor is energised.** The sensors do
+exactly two jobs: find the home shelf via the index sensor, and count shelves as
+they pass. Motion code starts the motor unconditionally, then consumes counted
+pulses while it runs.
+
+This was broken in three places, all the same mistake — reading a sensor *level*
+where an *edge* was meant:
+
+1. **Homing** asked "is the index sensor active?" A carousel parked with a shelf
+   in the index window answered yes immediately, so homing "succeeded" in
+   microseconds and the motor never turned.
+2. **Moving** used `wait_for_active()`, which returns instantly when the sensor is
+   already covered. All the steps were consumed at once and the motor was switched
+   off before it could physically move — a twitch, and the appearance of a motor
+   that only ran while a sensor saw something.
+3. **Drift correction** read the index level right after homing, while the carousel
+   was still sitting on the home flag, so the first shelf pulse was reset to 0
+   (reporting `0,1,2` for a 3-shelf move instead of `1,2,3`).
+
+The fixes: sensors are now edge counters (`when_activated`), homing drives *off*
+the flag before looking for a real edge, and a `PULSE_BLANKING` window discards
+the phantom pulse produced when the carousel restarts from a position parked a
+hair past an edge (especially when reversing direction).
+
+Two deliberate consequences:
+
+- The only sensor-related stop left is the jam guard, which fires on **elapsed
+  time with no pulse at all** — never on a sensor merely reading inactive.
+- An un-homed carousel can still move. Refusing meant a failed home (e.g. a
+  miswired index sensor) left the machine totally immobile, including the manual
+  Move buttons, so the motor could never be exercised to diagnose the fault
+  blocking it. Position is then relative and `homed` stays `false`.
+
+`test_motion_logic.py` locks this in without any hardware. It fakes a carousel
+parked *on* the sensor and asserts the motor is powered continuously — one power
+cycle, not one per pulse:
+
+```bash
+python3 test_motion_logic.py
+```
+
 ### "The app says it moved, but the carousel didn't"
 
 If GPIO cannot be initialised, the agent falls back to that same simulator. It

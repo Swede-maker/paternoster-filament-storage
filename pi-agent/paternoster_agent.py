@@ -52,6 +52,16 @@ MOVE_SPEED = 0.7      # 0..1 PWM duty during normal moves
 PULSE_TIMEOUT = 8.0   # seconds to wait for the next shelf pulse before faulting
 HOME_TIMEOUT = 30.0   # seconds to find the index sensor before faulting
 SENSOR_BOUNCE = 0.01  # debounce (s) for the inductive sensors
+# Max time to drive off the index flag when homing starts while already on it.
+# The motor runs throughout; this only bounds how long we watch for it to clear.
+INDEX_CLEAR_TIMEOUT = 10.0
+# The carousel always halts a hair PAST a sensor edge, so the shelf is still
+# near the window. Starting up again — especially in the opposite direction —
+# re-enters that window and fires a phantom pulse within a few milliseconds.
+# Pulses arriving this soon after the motor starts are therefore discarded.
+# The motor runs normally during this window: it filters counting, not power.
+# Keep it well under the real per-shelf travel time (~0.5s at MOVE_SPEED).
+PULSE_BLANKING = 0.15
 
 # Output type of the inductive proximity sensors. This decides which logic level
 # counts as "shelf detected", so getting it wrong makes the sensors look dead and
@@ -104,6 +114,42 @@ class RealHardware:
         self.shelf = DigitalInputDevice(PIN_SHELF_SENSOR, pull_up=pull_up, bounce_time=SENSOR_BOUNCE)
         self.index = DigitalInputDevice(PIN_INDEX_SENSOR, pull_up=pull_up, bounce_time=SENSOR_BOUNCE)
 
+        # ------------------------------------------------------------------
+        # Sensors are EDGE COUNTERS, never a power gate.
+        #
+        # This class used to answer "has a shelf passed?" with gpiozero's
+        # `wait_for_active()`, which returns instantly when the sensor is
+        # ALREADY active. A parked carousel sits with a shelf right in the
+        # sensor window, so every such call returned True immediately, the
+        # move loop burned through all its steps in microseconds, and the
+        # motor was switched off again before it could physically turn. The
+        # observable result was a motor that only twitched, and that appeared
+        # to run only while a sensor saw something.
+        #
+        # `when_activated` fires ONLY on a real inactive->active transition, so
+        # a sensor that is already covered contributes no count at all. Counts
+        # accumulate in the background completely independently of motor power:
+        # the motion code starts the motor, then consumes counts as they
+        # arrive. Sensor LEVEL never decides whether the motor is energised.
+        # ------------------------------------------------------------------
+        self._lock = threading.Lock()
+        self._shelf_pulses = 0
+        self._index_pulses = 0
+        self._shelf_tick = threading.Event()
+        self._index_tick = threading.Event()
+        self.shelf.when_activated = self._on_shelf
+        self.index.when_activated = self._on_index
+
+    def _on_shelf(self) -> None:
+        with self._lock:
+            self._shelf_pulses += 1
+        self._shelf_tick.set()
+
+    def _on_index(self) -> None:
+        with self._lock:
+            self._index_pulses += 1
+        self._index_tick.set()
+
     def forward(self, speed: float) -> None:
         self.enable.on()   # re-arm in case an estop left the bridge disabled
         self.motor.forward(speed)
@@ -119,13 +165,54 @@ class RealHardware:
         self.motor.stop()
         self.enable.off()
 
-    def wait_shelf_edge(self, timeout: float) -> bool:
-        # Rising edge = a shelf entered the window.
-        self.shelf.wait_for_inactive(timeout=0.001)
-        return bool(self.shelf.wait_for_active(timeout=timeout))
+    def reset_pulses(self) -> None:
+        """Drop stale counts. Call before a move; never touches motor power."""
+        with self._lock:
+            self._shelf_pulses = 0
+            self._index_pulses = 0
+        self._shelf_tick.clear()
+        self._index_tick.clear()
 
-    def wait_index_edge(self, timeout: float) -> bool:
-        return bool(self.index.wait_for_active(timeout=timeout))
+    def _take(self, kind: str, timeout: float) -> bool:
+        """
+        Consume one counted pulse, waiting up to `timeout` for one to arrive.
+        The counter is the source of truth and the Event is only a wake-up
+        hint, so a pulse landing between the check and the clear is still
+        counted rather than lost.
+        """
+        tick = self._shelf_tick if kind == "shelf" else self._index_tick
+        deadline = time.monotonic() + timeout
+        while True:
+            with self._lock:
+                if kind == "shelf" and self._shelf_pulses > 0:
+                    self._shelf_pulses -= 1
+                    return True
+                if kind == "index" and self._index_pulses > 0:
+                    self._index_pulses -= 1
+                    return True
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            tick.clear()
+            tick.wait(min(remaining, 0.05))
+
+    def take_shelf_pulse(self, timeout: float) -> bool:
+        return self._take("shelf", timeout)
+
+    def take_index_pulse(self, timeout: float) -> bool:
+        return self._take("index", timeout)
+
+    def index_clear(self, timeout: float) -> bool:
+        """
+        Block until the index window is EMPTY, leaving motor power untouched so
+        the carousel keeps driving off the flag while we watch.
+        """
+        deadline = time.monotonic() + timeout
+        while self.index.is_active:
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.005)
+        return True
 
     def index_active(self) -> bool:
         return bool(self.index.is_active)
@@ -155,8 +242,11 @@ class SimHardware:
         self._dir = 0             # -1, 0, +1
         self._speed = 0.0
         self._lock = threading.Lock()
-        self._shelf_edge = threading.Event()
-        self._index_edge = threading.Event()
+        # Mirrors RealHardware: counted edges, not levels.
+        self._shelf_pulses = 0
+        self._index_pulses = 0
+        self._shelf_tick = threading.Event()
+        self._index_tick = threading.Event()
         self._running = True
         self._t = threading.Thread(target=self._loop, daemon=True)
         self._t.start()
@@ -173,9 +263,11 @@ class SimHardware:
                     # ~1 shelf every (0.4 / speed) seconds.
                     self._pos += self._dir * dt * (self._speed / 0.4)
                     if int(before) != int(self._pos):
-                        self._shelf_edge.set()
-                    if int(before) != int(self._pos) and int(round(self._pos)) % self.shelves == 0:
-                        self._index_edge.set()
+                        self._shelf_pulses += 1
+                        self._shelf_tick.set()
+                        if int(round(self._pos)) % self.shelves == 0:
+                            self._index_pulses += 1
+                            self._index_tick.set()
             time.sleep(0.005)
 
     def forward(self, speed: float) -> None:
@@ -193,13 +285,43 @@ class SimHardware:
             self._dir = 0
             self._speed = 0.0
 
-    def wait_shelf_edge(self, timeout: float) -> bool:
-        self._shelf_edge.clear()
-        return self._shelf_edge.wait(timeout)
+    def reset_pulses(self) -> None:
+        with self._lock:
+            self._shelf_pulses = 0
+            self._index_pulses = 0
+        self._shelf_tick.clear()
+        self._index_tick.clear()
 
-    def wait_index_edge(self, timeout: float) -> bool:
-        self._index_edge.clear()
-        return self._index_edge.wait(timeout)
+    def _take(self, kind: str, timeout: float) -> bool:
+        tick = self._shelf_tick if kind == "shelf" else self._index_tick
+        deadline = time.monotonic() + timeout
+        while True:
+            with self._lock:
+                if kind == "shelf" and self._shelf_pulses > 0:
+                    self._shelf_pulses -= 1
+                    return True
+                if kind == "index" and self._index_pulses > 0:
+                    self._index_pulses -= 1
+                    return True
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            tick.clear()
+            tick.wait(min(remaining, 0.05))
+
+    def take_shelf_pulse(self, timeout: float) -> bool:
+        return self._take("shelf", timeout)
+
+    def take_index_pulse(self, timeout: float) -> bool:
+        return self._take("index", timeout)
+
+    def index_clear(self, timeout: float) -> bool:
+        deadline = time.monotonic() + timeout
+        while self.index_active():
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.005)
+        return True
 
     def index_active(self) -> bool:
         with self._lock:
@@ -285,11 +407,27 @@ class Carousel:
     def _do_home(self) -> None:
         self.status = "homing"
         self.emit(self.snapshot())
+
+        # Energise the motor FIRST and unconditionally. Motor power must never
+        # depend on what the sensors currently see.
+        self.hw.reset_pulses()
         if HOMING_DIRECTION == "down":
             self.hw.backward(HOMING_SPEED)
         else:
             self.hw.forward(HOMING_SPEED)
-        found = self.hw.wait_index_edge(HOME_TIMEOUT)
+
+        # Classic "already sitting on the switch" problem: if the carousel is
+        # parked with a shelf inside the index window, the flag is active before
+        # we even start. The old code asked "is index active?" and got an
+        # instant yes, so homing declared success after a few microseconds of
+        # motor time and the carousel never moved. Drive off the flag first —
+        # the motor stays powered the whole time — and only then look for the
+        # genuine inactive->active edge that actually means "home".
+        if self.hw.index_active():
+            self.hw.index_clear(INDEX_CLEAR_TIMEOUT)
+            self.hw.reset_pulses()  # ignore the edge produced by leaving the flag
+
+        found = self.hw.take_index_pulse(HOME_TIMEOUT)
         self.hw.stop()
         if self._abort.is_set():
             self.status = "idle"
@@ -304,10 +442,14 @@ class Carousel:
         self.emit({"type": "homed", "shelf": 0})
 
     def _do_goto(self, target: int) -> None:
-        if not self.homed:
-            self.emit({"type": "fault", "message": "Cannot move before homing"})
-            return
-        if target == self.current_shelf:
+        # An un-homed carousel is still allowed to move. Refusing here meant a
+        # failed home (e.g. a miswired index sensor) left the machine completely
+        # immobile, including the manual Move Up/Down buttons, so the motor
+        # could never be exercised to diagnose the very problem blocking it.
+        # Without a home reference the move is simply relative: we still count
+        # shelves, but `homed` stays False so the app knows the absolute
+        # position is not yet trustworthy.
+        if target == self.current_shelf and self.homed:
             self.emit({"type": "arrived", "shelf": target})
             return
 
@@ -322,6 +464,11 @@ class Carousel:
         else:
             direction, steps = "down", down_steps
 
+        # Drop stale counts, then energise the motor ONCE. It now runs
+        # continuously for the whole move: the loop below only *counts* shelves
+        # going past, and nothing in it consults a sensor level to decide
+        # whether the motor should be powered.
+        self.hw.reset_pulses()
         if direction == "up":
             self.hw.backward(MOVE_SPEED)
             step = -1
@@ -329,26 +476,45 @@ class Carousel:
             self.hw.forward(MOVE_SPEED)
             step = +1
 
-        for _ in range(steps):
+        # Let the carousel physically clear the edge it was parked on before we
+        # start counting. The motor is already running and stays running; this
+        # only throws away pulses that are too early to be real.
+        time.sleep(PULSE_BLANKING)
+        self.hw.reset_pulses()
+
+        counted = 0
+        while counted < steps:
             if self._abort.is_set():
                 self.hw.stop()
                 self.status = "idle"
                 return
-            if not self.hw.wait_shelf_edge(PULSE_TIMEOUT):
+            # The ONLY sensor-related stop left is this jam guard, and it fires
+            # on elapsed TIME with no pulse at all — never on a sensor simply
+            # reading inactive. A covered or uncovered sensor cannot cut power.
+            if not self.hw.take_shelf_pulse(PULSE_TIMEOUT):
                 self.hw.stop()
                 self.status = "idle"
                 self.emit({"type": "fault", "message": "Jam? No shelf pulse within timeout"})
                 return
+            counted += 1
             self.current_shelf = (self.current_shelf + step) % self.shelves
-            # Drift correction: if we passed the index while moving, trust it.
-            if self.current_shelf != 0 and self.hw.index_active():
+            # Drift correction from a counted index EDGE, never a level read.
+            # Reading the level here was the same mistake in a third place: just
+            # after homing the carousel is still physically sitting on the home
+            # flag, so the level was still active and the very first shelf pulse
+            # got "corrected" back to 0 — reporting 0,1,2 for a 3-shelf move.
+            # An edge only appears when the home flag genuinely passes by again.
+            # It also stays off un-homed, where a stuck-active sensor would
+            # otherwise pin the position to 0 forever.
+            if self.homed and self.hw.take_index_pulse(0.0):
                 self.current_shelf = 0
             self.emit({"type": "pos", "shelf": self.current_shelf})
 
         self.hw.stop()
         self.status = "idle"
-        self.current_shelf = target
-        self.emit({"type": "arrived", "shelf": target})
+        if self.homed:
+            self.current_shelf = target
+        self.emit({"type": "arrived", "shelf": self.current_shelf})
 
 
 # ==========================================================================

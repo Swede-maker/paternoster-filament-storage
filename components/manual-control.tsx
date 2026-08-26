@@ -22,7 +22,12 @@ export function ManualControl() {
   // have OPPOSITE causes — dropped packets or a wrong address vs. nothing
   // listening — so they must never look the same while diagnosing.
   const checking = node.driver === "hardware" && node.link === "checking"
-  const canJog = homed && idle && !offline
+  // Jogging is RELATIVE ("one shelf up/down"), so unlike absolute shelf
+  // navigation it does not need a home reference. Requiring `homed` here left a
+  // carousel with a failed home completely immobile from the UI — the operator
+  // could not nudge the motor to diagnose the very sensor fault that blocked
+  // homing. The agent allows relative moves un-homed; the UI must not veto them.
+  const canJog = idle && !offline
   const [calibrating, setCalibrating] = useState(false)
 
   // Speed controls only apply to a motorized carousel, not manual shelf storage.
