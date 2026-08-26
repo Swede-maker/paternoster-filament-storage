@@ -67,25 +67,39 @@ def step1_pin_factory():
             "sudo apt install -y python3-gpiozero python3-lgpio",
         )
 
-    # Reading the Pi model proves we can reach the GPIO chip, and tells us which
-    # board we are on. A Pi 5 uses a different GPIO controller than 1-4, and the
-    # old RPi.GPIO backend cannot drive it at all.
+    # The ONLY thing that decides pass/fail here is whether gpiozero can bring up
+    # a pin factory. Nothing cosmetic belongs in this try block: an earlier
+    # version printed gpiozero.__version__ here, that attribute does not exist on
+    # all builds, and the resulting AttributeError got caught below and reported
+    # as "cannot reach the GPIO chip" — a hard failure on a perfectly good Pi.
     try:
         Device.ensure_pin_factory()
         factory = type(Device.pin_factory).__name__
-        board = Device.pin_factory.board_info
-        print(f"  gpiozero  : {gpiozero.__version__}")
-        print(f"  pin factory: {factory}")
-        print(f"  board      : Pi {board.model} (rev {board.revision})", flush=True)
     except Exception as exc:
         fail(
-            f"cannot reach the GPIO chip: {exc}",
+            f"cannot reach the GPIO chip: {type(exc).__name__}: {exc}",
             "On a Pi 5 install the lgpio backend: sudo apt install -y python3-lgpio",
             "Then re-run with: GPIOZERO_PIN_FACTORY=lgpio python3 motor_test.py",
             "If you are not in the gpio group: sudo usermod -aG gpio $USER (then log out/in)",
         )
 
-    if "RPiGPIO" in factory and "5" in str(board.model):
+    # Everything below is diagnostic only, so each lookup is individually
+    # tolerant — missing version info must never fail the hardware test.
+    version = getattr(gpiozero, "__version__", "unknown")
+    print(f"  gpiozero   : {version}")
+    print(f"  pin factory: {factory}")
+
+    model = ""
+    try:
+        board = Device.pin_factory.board_info
+        model = str(board.model)
+        print(f"  board      : Pi {model} (rev {board.revision})", flush=True)
+    except Exception as exc:
+        print(f"  board      : unknown ({type(exc).__name__})", flush=True)
+
+    # A Pi 5 uses a different GPIO controller; the legacy RPi.GPIO backend cannot
+    # drive it. Only assert this when the model was actually readable.
+    if "RPiGPIO" in factory and model and "5" in model:
         fail(
             "this is a Pi 5 but gpiozero picked the RPi.GPIO backend, which cannot drive Pi 5 GPIO",
             "sudo apt install -y python3-lgpio",
@@ -101,17 +115,31 @@ def step2_claim_pins():
     print(f"  motor RPWM={PIN_MOTOR_RPWM}  LPWM={PIN_MOTOR_LPWM}  EN={PIN_MOTOR_EN}")
     print(f"  sensors shelf={PIN_SHELF_SENSOR}  index={PIN_INDEX_SENSOR}  type={SENSOR_TYPE}", flush=True)
 
+    # Track whatever we manage to claim, so a failure half-way through can release
+    # the rest. Without this, a partial claim leaves pins held by this process and
+    # the next run fails with a misleading "could not claim the pins".
+    claimed = []
     try:
         motor = Motor(forward=PIN_MOTOR_RPWM, backward=PIN_MOTOR_LPWM, pwm=True)
+        claimed.append(motor)
         enable = DigitalOutputDevice(PIN_MOTOR_EN, initial_value=False)
+        claimed.append(enable)
         pull_up = SENSOR_TYPE.upper() == "NPN"
         shelf = DigitalInputDevice(PIN_SHELF_SENSOR, pull_up=pull_up)
+        claimed.append(shelf)
         index = DigitalInputDevice(PIN_INDEX_SENSOR, pull_up=pull_up)
+        claimed.append(index)
     except Exception as exc:
+        for dev in claimed:
+            try:
+                dev.close()
+            except Exception:
+                pass
         fail(
-            f"could not claim the pins: {exc}",
+            f"could not claim the pins: {type(exc).__name__}: {exc}",
             "Is the agent still running and holding them? sudo systemctl stop paternoster-agent",
             "Another process (or a second copy of this script) may own the pins.",
+            f"A pin may be in use by another function (SPI/I2C) — check BCM {PIN_MOTOR_RPWM}/{PIN_MOTOR_LPWM}/{PIN_MOTOR_EN}.",
         )
 
     print("\n  ✓ All five pins claimed", flush=True)
@@ -168,6 +196,12 @@ def step4_motor(motor, enable):
         input("  Press Enter when ready (or Ctrl-C to abort)... ")
     except KeyboardInterrupt:
         print("\n  aborted", flush=True)
+        return
+    except EOFError:
+        # No terminal attached (e.g. output piped into `tee`). Never spin a motor
+        # nobody confirmed they were ready for.
+        print("\n  no terminal attached — skipping the motor burst for safety.")
+        print("  Run this directly in a shell to test the motor.", flush=True)
         return
 
     for label, run in (("FORWARD (down)", motor.forward), ("BACKWARD (up)", motor.backward)):
