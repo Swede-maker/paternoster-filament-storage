@@ -492,17 +492,18 @@ class Carousel:
         self.homed = False
         self.status = "idle"  # idle | moving | homing
 
-        # Direction the carousel last physically travelled ("up"/"down", None if
-        # it has not moved yet).
+        # Direction the carousel last PHYSICALLY turned ("up"/"down", None before
+        # it has ever moved). Maintained by `_energise`, which every motion path
+        # funnels through, so it tracks the mechanics rather than intentions.
         #
-        # This exists because the sensor is a LEVEL over a flag of real width,
-        # and the machine only begins braking AFTER the flag is detected — so a
-        # move routinely ends with the flag stopped just PAST the window. Set off
-        # again the same way and the next edge is genuinely the next shelf. But
-        # REVERSE, and the very first thing the sensor sees is the flag we are
-        # already parked at sliding back into the window. Counted blindly, that
-        # is the shelf we are on being counted as the next one along, so every
-        # change of direction lost a shelf and the display drifted one out.
+        # This exists because the sensor reports a LEVEL over a flag of real
+        # width, and braking only starts AFTER the flag is seen — so a move
+        # routinely ends with the flag just PAST the window. Set off again the
+        # same way and the next edge is a genuinely new shelf. Reverse, though,
+        # and the first thing the sensor sees is the flag we are already parked
+        # at sliding back in. Counted blindly, the shelf we are standing on gets
+        # counted as the next one along: ask to go back one and the carousel
+        # stops right where it started, convinced it has arrived.
         self._last_direction: Optional[str] = None
 
         # Live motion settings. The app pushes these with `config` whenever the
@@ -558,6 +559,26 @@ class Carousel:
     def _ramp_seconds(self) -> float:
         return (self.ramp_pct / 100.0) * MAX_RAMP_SECONDS
 
+    def _energise(self, direction: str, duty: float) -> None:
+        """
+        The ONE place the motor is ever given a direction, so that
+        `_last_direction` always describes the way the carousel physically last
+        turned.
+
+        Every path that moves the machine goes through here: the main move, the
+        soft start and stop, the homing sweep and the alignment crawl. That
+        matters because alignment creeps the OPPOSITE way to the move that
+        preceded it, so recording the direction only when a move was *requested*
+        described an intention rather than the mechanics. The flag's real
+        position relative to the sensor follows the mechanics, so a stale record
+        made the "did we just reverse?" test fire on exactly the wrong moves.
+        """
+        self._last_direction = direction
+        if direction == "up":
+            self.hw.backward(duty)
+        else:
+            self.hw.forward(duty)
+
     def _drive(self, direction: str, target: float, max_seconds: float | None = None) -> None:
         """
         Start the motor and ramp it up to `target` duty (soft start).
@@ -571,12 +592,11 @@ class Carousel:
         never actually reaches the requested duty — which made the speed slider
         feel completely dead on single-shelf hops.
         """
-        drive = self.hw.backward if direction == "up" else self.hw.forward
         ramp = self._ramp_seconds()
         if max_seconds is not None:
             ramp = min(ramp, max_seconds)
         if ramp <= 0 or target <= MIN_DUTY:
-            drive(target)
+            self._energise(direction, target)
             return
         steps = max(1, int(ramp / RAMP_STEP_SECONDS))
         for i in range(1, steps + 1):
@@ -584,7 +604,7 @@ class Carousel:
                 return
             # Start from MIN_DUTY rather than 0 so the carousel actually breaks
             # away instead of humming at a duty too low to turn it.
-            drive(MIN_DUTY + (target - MIN_DUTY) * (i / steps))
+            self._energise(direction, MIN_DUTY + (target - MIN_DUTY) * (i / steps))
             time.sleep(RAMP_STEP_SECONDS)
 
     def _decelerate(self, direction: str, current: float, max_seconds: float | None = None) -> None:
@@ -600,19 +620,17 @@ class Carousel:
         if ramp <= 0 or current <= MIN_DUTY:
             self.hw.stop()
             return
-        drive = self.hw.backward if direction == "up" else self.hw.forward
         steps = max(1, int(ramp / RAMP_STEP_SECONDS))
         for i in range(steps, 0, -1):
             if self._abort.is_set():
                 break
-            drive(MIN_DUTY + (current - MIN_DUTY) * (i / steps))
+            self._energise(direction, MIN_DUTY + (current - MIN_DUTY) * (i / steps))
             time.sleep(RAMP_STEP_SECONDS)
         self.hw.stop()
 
     def _creep_pulse(self, direction: str) -> None:
         """One bounded crawl step: drive briefly, then stop and let it settle."""
-        drive = self.hw.backward if direction == "up" else self.hw.forward
-        drive(CREEP_DUTY)
+        self._energise(direction, CREEP_DUTY)
         time.sleep(CREEP_PULSE_ON)
         self.hw.stop()
         time.sleep(CREEP_PULSE_OFF)
@@ -942,9 +960,6 @@ class Carousel:
 
         self.current_shelf = 0
         self.homed = True
-        # Homing is travel too, so the first move after it must know which way we
-        # came in — otherwise that move cannot tell whether it is reversing.
-        self._last_direction = home_direction
         self.status = "idle"
         self.emit({"type": "homed", "shelf": 0})
 
@@ -971,15 +986,13 @@ class Carousel:
         else:
             direction, steps = "down", down_steps
 
-        # Is this a change of direction? Only matters when the previous move
-        # coasted clear of its flag: reversing then drags that same flag back
-        # through the window, and counting it would skip a shelf.
+        # Are we about to turn back on ourselves? Compared against the way the
+        # carousel LAST PHYSICALLY TURNED (including the alignment crawl, which
+        # runs opposite to the move it follows), not against the last requested
+        # move. `_energise` keeps that record, and it is deliberately read here
+        # before this move touches the motor.
         reversing = (self._last_direction is not None
                      and direction != self._last_direction)
-        # Record it now, not on success: an aborted or faulted move still leaves
-        # the carousel physically pointing the way it was last travelling, and
-        # the next move has to reason about where the flag actually is.
-        self._last_direction = direction
 
         # Drop stale counts, then energise the motor ONCE. It now runs
         # continuously for the whole move: the loop below only *counts* shelves
@@ -1015,10 +1028,7 @@ class Carousel:
         # overshoot by nearly a full shelf. Detecting the departure at crawl
         # speed keeps it unambiguous.
         motor_start = time.monotonic()
-        if direction == "up":
-            self.hw.backward(MIN_DUTY)
-        else:
-            self.hw.forward(MIN_DUTY)
+        self._energise(direction, MIN_DUTY)
 
         if self.hw.shelf_active():
             if not self.hw.shelf_clear(SHELF_CLEAR_TIMEOUT):
@@ -1104,10 +1114,7 @@ class Carousel:
             # the target, instead of running at full speed into a hard stop.
             # Interpolated by ramp intensity: 0% keeps full speed to the end.
             if counted == steps - 1 and steps > 1 and approach < speed:
-                if direction == "up":
-                    self.hw.backward(approach)
-                else:
-                    self.hw.forward(approach)
+                self._energise(direction, approach)
                 speed = approach
             self.current_shelf = (self.current_shelf + step) % self.shelves
             # Drift correction from a counted index EDGE, never a level read.
