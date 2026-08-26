@@ -55,6 +55,12 @@ MOVE_SPEED = 0.45     # 0..1 PWM duty during normal moves
 # A BTS7960 with a geared carousel will not break stiction much below this duty;
 # it just buzzes and heats. Speed requests are clamped up to this floor.
 MIN_DUTY = 0.25
+# Floor for an OPERATOR-supplied duty from the app's PWM slider. Much lower than
+# MIN_DUTY on purpose: MIN_DUTY protects the agent's own crawls, where a stalled
+# motor would break shelf counting, but clamping the slider to it silently
+# discarded any lower request and made the control appear dead. Stiction varies
+# per machine, so the operator is trusted to find the usable range.
+SLIDER_MIN_DUTY = 0.05
 # Soft start/stop: seconds spent ramping at 100% ramp intensity. The ramp is
 # applied in small PWM steps while the motor is already powered.
 MAX_RAMP_SECONDS = 1.2
@@ -235,22 +241,17 @@ class RealHardware:
         self.shelf.when_activated = self._on_shelf
         self.index.when_activated = self._on_index
 
-        # ------------------------------------------------------------------
-        # Which SIDE of the sensor is the parked flag on?
+        # Which way the motor is turning right now, and which way it was turning
+        # at the moment the shelf flag LEFT the sensor window.
         #
-        # That, not "which way did the motor last turn", is what decides whether
-        # the next move will drag the flag we are already parked against back
-        # through the window. The two are not the same: after a move the
-        # alignment crawl creeps the OPPOSITE way, and homing aligns on the
-        # INDEX flag, which says nothing about where the shelf flag came to
-        # rest. Tracking motor direction therefore mis-answered the question on
-        # exactly the moves that follow a home.
-        #
-        # `when_deactivated` fires when the flag physically LEAVES the window,
-        # which is the moment — and the only moment — that fixes which side it
-        # is now on. Recording the direction of travel there is true regardless
-        # of which code path was driving.
-        # ------------------------------------------------------------------
+        # The second is the only reliable answer to "which side of the sensor is
+        # the flag parked on", and that is what decides whether the next move
+        # will drag it back through. It has to be MEASURED, not inferred from the
+        # move direction: depending on how hard the machine brakes, a move can
+        # end just PAST the flag (heavy carousel coasts through) or just BEFORE it
+        # (the alignment crawl backs out the near side). Those are opposite sides
+        # from the same move direction, so assuming either one is wrong half the
+        # time. The falling edge is what actually happened.
         self.travel_direction: Optional[str] = None
         self.flag_exit_direction: Optional[str] = None
         self.shelf.when_deactivated = self._on_shelf_exit
@@ -388,9 +389,8 @@ class SimHardware:
         # Position 0.0 is a shelf in place, so the window starts ACTIVE. Seeding
         # this True is what stops a phantom pulse being reported at startup.
         self._shelf_was_active = True
-        # Mirrors RealHardware's when_deactivated bookkeeping: which way the
-        # carousel is turning, and which way it turned as the flag last left the
-        # window.
+        # Mirrors RealHardware: current travel, and the travel at the flag's last
+        # departure from the sensor window.
         self.travel_direction: Optional[str] = None
         self.flag_exit_direction: Optional[str] = None
         self._running = True
@@ -429,8 +429,8 @@ class SimHardware:
                         self._index_pulses += 1
                         self._index_tick.set()
                 elif self._shelf_was_active and not active:
-                    # Falling edge: the flag has just left the window, so the
-                    # current direction of travel is the side it is now parked on.
+                    # Falling edge: the flag has just cleared the window, so the
+                    # current travel fixes which side it now rests on.
                     if self.travel_direction is not None:
                         self.flag_exit_direction = self.travel_direction
                 self._shelf_was_active = active
@@ -526,14 +526,11 @@ class Carousel:
         self.homed = False
         self.status = "idle"  # idle | moving | homing
 
-        # NOTE: which side of the sensor the parked shelf flag sits on lives in
-        # the hardware layer as `hw.flag_exit_direction`, recorded on the flag's
-        # falling edge. It is NOT tracked here as "last direction moved": the
-        # sensor reports a LEVEL over a flag of real width and braking only
-        # starts AFTER the flag is seen, so a move ends with the flag just PAST
-        # the window — and both the alignment crawl and the homing sweep then
-        # turn the motor the other way without moving the shelf flag back
-        # across. Only the flag's own departure edge fixes which side it is on.
+        # NOTE: which side of the sensor the parked shelf flag sits on is NOT
+        # tracked here. It lives in the hardware layer as `hw.flag_exit_direction`
+        # and is measured on the flag's falling edge, because how hard the machine
+        # brakes decides whether a move ends just past the flag or just before it
+        # — opposite sides from the same move direction.
 
         # Live motion settings. The app pushes these with `config` whenever the
         # speed or soft-start slider moves, so they must be INSTANCE state, not
@@ -568,14 +565,20 @@ class Carousel:
         """
         Apply speed / soft-start settings from the app's sliders.
 
-        Duties are clamped to [MIN_DUTY, 1.0]: below MIN_DUTY a geared carousel
-        will not overcome stiction and the motor only buzzes, which would look
-        exactly like "the slider broke the machine".
+        Clamped to [SLIDER_MIN_DUTY, 1.0], NOT to MIN_DUTY.
+
+        MIN_DUTY (25%) is the floor for the agent's own internal crawls, where a
+        stalled motor would break the counting logic. Applying it here silently
+        raised any lower setting back to 25%, so dragging the PWM slider below
+        that did nothing at all — the operator cannot tune out coasting with a
+        control that ignores them. Every carousel has a different stiction point,
+        so the floor is deliberately low and finding the usable range is the point
+        of the slider. If the motor only buzzes, the setting is too low: raise it.
         """
         if move_speed is not None:
-            self.move_speed = max(MIN_DUTY, min(1.0, float(move_speed)))
+            self.move_speed = max(SLIDER_MIN_DUTY, min(1.0, float(move_speed)))
         if homing_speed is not None:
-            self.homing_speed = max(MIN_DUTY, min(1.0, float(homing_speed)))
+            self.homing_speed = max(SLIDER_MIN_DUTY, min(1.0, float(homing_speed)))
         if ramp_pct is not None:
             self.ramp_pct = max(0, min(100, int(ramp_pct)))
         print(
@@ -590,15 +593,14 @@ class Carousel:
 
     def _energise(self, direction: str, duty: float) -> None:
         """
-        The ONE place the motor is ever given a direction, so the hardware layer
-        always knows which way the carousel is currently turning.
+        The ONE place the motor is ever given a direction.
 
-        Every path that moves the machine goes through here: the main move, the
-        soft start and stop, the homing sweep and the alignment crawl. The
-        hardware layer needs this only to timestamp the flag's DEPARTURE from the
-        sensor window; the direction itself is deliberately not used as a
-        stand-in for the flag's resting side, because the crawl and the homing
-        sweep both leave it pointing the wrong way.
+        Publishes the current travel to the hardware layer, which uses it to
+        timestamp the shelf flag's DEPARTURE from the sensor. Every path that
+        moves the machine goes through here — the main move, the soft start and
+        stop, the homing sweep and the alignment crawl — so whichever of them was
+        last to carry the flag out of the window is the one recorded, which is
+        exactly what the next move needs to know.
         """
         self.hw.travel_direction = direction
         if direction == "up":
@@ -622,16 +624,24 @@ class Carousel:
         ramp = self._ramp_seconds()
         if max_seconds is not None:
             ramp = min(ramp, max_seconds)
-        if ramp <= 0 or target <= MIN_DUTY:
+        # Only skip the ramp when there is no ramp. The old `target <= MIN_DUTY`
+        # guard meant every low-duty move jumped straight to full requested duty
+        # with no soft start, which is the harshest possible start on exactly the
+        # slow, carefully-tuned moves that need gentleness most.
+        if ramp <= 0:
             self._energise(direction, target)
             return
         steps = max(1, int(ramp / RAMP_STEP_SECONDS))
+        # Start from MIN_DUTY so the carousel breaks away instead of humming at a
+        # duty too low to turn it — but never ABOVE the duty asked for. Hardcoding
+        # MIN_DUTY here meant a 12% request was driven at 25%: the operator's PWM
+        # setting was silently doubled, the carousel arrived far too fast to stop
+        # on the flag, and dragging the slider down did nothing at all.
+        floor = min(MIN_DUTY, target)
         for i in range(1, steps + 1):
             if self._abort.is_set():
                 return
-            # Start from MIN_DUTY rather than 0 so the carousel actually breaks
-            # away instead of humming at a duty too low to turn it.
-            self._energise(direction, MIN_DUTY + (target - MIN_DUTY) * (i / steps))
+            self._energise(direction, floor + (target - floor) * (i / steps))
             time.sleep(RAMP_STEP_SECONDS)
 
     def _decelerate(self, direction: str, current: float, max_seconds: float | None = None) -> None:
@@ -644,14 +654,18 @@ class Carousel:
         ramp = self._ramp_seconds()
         if max_seconds is not None:
             ramp = min(ramp, max_seconds)
-        if ramp <= 0 or current <= MIN_DUTY:
+        if ramp <= 0:
             self.hw.stop()
             return
         steps = max(1, int(ramp / RAMP_STEP_SECONDS))
+        # Same floor clamp as the acceleration ramp: easing "down" from a
+        # hardcoded MIN_DUTY would RAISE the duty when the operator has set a
+        # lower one, braking the carousel by speeding it up.
+        floor = min(MIN_DUTY, current)
         for i in range(steps, 0, -1):
             if self._abort.is_set():
                 break
-            self._energise(direction, MIN_DUTY + (current - MIN_DUTY) * (i / steps))
+            self._energise(direction, floor + (current - floor) * (i / steps))
             time.sleep(RAMP_STEP_SECONDS)
         self.hw.stop()
 
@@ -751,12 +765,13 @@ class Carousel:
                 # several times.
                 #
                 # What matters is that we KNOW WHERE WE ARE, and we do: the flag
-                # was just seen, and we have stopped a short, bounded distance
-                # past it on the side we were travelling. `hw.flag_exit_direction`
-                # records that side on the falling edge, so the next move knows
-                # this flag will come back through the window and does not count
-                # it as a new shelf. Position is established by the CROSSING, not
-                # by residency.
+                # was just seen and we stopped a short, bounded distance past it.
+                # Position is established by the CROSSING, not by residency.
+                #
+                # Deliberately does NOT touch the skip-a-trigger state. The crawl
+                # only ever nudges within a fraction of a shelf, so it never
+                # changes WHICH flag we are next to — and it runs opposite to the
+                # move, so recording it here inverted the next move's decision.
                 if edges <= SETTLE_MAX_EDGES:
                     return True, edges
                 # Strayed too far to know which flag that was. Keep crawling; the
@@ -1034,17 +1049,21 @@ class Carousel:
         else:
             direction, steps = "down", down_steps
 
-        # Is the flag we are parked against about to be dragged back through the
-        # sensor? It will be if this move runs OPPOSITE to the way the flag was
-        # travelling when it last left the window.
+        # THE RULE: if this move runs the opposite way to the travel that last
+        # carried the flag OUT of the sensor, that flag is about to slide back
+        # through the window. It is the shelf we are already standing on, so its
+        # trigger is skipped rather than counted.
         #
-        # This is asked of the flag's recorded exit side, NOT of the last motor
-        # direction. After a home the two disagree: the sweep carries the shelf
-        # flag out past the sensor, then alignment crawls back the other way to
-        # sit on the INDEX flag, so the motor's last direction is the reverse of
-        # the shelf flag's exit. Testing motor direction therefore concluded
-        # "not reversing" on the very next move and counted the shelf we were
-        # standing on as the one we asked for.
+        # Measured at the falling edge rather than taken from the previous move,
+        # because the two disagree: a heavy carousel coasts THROUGH the flag and
+        # rests past it, while a well-braked one is backed out the near side by the
+        # alignment crawl. Same move direction, opposite resting sides. Comparing
+        # against the actual departure is correct for both.
+        #
+        # If the sensor is still active right now this does not apply at all — the
+        # flag never left, so there is no re-entry to skip. That is handled by the
+        # `shelf_active()` branch below, which just drives the flag out and counts
+        # from there.
         reversing = (self.hw.flag_exit_direction is not None
                      and direction != self.hw.flag_exit_direction)
 
@@ -1060,9 +1079,15 @@ class Carousel:
 
         # Gentle duty for the last shelf of travel, so the carousel is already
         # crawling when it reaches the target instead of slamming into a stop.
+        # Eased toward `floor`, never away from it. Using MIN_DUTY as the floor
+        # broke down once the operator's PWM slider could go below it: `speed -
+        # MIN_DUTY` went NEGATIVE and the "gentle" approach came out FASTER than
+        # the requested speed, so dialling the slider down sped the carousel up
+        # into the target. Clamping the floor to `speed` keeps easing monotonic.
         approach = speed
         if self.ramp_pct > 0:
-            approach = speed - (speed - MIN_DUTY) * (self.ramp_pct / 100.0)
+            floor = min(MIN_DUTY, speed)
+            approach = speed - (speed - floor) * (self.ramp_pct / 100.0)
 
         # A single-shelf hop IS its own final shelf: there is no room to cruise
         # fast and then slow down, and running one shelf at full speed guaranteed
@@ -1081,8 +1106,12 @@ class Carousel:
         # afterwards would then discard pulses for shelves already travelled and
         # overshoot by nearly a full shelf. Detecting the departure at crawl
         # speed keeps it unambiguous.
+        # Never faster than the duty asked for. This is the last place a
+        # hardcoded MIN_DUTY silently overrode the operator: every move opened
+        # with a 25% kick, so a 12% PWM setting still started at 25% and the
+        # slider's whole lower half did nothing.
         motor_start = time.monotonic()
-        self._energise(direction, MIN_DUTY)
+        self._energise(direction, min(MIN_DUTY, speed))
 
         if self.hw.shelf_active():
             if not self.hw.shelf_clear(SHELF_CLEAR_TIMEOUT):
