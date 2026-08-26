@@ -235,6 +235,30 @@ class RealHardware:
         self.shelf.when_activated = self._on_shelf
         self.index.when_activated = self._on_index
 
+        # ------------------------------------------------------------------
+        # Which SIDE of the sensor is the parked flag on?
+        #
+        # That, not "which way did the motor last turn", is what decides whether
+        # the next move will drag the flag we are already parked against back
+        # through the window. The two are not the same: after a move the
+        # alignment crawl creeps the OPPOSITE way, and homing aligns on the
+        # INDEX flag, which says nothing about where the shelf flag came to
+        # rest. Tracking motor direction therefore mis-answered the question on
+        # exactly the moves that follow a home.
+        #
+        # `when_deactivated` fires when the flag physically LEAVES the window,
+        # which is the moment — and the only moment — that fixes which side it
+        # is now on. Recording the direction of travel there is true regardless
+        # of which code path was driving.
+        # ------------------------------------------------------------------
+        self.travel_direction: Optional[str] = None
+        self.flag_exit_direction: Optional[str] = None
+        self.shelf.when_deactivated = self._on_shelf_exit
+
+    def _on_shelf_exit(self) -> None:
+        if self.travel_direction is not None:
+            self.flag_exit_direction = self.travel_direction
+
     def _on_shelf(self) -> None:
         with self._lock:
             self._shelf_pulses += 1
@@ -364,6 +388,11 @@ class SimHardware:
         # Position 0.0 is a shelf in place, so the window starts ACTIVE. Seeding
         # this True is what stops a phantom pulse being reported at startup.
         self._shelf_was_active = True
+        # Mirrors RealHardware's when_deactivated bookkeeping: which way the
+        # carousel is turning, and which way it turned as the flag last left the
+        # window.
+        self.travel_direction: Optional[str] = None
+        self.flag_exit_direction: Optional[str] = None
         self._running = True
         self._t = threading.Thread(target=self._loop, daemon=True)
         self._t.start()
@@ -399,6 +428,11 @@ class SimHardware:
                     if self._index_window_active():
                         self._index_pulses += 1
                         self._index_tick.set()
+                elif self._shelf_was_active and not active:
+                    # Falling edge: the flag has just left the window, so the
+                    # current direction of travel is the side it is now parked on.
+                    if self.travel_direction is not None:
+                        self.flag_exit_direction = self.travel_direction
                 self._shelf_was_active = active
             time.sleep(0.005)
 
@@ -492,19 +526,14 @@ class Carousel:
         self.homed = False
         self.status = "idle"  # idle | moving | homing
 
-        # Direction the carousel last PHYSICALLY turned ("up"/"down", None before
-        # it has ever moved). Maintained by `_energise`, which every motion path
-        # funnels through, so it tracks the mechanics rather than intentions.
-        #
-        # This exists because the sensor reports a LEVEL over a flag of real
-        # width, and braking only starts AFTER the flag is seen — so a move
-        # routinely ends with the flag just PAST the window. Set off again the
-        # same way and the next edge is a genuinely new shelf. Reverse, though,
-        # and the first thing the sensor sees is the flag we are already parked
-        # at sliding back in. Counted blindly, the shelf we are standing on gets
-        # counted as the next one along: ask to go back one and the carousel
-        # stops right where it started, convinced it has arrived.
-        self._last_direction: Optional[str] = None
+        # NOTE: which side of the sensor the parked shelf flag sits on lives in
+        # the hardware layer as `hw.flag_exit_direction`, recorded on the flag's
+        # falling edge. It is NOT tracked here as "last direction moved": the
+        # sensor reports a LEVEL over a flag of real width and braking only
+        # starts AFTER the flag is seen, so a move ends with the flag just PAST
+        # the window — and both the alignment crawl and the homing sweep then
+        # turn the motor the other way without moving the shelf flag back
+        # across. Only the flag's own departure edge fixes which side it is on.
 
         # Live motion settings. The app pushes these with `config` whenever the
         # speed or soft-start slider moves, so they must be INSTANCE state, not
@@ -561,19 +590,17 @@ class Carousel:
 
     def _energise(self, direction: str, duty: float) -> None:
         """
-        The ONE place the motor is ever given a direction, so that
-        `_last_direction` always describes the way the carousel physically last
-        turned.
+        The ONE place the motor is ever given a direction, so the hardware layer
+        always knows which way the carousel is currently turning.
 
         Every path that moves the machine goes through here: the main move, the
-        soft start and stop, the homing sweep and the alignment crawl. That
-        matters because alignment creeps the OPPOSITE way to the move that
-        preceded it, so recording the direction only when a move was *requested*
-        described an intention rather than the mechanics. The flag's real
-        position relative to the sensor follows the mechanics, so a stale record
-        made the "did we just reverse?" test fire on exactly the wrong moves.
+        soft start and stop, the homing sweep and the alignment crawl. The
+        hardware layer needs this only to timestamp the flag's DEPARTURE from the
+        sensor window; the direction itself is deliberately not used as a
+        stand-in for the flag's resting side, because the crawl and the homing
+        sweep both leave it pointing the wrong way.
         """
-        self._last_direction = direction
+        self.hw.travel_direction = direction
         if direction == "up":
             self.hw.backward(duty)
         else:
@@ -710,9 +737,30 @@ class Carousel:
                 edges += self._drain_shelf_edges()
                 if parked:
                     return edges <= SETTLE_MAX_EDGES, edges
-                # Coasted straight past the window. Fall through and keep
-                # crawling: the timeout and the caller's bounded retry decide
-                # when to give up, so this cannot spin forever.
+                # Coasted out the far side of the window.
+                #
+                # This is still a SUCCESS, and insisting otherwise is what made
+                # homing impossible. The sensor window is narrower than the
+                # carousel's own stopping distance, so "come to rest INSIDE the
+                # window" is a condition the mechanism cannot meet at all: every
+                # creep pulse that reaches the flag also carries past it. The old
+                # code read that as failure and crawled again, alternating sides,
+                # hunting back and forth across the sensor until the attempt
+                # budget ran out and homing gave up with "home sensor not
+                # triggered" — while the flag had in fact crossed the sensor
+                # several times.
+                #
+                # What matters is that we KNOW WHERE WE ARE, and we do: the flag
+                # was just seen, and we have stopped a short, bounded distance
+                # past it on the side we were travelling. `hw.flag_exit_direction`
+                # records that side on the falling edge, so the next move knows
+                # this flag will come back through the window and does not count
+                # it as a new shelf. Position is established by the CROSSING, not
+                # by residency.
+                if edges <= SETTLE_MAX_EDGES:
+                    return True, edges
+                # Strayed too far to know which flag that was. Keep crawling; the
+                # timeout and the caller's bounded retry decide when to give up.
             self._creep_pulse(direction)
             pulses += 1
         self.hw.stop()
@@ -986,13 +1034,19 @@ class Carousel:
         else:
             direction, steps = "down", down_steps
 
-        # Are we about to turn back on ourselves? Compared against the way the
-        # carousel LAST PHYSICALLY TURNED (including the alignment crawl, which
-        # runs opposite to the move it follows), not against the last requested
-        # move. `_energise` keeps that record, and it is deliberately read here
-        # before this move touches the motor.
-        reversing = (self._last_direction is not None
-                     and direction != self._last_direction)
+        # Is the flag we are parked against about to be dragged back through the
+        # sensor? It will be if this move runs OPPOSITE to the way the flag was
+        # travelling when it last left the window.
+        #
+        # This is asked of the flag's recorded exit side, NOT of the last motor
+        # direction. After a home the two disagree: the sweep carries the shelf
+        # flag out past the sensor, then alignment crawls back the other way to
+        # sit on the INDEX flag, so the motor's last direction is the reverse of
+        # the shelf flag's exit. Testing motor direction therefore concluded
+        # "not reversing" on the very next move and counted the shelf we were
+        # standing on as the one we asked for.
+        reversing = (self.hw.flag_exit_direction is not None
+                     and direction != self.hw.flag_exit_direction)
 
         # Drop stale counts, then energise the motor ONCE. It now runs
         # continuously for the whole move: the loop below only *counts* shelves

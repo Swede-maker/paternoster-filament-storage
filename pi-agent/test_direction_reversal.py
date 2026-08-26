@@ -38,7 +38,13 @@ import time
 sys.path.insert(0, "/vercel/share/v0-project/pi-agent")
 import paternoster_agent as pa
 
-HALF = pa.SIM_SENSOR_HALF_WIDTH
+# Half-width of the sensor window, in shelves. Deliberately NOT the simulator's
+# own constant: that is set wide (0.18 shelves ~ 90mm on a 500mm pitch), wide
+# enough that a stop which overshoots by a few centimetres still lands INSIDE the
+# window. The carousel then always parks on the flag and the reversal fault is
+# unreachable — the bug cannot be reproduced at all. 0.03 is ~15mm, which is the
+# order of a real inductive sensor's sensing zone.
+HALF = 0.03
 
 PASS = "PASS"
 FAIL = "FAIL"
@@ -73,6 +79,12 @@ class ReversalHW:
         self._tick = threading.Event()
         self._itick = threading.Event()
         self._was_active = self._window(start_pos)
+        # Mirrors the agent's hardware layer: which way the carousel is turning
+        # right now, and which way it was turning when the flag last LEFT the
+        # window. The second is what tells the agent which SIDE of the sensor the
+        # flag it is parked against is on.
+        self.travel_direction = None
+        self.flag_exit_direction = None
         self._alive = True
         threading.Thread(target=self._spin, daemon=True).start()
 
@@ -96,12 +108,21 @@ class ReversalHW:
                         self.vel -= drop if self.vel > 0 else -drop
                 self.pos += self.vel * dt
                 active = self._window(self.pos)
-                if active != self._was_active:
+                # RISING edges only, as gpiozero's `when_activated` does. Counting
+                # both edges was a flaw in this harness: it handed the agent two
+                # pulses per shelf, so a test could pass on the strength of the
+                # extra edge and hide a real miscount.
+                if active and not self._was_active:
                     self._shelf_pulses += 1
                     self._tick.set()
                     if int(round(self.pos)) % self.shelves == 0:
                         self._index_pulses += 1
                         self._itick.set()
+                elif self._was_active and not active:
+                    # Falling edge: the flag has just left the window, so the
+                    # direction of travel now fixes which side it rests on.
+                    if self.travel_direction is not None:
+                        self.flag_exit_direction = self.travel_direction
                 self._was_active = active
             time.sleep(0.002)
 
@@ -181,15 +202,29 @@ class ReversalHW:
 
 
 def make(hw, shelf, last_dir, shelves=9):
-    """Build a Carousel that believes it is parked at `shelf`, having last
-    travelled `last_dir`."""
+    """Build a Carousel that believes it is parked at `shelf`, with the flag it
+    is parked against having left the sensor travelling `last_dir`."""
     events = []
     car = pa.Carousel(hw, shelves=shelves, emit=events.append)
     car.homed = True
     car.current_shelf = shelf
-    car._last_direction = last_dir
+    # The flag's exit side lives in the hardware layer, recorded on the falling
+    # edge — NOT as "the last direction the motor turned", which the alignment
+    # crawl and the homing sweep both leave pointing the wrong way.
+    hw.flag_exit_direction = last_dir
     car.set_motion(move_speed=0.45, ramp_pct=40)
     return car, events
+
+
+def wait_idle(car, timeout=45.0):
+    """Block until the carousel has been idle for a moment (settling included)."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if car.status == "idle":
+            time.sleep(0.35)
+            if car.status == "idle":
+                return
+        time.sleep(0.05)
 
 
 def goto(car, target, timeout=45.0):
@@ -230,7 +265,15 @@ def main():
           % (physical(hw), hw.pos, car.current_shelf))
     check("reversal does not lose a shelf", agrees(hw, car),
           "physical=%d reported=%d" % (physical(hw), car.current_shelf))
-    check("stopped on a flag", hw.shelf_active(), "pos %.3f" % hw.pos)
+    # NOT "did it come to rest inside the sensor window". The window is narrower
+    # than the carousel's stopping distance, so that is a condition the machine
+    # can never meet: every creep pulse that reaches the flag also carries past
+    # it. Asserting it demanded the impossible and hid the real requirement,
+    # which is that the stop be a bounded distance from the CORRECT flag.
+    check("stopped close to the target flag",
+          abs(hw.pos - round(hw.pos)) < 0.25,
+          "pos %.3f is %.3f shelves off the flag"
+          % (hw.pos, abs(hw.pos - round(hw.pos))))
     car.shutdown(); hw.cleanup()
 
     # ======================================================================
@@ -279,7 +322,42 @@ def main():
     # ======================================================================
     print()
     print("=" * 68)
-    print("4. NPN SENSOR POLARITY (active-LOW)")
+    print("4. THE FIRST MOVE AFTER HOMING")
+    print("=" * 68)
+    print("Homing sweeps the shelf flag out past the sensor, then the alignment")
+    print("crawl creeps back the OTHER way to sit on the index flag. The motor's")
+    print("last direction is therefore the reverse of the shelf flag's exit, so")
+    print("judging the reversal by motor direction gets this move wrong: the")
+    print("flag slides back in and is counted as the shelf that was asked for,")
+    print("leaving the carousel where it started.")
+    print()
+
+    hw = ReversalHW(start_pos=3.4)
+    events = []
+    car = pa.Carousel(hw, shelves=9, emit=events.append)
+    car.set_motion(move_speed=0.45, ramp_pct=40)
+    car.request_home()
+    wait_idle(car, timeout=90.0)
+    print("   after home: physical shelf %d (pos %.3f), reports %d, homed=%s"
+          % (physical(hw), hw.pos, car.current_shelf, car.homed))
+    home_pos = hw.pos
+    check("homed onto the index flag", car.homed, "pos %.3f" % hw.pos)
+
+    goto(car, 1)
+    time.sleep(0.4)
+    print("   then goto 1: physical shelf %d (pos %.3f), reports %d"
+          % (physical(hw), hw.pos, car.current_shelf))
+    check("first move after homing actually travels a shelf",
+          abs(hw.pos - home_pos) > 0.5,
+          "travelled %.3f shelves" % abs(hw.pos - home_pos))
+    check("first move after homing lands on the right shelf", agrees(hw, car),
+          "physical=%d reported=%d" % (physical(hw), car.current_shelf))
+    car.shutdown(); hw.cleanup()
+
+    # ======================================================================
+    print()
+    print("=" * 68)
+    print("5. NPN SENSOR POLARITY (active-LOW)")
     print("=" * 68)
     print("An NPN sensor sinks its output to GND when a shelf is present, so")
     print("the pin must be pulled UP and LOW must read as 'shelf detected'.")

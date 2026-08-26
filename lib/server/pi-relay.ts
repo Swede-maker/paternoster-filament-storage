@@ -176,6 +176,78 @@ function stopHeartbeat(relay: Relay) {
   }
 }
 
+/**
+ * Keep `lastState` describing where the carousel IS, not where it happened to be
+ * the last time the agent volunteered a full snapshot.
+ *
+ * This cache is what a newly subscribing browser is replayed. The relay's socket
+ * to the Pi OUTLIVES a browser refresh, so a reloaded tab does NOT get a fresh
+ * snapshot from the agent — the replay is all it has. The agent only emits
+ * `state` on connect and at the START of a move, and reports arrivals as
+ * `arrived`/`pos`/`homed`, so caching `state` frames alone left the replay
+ * frozen at connect time (shelf 0, un-homed). A refresh then snapped the display
+ * back to shelf 1 while the carousel stood somewhere else, and the next move was
+ * computed from that phantom position — which is why picking the shelf the
+ * machine was already on did nothing at all.
+ *
+ * Folding the position frames into the cache keeps the replay truthful. `homed`
+ * is only ever set by frames that genuinely establish a reference, never
+ * inferred from a bare `pos`, so an un-homed agent still cannot overwrite the
+ * browser's persisted position with a guess.
+ */
+function rememberState(relay: Relay, text: string): void {
+  let ev: { type?: string; status?: string; shelf?: number; homed?: boolean }
+  try {
+    ev = JSON.parse(text)
+  } catch {
+    return // not JSON (or a partial frame) — nothing to learn from it
+  }
+  if (!ev || typeof ev !== "object") return
+
+  let prev: { status?: string; shelf?: number; homed?: boolean } | null = null
+  if (relay.lastState) {
+    try {
+      prev = JSON.parse(relay.lastState)
+    } catch {
+      prev = null
+    }
+  }
+
+  const snap = {
+    type: "state",
+    status: prev?.status ?? "idle",
+    shelf: typeof prev?.shelf === "number" ? prev.shelf : 0,
+    homed: prev?.homed === true,
+  }
+
+  switch (ev.type) {
+    case "state":
+      // The agent's own summary is authoritative for every field.
+      if (typeof ev.status === "string") snap.status = ev.status
+      if (typeof ev.shelf === "number") snap.shelf = ev.shelf
+      snap.homed = ev.homed === true
+      break
+    case "pos":
+      // A counted sensor crossing mid-move: position only.
+      if (typeof ev.shelf !== "number") return
+      snap.shelf = ev.shelf
+      break
+    case "arrived":
+      if (typeof ev.shelf === "number") snap.shelf = ev.shelf
+      snap.status = "idle"
+      break
+    case "homed":
+      if (typeof ev.shelf === "number") snap.shelf = ev.shelf
+      snap.homed = true
+      snap.status = "idle"
+      break
+    default:
+      return // hello/fault/etc. carry no position
+  }
+
+  relay.lastState = JSON.stringify(snap)
+}
+
 function startHeartbeat(relay: Relay) {
   stopHeartbeat(relay)
   relay.heartbeat = setInterval(() => {
@@ -249,8 +321,7 @@ function openSocket(relay: Relay) {
     relay.lastRx = Date.now()
     relay.pingSentAt = null
     const text = data.toString()
-    // Cache the latest full-state snapshot for fast sync of new subscribers.
-    if (text.includes('"state"')) relay.lastState = text
+    rememberState(relay, text)
     broadcast(relay, { kind: "event", data: text })
   })
 
