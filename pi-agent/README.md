@@ -96,9 +96,11 @@ signal line to keep inductive noise from causing phantom shelf pulses.
   each pulse and an `arrived` event when it stops. A missing pulse within
   `PULSE_TIMEOUT` reports a `fault` (jam / sensor failure) and stops the motor.
 
-Tune `HOMING_SPEED`, `MOVE_SPEED`, and the timeouts at the top of the script.
-If the carousel moves the opposite way from the app's up/down labels, flip
-`HOMING_DIRECTION`.
+Speed and soft start are set from the **app's sliders** at runtime, not by editing
+the script — `HOMING_SPEED` and `MOVE_SPEED` are only the values used before the
+app first sends a `config` (see the `config` section below). Edit the timeouts and
+`MIN_DUTY` in the script if needed. If the carousel moves the opposite way from
+the app's up/down labels, flip `HOMING_DIRECTION`.
 
 ## Install & run on the Pi
 
@@ -241,6 +243,53 @@ cycle, not one per pulse:
 
 ```bash
 python3 test_motion_logic.py
+```
+
+## Speed and soft start reach the motor via `config`
+
+The speed and soft-start sliders used to be cosmetic: they retimed the on-screen
+animation only. The chain was broken in **three** independent places, and any one
+of them alone was enough to make the sliders do nothing to the hardware:
+
+1. **The app never sent a `config` command at all.** `SET_NODE_SPEED` /
+   `SET_NODE_RAMP` updated local state that only fed the animation clock. Shelf
+   count reached the Pi as a stream query param, so `ConfigCommand` was dead code
+   from end to end.
+2. **`/api/pi/command` rebuilt the command field-by-field** and copied only
+   `shelves`, so any motion field would have been dropped in transit anyway.
+3. **The agent's motion code read the module constants** `MOVE_SPEED` /
+   `HOMING_SPEED`, so even a delivered setting could not change the PWM duty.
+
+The settings now flow all the way through:
+
+```
+slider (sec/shelf) -> secPerShelfToDuty() -> config{moveSpeed,homingSpeed,rampPct}
+   -> relay -> agent.set_motion() -> self.move_speed -> PWM duty
+```
+
+`MOVE_SPEED` / `HOMING_SPEED` in the agent are **defaults only**. Motion code must
+read `self.move_speed`, `self.homing_speed` and `self.ramp_pct` — never the
+constants — or the sliders go dead again.
+
+Duty is clamped to `MIN_DUTY` (0.25) … 1.0 in both the app and the agent: below
+about a quarter duty a geared carousel cannot break stiction and the motor just
+buzzes and heats, which looks like the slider breaking the machine. The slider's
+1.5–8 s/shelf range maps across the whole usable band (1.0 down to 0.25).
+
+Soft start/stop is a real PWM ramp, not an animation curve: the duty climbs from
+`MIN_DUTY` to target in `RAMP_STEP_SECONDS` increments, drops to a slower approach
+duty one shelf before the target, then eases down to a halt. At `rampPct = 0` full
+duty is applied in one step and the stop is immediate. The motor stays energised
+throughout — ramping changes how fast it accelerates, never whether it has power,
+so this does not reintroduce the sensor-gating bug above.
+
+The jam timeout scales with the chosen speed plus the ramp time, so a
+slow-but-healthy move is not misreported as a jam.
+
+Settings are re-sent on reconnect, because a restarted Pi comes back on defaults.
+
+```bash
+python3 test_speed_control.py   # asserts the duty actually changes
 ```
 
 ### "The app says it moved, but the carousel didn't"
@@ -420,7 +469,7 @@ The agent and app exchange newline-free JSON messages. This mirrors
 | Message                              | Meaning                          |
 | ------------------------------------ | -------------------------------- |
 | `{"type":"hello"}`                   | Handshake request                |
-| `{"type":"config","shelves":N}`      | Tell the agent the shelf count   |
+| `{"type":"config","shelves":N,"moveSpeed":0.7,"homingSpeed":0.45,"rampPct":40}` | Shelf count + live motion tuning. The motion fields are optional; omitted ones keep their current value, so they must be sent for the sliders to take effect. |
 | `{"type":"home"}`                    | Start homing                     |
 | `{"type":"goto","shelf":N}`          | Rotate to shelf N (0-based)      |
 | `{"type":"stop"}`                    | Emergency stop                   |

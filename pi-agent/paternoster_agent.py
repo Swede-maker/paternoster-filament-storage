@@ -46,9 +46,19 @@ PIN_MOTOR_EN = 22    # -> R_EN + L_EN tied together (HIGH = bridge enabled)
 PIN_SHELF_SENSOR = 23  # inductive sensor: one pulse per shelf
 PIN_INDEX_SENSOR = 24  # inductive sensor: active only at shelf 1 (home)
 
-# Motion tuning.
+# Motion tuning. These are DEFAULTS ONLY — the app overrides them at runtime via
+# the `config` command, so the speed and soft-start sliders reach the motor. Do
+# not read these constants inside motion code; read the Carousel instance fields
+# (self.move_speed / self.ramp_pct) or slider changes will silently do nothing.
 HOMING_SPEED = 0.45   # 0..1 PWM duty during homing
 MOVE_SPEED = 0.7      # 0..1 PWM duty during normal moves
+# A BTS7960 with a geared carousel will not break stiction much below this duty;
+# it just buzzes and heats. Speed requests are clamped up to this floor.
+MIN_DUTY = 0.25
+# Soft start/stop: seconds spent ramping at 100% ramp intensity. The ramp is
+# applied in small PWM steps while the motor is already powered.
+MAX_RAMP_SECONDS = 1.2
+RAMP_STEP_SECONDS = 0.02  # PWM update interval while ramping
 PULSE_TIMEOUT = 8.0   # seconds to wait for the next shelf pulse before faulting
 HOME_TIMEOUT = 30.0   # seconds to find the index sensor before faulting
 SENSOR_BOUNCE = 0.01  # debounce (s) for the inductive sensors
@@ -348,6 +358,13 @@ class Carousel:
         self.homed = False
         self.status = "idle"  # idle | moving | homing
 
+        # Live motion settings. The app pushes these with `config` whenever the
+        # speed or soft-start slider moves, so they must be INSTANCE state, not
+        # module constants. The constants above are only the initial values.
+        self.move_speed = MOVE_SPEED
+        self.homing_speed = HOMING_SPEED
+        self.ramp_pct = 40
+
         self._cmd: Optional[tuple] = None
         self._abort = threading.Event()
         self._wake = threading.Event()
@@ -369,6 +386,67 @@ class Carousel:
     def set_shelves(self, shelves: int) -> None:
         if shelves > 0:
             self.shelves = shelves
+
+    def set_motion(self, move_speed=None, homing_speed=None, ramp_pct=None) -> None:
+        """
+        Apply speed / soft-start settings from the app's sliders.
+
+        Duties are clamped to [MIN_DUTY, 1.0]: below MIN_DUTY a geared carousel
+        will not overcome stiction and the motor only buzzes, which would look
+        exactly like "the slider broke the machine".
+        """
+        if move_speed is not None:
+            self.move_speed = max(MIN_DUTY, min(1.0, float(move_speed)))
+        if homing_speed is not None:
+            self.homing_speed = max(MIN_DUTY, min(1.0, float(homing_speed)))
+        if ramp_pct is not None:
+            self.ramp_pct = max(0, min(100, int(ramp_pct)))
+        print(
+            f"[agent] motion set: move={self.move_speed:.2f} "
+            f"home={self.homing_speed:.2f} ramp={self.ramp_pct}%",
+            flush=True,
+        )
+
+    # ---- ramping ----
+    def _ramp_seconds(self) -> float:
+        return (self.ramp_pct / 100.0) * MAX_RAMP_SECONDS
+
+    def _drive(self, direction: str, target: float) -> None:
+        """
+        Start the motor and ramp it up to `target` duty (soft start).
+
+        The motor is energised at MIN_DUTY immediately and never de-energised
+        mid-ramp, so this changes how fast it accelerates, never whether it has
+        power. With ramp_pct = 0 it applies full duty in one step.
+        """
+        drive = self.hw.backward if direction == "up" else self.hw.forward
+        ramp = self._ramp_seconds()
+        if ramp <= 0 or target <= MIN_DUTY:
+            drive(target)
+            return
+        steps = max(1, int(ramp / RAMP_STEP_SECONDS))
+        for i in range(1, steps + 1):
+            if self._abort.is_set():
+                return
+            # Start from MIN_DUTY rather than 0 so the carousel actually breaks
+            # away instead of humming at a duty too low to turn it.
+            drive(MIN_DUTY + (target - MIN_DUTY) * (i / steps))
+            time.sleep(RAMP_STEP_SECONDS)
+
+    def _decelerate(self, direction: str, current: float) -> None:
+        """Soft stop: ease the duty down before cutting power."""
+        ramp = self._ramp_seconds()
+        if ramp <= 0 or current <= MIN_DUTY:
+            self.hw.stop()
+            return
+        drive = self.hw.backward if direction == "up" else self.hw.forward
+        steps = max(1, int(ramp / RAMP_STEP_SECONDS))
+        for i in range(steps, 0, -1):
+            if self._abort.is_set():
+                break
+            drive(MIN_DUTY + (current - MIN_DUTY) * (i / steps))
+            time.sleep(RAMP_STEP_SECONDS)
+        self.hw.stop()
 
     def shutdown(self) -> None:
         self._alive = False
@@ -411,10 +489,9 @@ class Carousel:
         # Energise the motor FIRST and unconditionally. Motor power must never
         # depend on what the sensors currently see.
         self.hw.reset_pulses()
-        if HOMING_DIRECTION == "down":
-            self.hw.backward(HOMING_SPEED)
-        else:
-            self.hw.forward(HOMING_SPEED)
+        # Soft-started at the CURRENT homing speed, not the module default, so
+        # the sliders affect homing too.
+        self._drive("up" if HOMING_DIRECTION == "down" else "down", self.homing_speed)
 
         # Classic "already sitting on the switch" problem: if the carousel is
         # parked with a shelf inside the index window, the flag is active before
@@ -469,18 +546,22 @@ class Carousel:
         # going past, and nothing in it consults a sensor level to decide
         # whether the motor should be powered.
         self.hw.reset_pulses()
-        if direction == "up":
-            self.hw.backward(MOVE_SPEED)
-            step = -1
-        else:
-            self.hw.forward(MOVE_SPEED)
-            step = +1
+        step = -1 if direction == "up" else +1
+        # Soft start at the CURRENT slider speed. Reading the MOVE_SPEED constant
+        # here was why the speed slider did nothing to the hardware.
+        speed = self.move_speed
+        self._drive(direction, speed)
 
         # Let the carousel physically clear the edge it was parked on before we
         # start counting. The motor is already running and stays running; this
         # only throws away pulses that are too early to be real.
         time.sleep(PULSE_BLANKING)
         self.hw.reset_pulses()
+
+        # A slow speed or a long soft start means the first shelf legitimately
+        # takes longer to arrive. Scaling the jam timeout keeps a slow-but-
+        # healthy move from being misreported as a jam.
+        pulse_timeout = PULSE_TIMEOUT * (MOVE_SPEED / max(MIN_DUTY, speed)) + self._ramp_seconds()
 
         counted = 0
         while counted < steps:
@@ -491,12 +572,23 @@ class Carousel:
             # The ONLY sensor-related stop left is this jam guard, and it fires
             # on elapsed TIME with no pulse at all — never on a sensor simply
             # reading inactive. A covered or uncovered sensor cannot cut power.
-            if not self.hw.take_shelf_pulse(PULSE_TIMEOUT):
+            if not self.hw.take_shelf_pulse(pulse_timeout):
                 self.hw.stop()
                 self.status = "idle"
                 self.emit({"type": "fault", "message": "Jam? No shelf pulse within timeout"})
                 return
             counted += 1
+            # Soft stop, part 1: with one shelf left to travel, drop to a slower
+            # approach duty so the carousel is already crawling when it reaches
+            # the target, instead of running at full speed into a hard stop.
+            # Interpolated by ramp intensity: 0% keeps full speed to the end.
+            if counted == steps - 1 and self.ramp_pct > 0 and steps > 1:
+                approach = speed - (speed - MIN_DUTY) * (self.ramp_pct / 100.0)
+                if direction == "up":
+                    self.hw.backward(approach)
+                else:
+                    self.hw.forward(approach)
+                speed = approach
             self.current_shelf = (self.current_shelf + step) % self.shelves
             # Drift correction from a counted index EDGE, never a level read.
             # Reading the level here was the same mistake in a third place: just
@@ -510,7 +602,9 @@ class Carousel:
                 self.current_shelf = 0
             self.emit({"type": "pos", "shelf": self.current_shelf})
 
-        self.hw.stop()
+        # Soft stop, part 2: ease the duty down to a halt rather than cutting
+        # power dead. `_decelerate` falls through to a plain stop at ramp 0%.
+        self._decelerate(direction, speed)
         self.status = "idle"
         if self.homed:
             self.current_shelf = target
@@ -611,6 +705,14 @@ async def serve(args) -> None:
                     broadcast(carousel.snapshot())
                 elif t == "config":
                     carousel.set_shelves(int(msg.get("shelves", carousel.shelves)))
+                    # Previously this handler ignored everything except
+                    # `shelves`, so the speed and soft-start sliders were
+                    # delivered to the Pi and then silently dropped.
+                    carousel.set_motion(
+                        move_speed=msg.get("moveSpeed"),
+                        homing_speed=msg.get("homingSpeed"),
+                        ramp_pct=msg.get("rampPct"),
+                    )
                 elif t == "hello":
                     await ws.send(json.dumps({"type": "hello", "name": args.name, "shelves": carousel.shelves, "simulated": sim_reason is not None, "simReason": sim_reason}))
         except ConnectionClosed:
