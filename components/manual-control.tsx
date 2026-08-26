@@ -1,18 +1,10 @@
 "use client"
 
-import { useEffect, useRef, useState } from "react"
-import { ArrowUp, ArrowDown, Home, Loader2, Gauge, OctagonX, Play } from "lucide-react"
+import { ArrowUp, ArrowDown, Home, Loader2, OctagonX, Play } from "lucide-react"
 import { useStore } from "@/lib/store"
 import { activeNode } from "@/lib/selectors"
-import {
-  DEFAULT_SEC_PER_SHELF,
-  MIN_SEC_PER_SHELF,
-  MAX_SEC_PER_SHELF,
-  DEFAULT_RAMP_PCT,
-  moveDutyFor,
-} from "@/lib/filament"
+import { DEFAULT_RAMP_PCT, moveDutyFor } from "@/lib/filament"
 import { Button } from "./ui/button"
-import { CalibrationDialog } from "./calibration-dialog"
 import { cn } from "@/lib/utils"
 
 export function ManualControl() {
@@ -34,22 +26,10 @@ export function ManualControl() {
   // could not nudge the motor to diagnose the very sensor fault that blocked
   // homing. The agent allows relative moves un-homed; the UI must not veto them.
   const canJog = idle && !offline
-  const [calibrating, setCalibrating] = useState(false)
 
   // Speed controls only apply to a motorized carousel, not manual shelf storage.
   const isCarousel = node.type !== "shelf"
-  const secPerShelf = node.secPerShelf ?? DEFAULT_SEC_PER_SHELF
   const rampPct = node.rampPct ?? DEFAULT_RAMP_PCT
-
-  // Prompt calibration once per uncalibrated carousel (e.g. right after setup):
-  // a paternoster must be calibrated BEFORE it can home, so surface it up front.
-  const promptedRef = useRef<Set<string>>(new Set())
-  useEffect(() => {
-    if (isCarousel && !node.calibrated && node.machine.status === "idle" && !promptedRef.current.has(node.id)) {
-      promptedRef.current.add(node.id)
-      setCalibrating(true)
-    }
-  }, [isCarousel, node.calibrated, node.id, node.machine.status])
 
   const statusLabel = (() => {
     switch (status) {
@@ -63,16 +43,14 @@ export function ManualControl() {
         return "Ready to pick"
       case "awaiting-store-confirm":
         return "Ready to store"
-      case "calibrating":
-        return "Calibrating…"
       case "stopped":
         return "Emergency stopped"
       default:
-        return homed ? "Positioning OK" : node.calibrated || !isCarousel ? "Not homed" : "Needs calibration"
+        return homed ? "Positioning OK" : "Not homed"
     }
   })()
 
-  const busy = status === "homing" || status === "moving" || status === "calibrating"
+  const busy = status === "homing" || status === "moving"
   // Emergency-stopped: frozen in place until the operator resumes or re-homes.
   const stopped = isCarousel && status === "stopped"
   // What "Continue task" will pick back up, so we can label it meaningfully.
@@ -218,46 +196,29 @@ export function ManualControl() {
 
       {isCarousel && (
         <div className="mt-4 rounded-xl border border-border bg-background/50 p-3">
-          <div className="flex items-center justify-between">
-            <p className="text-xs uppercase tracking-wider text-muted-foreground">Carousel Speed</p>
-            <span className="font-mono text-xs text-foreground">{secPerShelf.toFixed(1)}s / shelf</span>
-          </div>
+          {/* The "Carousel Speed" (seconds-per-shelf) slider used to sit here. It
+              is gone: speed is set directly by the PWM duty slider, which is the
+              single source of truth for how fast the motor turns. Two controls for
+              one physical quantity meant the seconds-per-shelf value silently
+              fought the duty the operator had actually dialled in. Position is
+              known from homing plus shelf-sensor counting — never from elapsed
+              time — so nothing here needs a seconds-per-shelf figure. */}
 
-          {/* Manual fine-tune. Slider is inverted so "right = faster" reads naturally:
-              we map the position back to seconds-per-shelf (lower sec = faster). */}
-          <input
-            type="range"
-            aria-label="Carousel speed (seconds per shelf)"
-            min={MIN_SEC_PER_SHELF}
-            max={MAX_SEC_PER_SHELF}
-            step={0.1}
-            // invert: slider value is "fastness", displayed value is seconds
-            value={MIN_SEC_PER_SHELF + MAX_SEC_PER_SHELF - secPerShelf}
-            disabled={busy}
-            onChange={(e) => {
-              const fastness = Number(e.target.value)
-              const sec = MIN_SEC_PER_SHELF + MAX_SEC_PER_SHELF - fastness
-              dispatch({ type: "SET_NODE_SPEED", nodeId: node.id, secPerShelf: sec })
-            }}
-            className="mt-2 w-full accent-[var(--color-primary)] disabled:opacity-40"
-          />
-          <div className="flex justify-between text-[10px] uppercase tracking-wide text-muted-foreground">
-            <span>Slower</span>
-            <span>Faster</span>
-          </div>
-
-          {/* Soft start/stop ramp: how gently the carousel accelerates at the
-              start of a move and decelerates at the end. Auto-calibration seeds
-              a value from the found speed; this lets the user fine-tune it. */}
+          {/* Acceleration ramp only — how gently the carousel gets moving, plus
+              how gently it eases to the slower approach duty for the final shelf.
+              It deliberately does NOT soften the stop: arrival cuts power the
+              instant the shelf sensor triggers, because any ramp there keeps the
+              motor driving after the flag is detected and carries it straight
+              back out of the sensor window. */}
           <div className="mt-4 flex items-center justify-between">
-            <p className="text-xs uppercase tracking-wider text-muted-foreground">Soft start / stop</p>
+            <p className="text-xs uppercase tracking-wider text-muted-foreground">Soft start</p>
             <span className="font-mono text-xs text-foreground">
               {rampPct === 0 ? "Off" : `${rampPct}%`}
             </span>
           </div>
           <input
             type="range"
-            aria-label="Soft start and stop ramp intensity (percent)"
+            aria-label="Soft start ramp intensity (percent)"
             min={0}
             max={100}
             step={5}
@@ -270,6 +231,10 @@ export function ManualControl() {
             <span>Sharp</span>
             <span>Gentle</span>
           </div>
+          <p className="mt-1 text-[10px] leading-relaxed text-muted-foreground">
+            Affects starting only. Stopping is always immediate — the motor cuts
+            the moment the shelf sensor triggers.
+          </p>
 
           {/* Direct PWM duty. The speed slider above is in seconds-per-shelf and
               its duty curve is clamped to 25–100%, which cannot express the very
@@ -299,25 +264,9 @@ export function ManualControl() {
             <span>100%</span>
           </div>
           <p className="mt-1 text-[10px] leading-relaxed text-muted-foreground">
-            Sent straight to the motor, overriding the speed slider. Lower it until the carousel stops
-            overshooting the shelf sensor.
+            Sets the motor speed directly. Lower it until the carousel stops overshooting the shelf
+            sensor.
           </p>
-
-          <Button
-            variant="secondary"
-            size="sm"
-            className="mt-3 w-full"
-            disabled={busy}
-            onClick={() => setCalibrating(true)}
-          >
-            <Gauge className="h-4 w-4" />
-            Auto-calibrate speed
-          </Button>
-          {!node.calibrated && (
-            <p className="mt-2 text-[11px] leading-relaxed text-amber-500">
-              This carousel isn&apos;t calibrated yet. Run auto-calibrate so it can home and move reliably.
-            </p>
-          )}
         </div>
       )}
 
@@ -338,8 +287,6 @@ export function ManualControl() {
           </span>
         </p>
       </div>
-
-      <CalibrationDialog node={calibrating ? node : null} open={calibrating} onClose={() => setCalibrating(false)} />
     </section>
   )
 }

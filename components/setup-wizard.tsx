@@ -101,7 +101,7 @@ export function SetupWizard() {
           </Button>
           <p className="text-center text-xs text-muted-foreground">
             You can change these later, and add more storage units, in Settings.
-            {!isManual && " First you'll calibrate the carousel speed, then it homes itself."}
+            {!isManual && " The carousel homes itself, then you can tune its PWM speed in Manual control."}
           </p>
         </div>
       </div>

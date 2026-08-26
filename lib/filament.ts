@@ -128,88 +128,40 @@ export function spoolDiameter(spool: Pick<Spool, "diameter">, fallback = DEFAULT
   return spool.diameter && spool.diameter > 0 ? spool.diameter : fallback
 }
 
-/** Target carousel speed found/assumed by calibration, in seconds per shelf. */
-export const DEFAULT_SEC_PER_SHELF = 3.5
-/** Bounds the manual speed slider (fast … slow), in seconds per shelf. */
-export const MIN_SEC_PER_SHELF = 1.5
-export const MAX_SEC_PER_SHELF = 8
-
 /**
- * Convert a real-world carousel speed (seconds per shelf) into the on-screen
- * per-shelf animation duration (ms). Scaled so the 3.5 s target maps to the
- * app's original 420 ms feel, and clamped so extreme speeds stay watchable.
- */
-export function secPerShelfToStepMs(secPerShelf: number | undefined): number {
-  const sec = secPerShelf && secPerShelf > 0 ? secPerShelf : DEFAULT_SEC_PER_SHELF
-  return Math.round(Math.min(1200, Math.max(150, sec * 120)))
-}
-
-/**
- * Convert the speed slider (seconds per shelf) into a PWM duty cycle (0..1) for
- * the motor driver.
+ * Motor speed is expressed ONLY as a PWM duty cycle (0..1) — the unit the
+ * BTS7960 driver actually understands.
  *
- * The slider is in seconds-per-shelf because that is what calibration measures
- * and what the operator sees, but the BTS7960 only understands duty. Without
- * this conversion the slider could only ever retime the on-screen animation —
- * which is exactly the bug it had.
- *
- * Inverted (fewer seconds = faster = higher duty) and clamped to the band the
- * hardware can actually use: below ~0.25 a geared carousel does not break
- * stiction and just buzzes. The agent clamps again, so this is defence in depth.
+ * The old seconds-per-shelf model and its conversion curves are gone. They
+ * described speed as a duration, which meant the app held two competing ideas of
+ * how fast the carousel turns, and the curve clamped away the low duties (it
+ * bottomed out at 25%) that a heavy carousel needs to stop coasting past the
+ * sensor flag. Nothing derives position from elapsed time: the carousel knows
+ * where it is from homing plus shelf-sensor pulses.
  */
-export const MIN_MOTOR_DUTY = 0.25
-export const MAX_MOTOR_DUTY = 1
 
-export function secPerShelfToDuty(secPerShelf: number | undefined): number {
-  const sec = secPerShelf && secPerShelf > 0 ? secPerShelf : DEFAULT_SEC_PER_SHELF
-  const span = MAX_SEC_PER_SHELF - MIN_SEC_PER_SHELF
-  const t = Math.max(0, Math.min(1, (sec - MIN_SEC_PER_SHELF) / span)) // 0 fast … 1 slow
-  const duty = MAX_MOTOR_DUTY - t * (MAX_MOTOR_DUTY - MIN_MOTOR_DUTY)
-  return Math.round(duty * 100) / 100
-}
-
-/**
- * Homing deliberately runs slower than normal moves so the index flag is not
- * overshot, but it still tracks the slider so a carousel tuned slow homes slow.
- */
-export function secPerShelfToHomingDuty(secPerShelf: number | undefined): number {
-  const duty = secPerShelfToDuty(secPerShelf) * 0.65
-  return Math.round(Math.max(MIN_MOTOR_DUTY, duty) * 100) / 100
-}
-
-/** Lowest duty the direct PWM slider can request. */
+/** Lowest duty the PWM slider can request. */
 export const MIN_PWM_DUTY = 0.05
+/** Duty used when the operator has not set one yet. */
+export const DEFAULT_PWM_DUTY = 0.45
 
-/**
- * The duty a move should actually run at: the operator's direct PWM setting when
- * they have set one, otherwise the seconds-per-shelf curve.
- *
- * Exists because that curve bottoms out at MIN_MOTOR_DUTY (25%) and is expressed
- * in seconds rather than duty, so it cannot ask for the very low duties a heavy
- * carousel needs to stop coasting past the sensor flag.
- */
-export function moveDutyFor(node: { secPerShelf?: number; pwmDuty?: number }): number {
-  if (typeof node.pwmDuty === "number" && node.pwmDuty > 0) {
-    return Math.round(Math.max(MIN_PWM_DUTY, Math.min(1, node.pwmDuty)) * 100) / 100
-  }
-  return secPerShelfToDuty(node.secPerShelf)
+/** The duty a move runs at. */
+export function moveDutyFor(node: { pwmDuty?: number }): number {
+  const duty = typeof node.pwmDuty === "number" && node.pwmDuty > 0 ? node.pwmDuty : DEFAULT_PWM_DUTY
+  return Math.round(Math.max(MIN_PWM_DUTY, Math.min(1, duty)) * 100) / 100
 }
 
 /**
- * Homing duty that respects a direct PWM override. Homing still runs at a
- * fraction of the move duty, but if the operator has dialled the move duty right
- * down, homing must come down with it — otherwise homing keeps flying past the
- * index flag at the old speed and the override appears to do nothing.
+ * Homing runs at a fraction of the move duty so the index flag is not overshot.
+ * It tracks the move duty, so dialling the carousel down also slows homing —
+ * otherwise homing would keep flying past the flag at the old speed.
  */
-export function homingDutyFor(node: { secPerShelf?: number; pwmDuty?: number }): number {
-  if (typeof node.pwmDuty === "number" && node.pwmDuty > 0) {
-    const duty = moveDutyFor(node) * 0.65
-    return Math.round(Math.max(MIN_PWM_DUTY, duty) * 100) / 100
-  }
-  return secPerShelfToHomingDuty(node.secPerShelf)
+export function homingDutyFor(node: { pwmDuty?: number }): number {
+  const duty = moveDutyFor(node) * 0.65
+  return Math.round(Math.max(MIN_PWM_DUTY, duty) * 100) / 100
 }
 
-/** Default soft start/stop ramp intensity (%) for a new/uncalibrated carousel. */
+/** Default soft START ramp intensity (%) for a new carousel. */
 export const DEFAULT_RAMP_PCT = 40
 /** How much the ends of a move can be slowed at full ramp (2.5x base delay). */
 const RAMP_MAX_STRENGTH = 1.5
@@ -228,17 +180,6 @@ export function rampStepMs(baseMs: number, stepIndex: number, totalSteps: number
   // sin(pi*p) is 0 at the ends and 1 in the middle, so (1 - sin) slows the ends.
   const shape = 1 - Math.sin(Math.PI * p)
   return Math.round(baseMs * (1 + strength * shape))
-}
-
-/**
- * A calibration-derived soft start/stop ramp: faster carousels (fewer
- * seconds/shelf) get more easing to avoid jerk, slower ones get less. Mapped
- * across the speed slider's bounds and clamped to a sensible 25–70% band.
- */
-export function autoRampPct(secPerShelf: number): number {
-  const span = MAX_SEC_PER_SHELF - MIN_SEC_PER_SHELF
-  const t = Math.max(0, Math.min(1, (secPerShelf - MIN_SEC_PER_SHELF) / span)) // 0 fast … 1 slow
-  return Math.round(70 - t * (70 - 25))
 }
 
 /** Total number of loadable slots for a printer based on its kind. */

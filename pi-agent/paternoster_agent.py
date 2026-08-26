@@ -73,7 +73,48 @@ RAMP_STEP_SECONDS = 0.02  # PWM update interval while ramping
 STOP_RAMP_SECONDS = 0.25
 PULSE_TIMEOUT = 8.0   # seconds to wait for the next shelf pulse before faulting
 HOME_TIMEOUT = 30.0   # seconds to find the index sensor before faulting
+# How often a long sensor wait re-checks for an emergency stop. Small enough to
+# feel instant to an operator, large enough not to spin the CPU.
+ABORT_POLL_SECONDS = 0.02
 SENSOR_BOUNCE = 0.01  # debounce (s) for the inductive sensors
+# ---------------------------------------------------------------------------
+# Mechanical shelf-bounce filter.
+#
+# A shelf can swing/rock as it settles, leaving the sensor window and swinging
+# straight back into it. Each re-entry is a fresh rising edge, so the SAME shelf
+# was counted twice or more and the carousel believed it had travelled further
+# than it had.
+#
+# The filter is release-based: a rising edge only counts if the window was
+# continuously EMPTY for a settle period beforehand. Bounce has a tiny empty gap
+# (the flag never really left), so it is rejected. A genuine next shelf is
+# preceded by a whole inter-shelf travel with the window empty, so it counts.
+#
+# The settle period is NOT a fixed wall-clock value, because the safe ceiling
+# depends entirely on speed. Per-shelf travel is ~0.5s at MOVE_SPEED, so a flat
+# 1.0-1.5s filter would be LONGER than the entire gap between shelves and would
+# reject genuine shelves — the carousel would stop counting and hit the jam
+# timeout. Scaling with duty keeps the filter proportionally identical at every
+# speed: generous at the slow duties where bounce actually matters, and always
+# comfortably inside the real shelf spacing.
+#
+# This filters COUNTING only. It never gates motor power, and position still
+# comes from counted pulses rather than from elapsed time.
+SHELF_SETTLE_AT_MOVE_SPEED = 0.20
+SHELF_SETTLE_MAX = 1.5
+
+
+def shelf_settle_for(duty: float) -> float:
+    """
+    Settle period for a given PWM duty.
+
+    Travel time per shelf is inversely proportional to duty, so the filter scales
+    the same way and stays at a constant FRACTION of the real shelf spacing. That
+    is what makes one setting correct at 45% and at 5% alike. Capped so a
+    near-stalled duty cannot produce an absurdly long blind window.
+    """
+    settle = SHELF_SETTLE_AT_MOVE_SPEED * (MOVE_SPEED / max(0.01, duty))
+    return min(SHELF_SETTLE_MAX, settle)
 # Max time to drive off the index flag when homing starts while already on it.
 # The motor runs throughout; this only bounds how long we watch for it to clear.
 INDEX_CLEAR_TIMEOUT = 10.0
@@ -238,6 +279,13 @@ class RealHardware:
         self._index_pulses = 0
         self._shelf_tick = threading.Event()
         self._index_tick = threading.Event()
+        # Mechanical bounce filter state. `None` means "not currently known to be
+        # empty", which fails SAFE: an edge is counted rather than dropped, since
+        # dropping a genuine shelf loses position while an extra count is what the
+        # settle window is there to catch.
+        self._shelf_clear_since: Optional[float] = None
+        self._shelf_settle = 0.0
+        self._suppressed_bounces = 0
         self.shelf.when_activated = self._on_shelf
         self.index.when_activated = self._on_index
 
@@ -256,12 +304,33 @@ class RealHardware:
         self.flag_exit_direction: Optional[str] = None
         self.shelf.when_deactivated = self._on_shelf_exit
 
+    def set_shelf_settle(self, seconds: float) -> None:
+        """How long the window must stay EMPTY before a rising edge counts."""
+        with self._lock:
+            self._shelf_settle = max(0.0, seconds)
+
     def _on_shelf_exit(self) -> None:
         if self.travel_direction is not None:
             self.flag_exit_direction = self.travel_direction
+        # Stamp when the window became empty. This is physical reality, so it is
+        # deliberately NOT touched by reset_pulses(): counter bookkeeping must not
+        # be able to forget that the flag is still hovering on the boundary.
+        with self._lock:
+            self._shelf_clear_since = time.monotonic()
 
     def _on_shelf(self) -> None:
+        now = time.monotonic()
         with self._lock:
+            since = self._shelf_clear_since
+            settle = self._shelf_settle
+            if since is not None and settle > 0 and (now - since) < settle:
+                # The flag bounced back in before the window had been empty long
+                # enough to be a real inter-shelf gap. Same shelf, not the next.
+                self._suppressed_bounces += 1
+                return
+            # Inside the window now, so there is no "empty since" time any more.
+            # A bounce must produce a fresh exit edge to be measured against.
+            self._shelf_clear_since = None
             self._shelf_pulses += 1
         self._shelf_tick.set()
 
@@ -389,6 +458,10 @@ class SimHardware:
         # Position 0.0 is a shelf in place, so the window starts ACTIVE. Seeding
         # this True is what stops a phantom pulse being reported at startup.
         self._shelf_was_active = True
+        # Mirrors RealHardware's bounce filter state.
+        self._shelf_clear_since: Optional[float] = None
+        self._shelf_settle = 0.0
+        self._suppressed_bounces = 0
         # Mirrors RealHardware: current travel, and the travel at the flag's last
         # departure from the sensor window.
         self.travel_direction: Optional[str] = None
@@ -423,12 +496,30 @@ class SimHardware:
                 # a parked-on-sensor carousel was impossible to simulate.
                 active = self._shelf_window_active()
                 if active and not self._shelf_was_active:
-                    self._shelf_pulses += 1
-                    self._shelf_tick.set()
+                    # Same release-based bounce filter as the real hardware.
+                    if (self._shelf_clear_since is not None
+                            and self._shelf_settle > 0
+                            and (now - self._shelf_clear_since) < self._shelf_settle):
+                        self._suppressed_bounces += 1
+                    else:
+                        self._shelf_clear_since = None
+                        self._shelf_pulses += 1
+                        self._shelf_tick.set()
+                    # The INDEX pulse is raised OUTSIDE the bounce filter, on
+                    # every rising edge, matching real hardware where the index
+                    # sensor is a physically separate input with its own callback.
+                    #
+                    # Nesting it inside the filter meant a bouncing home flag
+                    # suppressed the index pulse as well, so homing could sail
+                    # past the home position and time out. Over-counting the index
+                    # is harmless (homing only asks "have we seen it yet?"),
+                    # whereas missing it loses the datum the whole axis is
+                    # referenced from.
                     if self._index_window_active():
                         self._index_pulses += 1
                         self._index_tick.set()
                 elif self._shelf_was_active and not active:
+                    self._shelf_clear_since = now
                     # Falling edge: the flag has just cleared the window, so the
                     # current travel fixes which side it now rests on.
                     if self.travel_direction is not None:
@@ -450,6 +541,10 @@ class SimHardware:
         with self._lock:
             self._dir = 0
             self._speed = 0.0
+
+    def set_shelf_settle(self, seconds: float) -> None:
+        with self._lock:
+            self._shelf_settle = max(0.0, seconds)
 
     def reset_pulses(self) -> None:
         with self._lock:
@@ -603,6 +698,15 @@ class Carousel:
         exactly what the next move needs to know.
         """
         self.hw.travel_direction = direction
+        # Re-scale the mechanical bounce filter for the duty we are about to run
+        # at. Slower travel means a longer real gap between shelves, so the filter
+        # can afford to be (and must be) proportionally longer to reject a slow
+        # shelf swing; faster travel needs it short so a genuine shelf is never
+        # rejected. Setting it here means every mover — main move, ramps, homing
+        # sweep, alignment crawl — gets a filter matched to its actual speed.
+        setter = getattr(self.hw, "set_shelf_settle", None)
+        if setter is not None:
+            setter(shelf_settle_for(duty))
         if direction == "up":
             self.hw.backward(duty)
         else:
@@ -644,30 +748,19 @@ class Carousel:
             self._energise(direction, floor + (target - floor) * (i / steps))
             time.sleep(RAMP_STEP_SECONDS)
 
-    def _decelerate(self, direction: str, current: float, max_seconds: float | None = None) -> None:
-        """
-        Soft stop: ease the duty down before cutting power.
-
-        `max_seconds` caps the ramp. Deceleration after the target shelf's pulse
-        is pure overshoot, so callers stopping ON a target pass a short budget.
-        """
-        ramp = self._ramp_seconds()
-        if max_seconds is not None:
-            ramp = min(ramp, max_seconds)
-        if ramp <= 0:
-            self.hw.stop()
-            return
-        steps = max(1, int(ramp / RAMP_STEP_SECONDS))
-        # Same floor clamp as the acceleration ramp: easing "down" from a
-        # hardcoded MIN_DUTY would RAISE the duty when the operator has set a
-        # lower one, braking the carousel by speeding it up.
-        floor = min(MIN_DUTY, current)
-        for i in range(steps, 0, -1):
-            if self._abort.is_set():
-                break
-            self._energise(direction, floor + (current - floor) * (i / steps))
-            time.sleep(RAMP_STEP_SECONDS)
-        self.hw.stop()
+    # NOTE: there is deliberately no `_decelerate` / soft-stop ramp any more.
+    #
+    # Stopping ON a sensor and ramping down are incompatible: every millisecond
+    # of ramp is extra travel past the flag that was just detected. The ramp also
+    # had a floor bug that made it useless where it mattered most — easing from
+    # `current` down to `min(MIN_DUTY, current)` is a no-op once the operator sets
+    # a duty below MIN_DUTY, so at 10% or 6% it held FULL requested duty for the
+    # whole ramp and then cut power, i.e. pure overshoot with no braking at all.
+    # That is why going "mega slow" did not help: the slower the setting, the more
+    # completely the ramp degenerated into a fixed-length coast.
+    #
+    # Arrival now cuts power outright. The acceleration ramp in `_drive` stays;
+    # softening the START is free, because nothing is being aimed at.
 
     def _creep_pulse(self, direction: str) -> None:
         """One bounded crawl step: drive briefly, then stop and let it settle."""
@@ -966,6 +1059,30 @@ class Carousel:
                 self.status = "idle"
                 self.emit({"type": "fault", "message": str(exc)})
 
+    def _await(self, wait_fn, timeout: float) -> bool:
+        """
+        Abort-aware wrapper around a blocking sensor wait.
+
+        Slices the wait into short spans and re-checks `_abort` between them, so
+        an emergency stop is honoured within milliseconds instead of after the
+        full timeout. Homing waited up to HOME_TIMEOUT (30 s) in ONE call, so the
+        worker thread sat inside that call, deaf to everything, and could not even
+        report the stop or accept the next command until it expired.
+
+        Slicing is safe: the pulse counters accumulate in the sensor callbacks,
+        independently of whoever is waiting, so a pulse landing during any slice
+        is still counted rather than lost.
+        """
+        deadline = time.monotonic() + timeout
+        while True:
+            if self._abort.is_set():
+                return False
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            if wait_fn(min(ABORT_POLL_SECONDS, remaining)):
+                return True
+
     def _do_home(self) -> None:
         self.status = "homing"
         self.emit(self.snapshot())
@@ -986,10 +1103,10 @@ class Carousel:
         # the motor stays powered the whole time — and only then look for the
         # genuine inactive->active edge that actually means "home".
         if self.hw.index_active():
-            self.hw.index_clear(INDEX_CLEAR_TIMEOUT)
+            self._await(self.hw.index_clear, INDEX_CLEAR_TIMEOUT)
             self.hw.reset_pulses()  # ignore the edge produced by leaving the flag
 
-        found = self.hw.take_index_pulse(HOME_TIMEOUT)
+        found = self._await(self.hw.take_index_pulse, HOME_TIMEOUT)
         self.hw.stop()
         if self._abort.is_set():
             self.status = "idle"
@@ -1156,7 +1273,18 @@ class Carousel:
         # A slow speed or a long soft start means the first shelf legitimately
         # takes longer to arrive. Scaling the jam timeout keeps a slow-but-
         # healthy move from being misreported as a jam.
-        pulse_timeout = PULSE_TIMEOUT * (MOVE_SPEED / max(MIN_DUTY, speed)) + self._ramp_seconds()
+        #
+        # This is purely a JAM watchdog — an upper bound on how long to wait for
+        # the next pulse. Position itself never comes from elapsed time; it comes
+        # from counting shelf-sensor pulses. So this may be generous, and being
+        # generous is the safe direction: too short invents jams that aren't there.
+        #
+        # The divisor is NOT clamped to MIN_DUTY. It used to be, which capped the
+        # timeout at 25% duty while the real travel time kept growing as the
+        # operator dialled the PWM lower — so a deliberately mega-slow move
+        # marched towards a bogus "Jam?" fault. Scaling on the true duty keeps the
+        # ratio constant at any speed.
+        pulse_timeout = PULSE_TIMEOUT * (MOVE_SPEED / max(0.01, speed)) + self._ramp_seconds()
 
         counted = 0
         # True once a shelf has been counted and we are waiting for that shelf's
@@ -1171,9 +1299,14 @@ class Carousel:
             # The ONLY sensor-related stop left is this jam guard, and it fires
             # on elapsed TIME with no pulse at all — never on a sensor simply
             # reading inactive. A covered or uncovered sensor cannot cut power.
-            if not self.hw.take_shelf_pulse(pulse_timeout):
+            if not self._await(self.hw.take_shelf_pulse, pulse_timeout):
                 self.hw.stop()
                 self.status = "idle"
+                # An abort is an operator decision, not a jam. Reporting a fault
+                # here would spam a scary "Jam?" message every time someone hit
+                # emergency stop mid-move.
+                if self._abort.is_set():
+                    return
                 self.emit({"type": "fault", "message": "Jam? No shelf pulse within timeout"})
                 return
             # An inductive sensor is a LEVEL, so each shelf passing can produce
@@ -1192,11 +1325,30 @@ class Carousel:
                 continue
             pending_departure = True
             counted += 1
+            if counted >= steps:
+                # ARRIVED. Cut power THIS INSTANT, on the rising edge, while the
+                # flag is still inside the sensor window.
+                #
+                # This must be the first thing that happens — before the position
+                # bookkeeping below, before anything that can sleep. Previously a
+                # soft-stop ramp ran here instead, which kept the motor energised
+                # for another STOP_RAMP_SECONDS and carried the flag straight back
+                # out of the window: the sensor went HIGH, then LOW, and only then
+                # did the machine halt, a whole shelf-edge late. The alignment
+                # crawl then had to hunt backwards for the flag it had just left,
+                # which is the back-and-forth bouncing, and when the hunt ran out
+                # of budget it dropped `homed` and demanded a re-home.
+                #
+                # Braking distance is a mechanical property, not something to
+                # schedule: whatever the carousel coasts, it coasts, and the
+                # alignment crawl exists to take up that slack. Adding a ramp on
+                # top only guarantees the overshoot. HIGH -> STOP.
+                self.hw.stop()
             # Soft stop, part 1: with one shelf left to travel, drop to a slower
             # approach duty so the carousel is already crawling when it reaches
             # the target, instead of running at full speed into a hard stop.
             # Interpolated by ramp intensity: 0% keeps full speed to the end.
-            if counted == steps - 1 and steps > 1 and approach < speed:
+            elif counted == steps - 1 and steps > 1 and approach < speed:
                 self._energise(direction, approach)
                 speed = approach
             self.current_shelf = (self.current_shelf + step) % self.shelves
@@ -1212,9 +1364,8 @@ class Carousel:
                 self.current_shelf = 0
             self.emit({"type": "pos", "shelf": self.current_shelf})
 
-        # Soft stop, part 2: ease the duty down to a halt rather than cutting
-        # power dead. `_decelerate` falls through to a plain stop at ramp 0%.
-        self._decelerate(direction, speed, max_seconds=STOP_RAMP_SECONDS)
+        # Power was already cut inside the loop, on the target's rising edge.
+        # Nothing may drive the motor between that edge and alignment.
         # Counting says we arrived; the sensor says where we actually are. Park
         # the shelf inside the window so "in position" stays verifiable.
         aligned = self._settle_on_sensor(direction)
