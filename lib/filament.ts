@@ -177,6 +177,38 @@ export function secPerShelfToHomingDuty(secPerShelf: number | undefined): number
   return Math.round(Math.max(MIN_MOTOR_DUTY, duty) * 100) / 100
 }
 
+/** Lowest duty the direct PWM slider can request. */
+export const MIN_PWM_DUTY = 0.05
+
+/**
+ * The duty a move should actually run at: the operator's direct PWM setting when
+ * they have set one, otherwise the seconds-per-shelf curve.
+ *
+ * Exists because that curve bottoms out at MIN_MOTOR_DUTY (25%) and is expressed
+ * in seconds rather than duty, so it cannot ask for the very low duties a heavy
+ * carousel needs to stop coasting past the sensor flag.
+ */
+export function moveDutyFor(node: { secPerShelf?: number; pwmDuty?: number }): number {
+  if (typeof node.pwmDuty === "number" && node.pwmDuty > 0) {
+    return Math.round(Math.max(MIN_PWM_DUTY, Math.min(1, node.pwmDuty)) * 100) / 100
+  }
+  return secPerShelfToDuty(node.secPerShelf)
+}
+
+/**
+ * Homing duty that respects a direct PWM override. Homing still runs at a
+ * fraction of the move duty, but if the operator has dialled the move duty right
+ * down, homing must come down with it — otherwise homing keeps flying past the
+ * index flag at the old speed and the override appears to do nothing.
+ */
+export function homingDutyFor(node: { secPerShelf?: number; pwmDuty?: number }): number {
+  if (typeof node.pwmDuty === "number" && node.pwmDuty > 0) {
+    const duty = moveDutyFor(node) * 0.65
+    return Math.round(Math.max(MIN_PWM_DUTY, duty) * 100) / 100
+  }
+  return secPerShelfToHomingDuty(node.secPerShelf)
+}
+
 /** Default soft start/stop ramp intensity (%) for a new/uncalibrated carousel. */
 export const DEFAULT_RAMP_PCT = 40
 /** How much the ends of a move can be slowed at full ramp (2.5x base delay). */

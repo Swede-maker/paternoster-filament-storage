@@ -4,7 +4,7 @@ import { useEffect, useRef } from "react"
 import { useStore } from "@/lib/store"
 import type { StorageNode } from "@/lib/types"
 import { parseEvent, type NodeCommand } from "@/lib/node-protocol"
-import { secPerShelfToDuty, secPerShelfToHomingDuty, DEFAULT_RAMP_PCT } from "@/lib/filament"
+import { moveDutyFor, homingDutyFor, DEFAULT_RAMP_PCT } from "@/lib/filament"
 
 /**
  * Owns the live connection to hardware nodes' Pi agents — via the app server.
@@ -284,8 +284,8 @@ export function NodeConnection() {
         n.id,
         n.link,
         n.storage.shelves,
-        secPerShelfToDuty(n.secPerShelf),
-        secPerShelfToHomingDuty(n.secPerShelf),
+        moveDutyFor(n),
+        homingDutyFor(n),
         n.rampPct ?? DEFAULT_RAMP_PCT,
       ].join(":"),
     )
@@ -310,8 +310,8 @@ export function NodeConnection() {
             command: {
               type: "config",
               shelves: node.storage.shelves,
-              moveSpeed: secPerShelfToDuty(node.secPerShelf),
-              homingSpeed: secPerShelfToHomingDuty(node.secPerShelf),
+              moveSpeed: moveDutyFor(node),
+              homingSpeed: homingDutyFor(node),
               rampPct: node.rampPct ?? DEFAULT_RAMP_PCT,
             },
           }),

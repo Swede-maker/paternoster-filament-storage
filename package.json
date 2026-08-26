@@ -5,6 +5,7 @@
   "scripts": {
     "dev": "next dev",
     "build": "next build",
+    "build:pi": "LOW_MEM=1 next build",
     "start": "next start",
     "lint": "eslint .",
     "postinstall": "node scripts/ensure-native-modules.mjs"

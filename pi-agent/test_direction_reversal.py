@@ -79,10 +79,9 @@ class ReversalHW:
         self._tick = threading.Event()
         self._itick = threading.Event()
         self._was_active = self._window(start_pos)
-        # Mirrors the agent's hardware layer: which way the carousel is turning
-        # right now, and which way it was turning when the flag last LEFT the
-        # window. The second is what tells the agent which SIDE of the sensor the
-        # flag it is parked against is on.
+        # Mirrors the agent's hardware layer: current travel, and the travel at
+        # the moment the flag last LEFT the sensor window. The second is what
+        # tells the agent which side of the sensor the parked flag rests on.
         self.travel_direction = None
         self.flag_exit_direction = None
         self._alive = True
@@ -119,8 +118,8 @@ class ReversalHW:
                         self._index_pulses += 1
                         self._itick.set()
                 elif self._was_active and not active:
-                    # Falling edge: the flag has just left the window, so the
-                    # direction of travel now fixes which side it rests on.
+                    # Falling edge: the flag has just cleared the window, so the
+                    # current travel fixes which side it now rests on.
                     if self.travel_direction is not None:
                         self.flag_exit_direction = self.travel_direction
                 self._was_active = active
@@ -130,6 +129,10 @@ class ReversalHW:
         with self._lock:
             self._powered = True
             self._target = sign * (duty / 0.4)
+
+    def cut(self):
+        """Emergency stop, as the agent's estop path calls it."""
+        self.stop()
 
     def forward(self, duty):
         self._go(duty, +1)
@@ -208,9 +211,9 @@ def make(hw, shelf, last_dir, shelves=9):
     car = pa.Carousel(hw, shelves=shelves, emit=events.append)
     car.homed = True
     car.current_shelf = shelf
-    # The flag's exit side lives in the hardware layer, recorded on the falling
-    # edge — NOT as "the last direction the motor turned", which the alignment
-    # crawl and the homing sweep both leave pointing the wrong way.
+    # Which side the parked flag sits on, i.e. the travel direction that last
+    # carried it out of the sensor window. Lives in the hardware layer because it
+    # is measured at the flag's falling edge, not inferred from the move.
     hw.flag_exit_direction = last_dir
     car.set_motion(move_speed=0.45, ramp_pct=40)
     return car, events

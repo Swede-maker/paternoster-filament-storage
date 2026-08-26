@@ -4,7 +4,13 @@ import { useEffect, useRef, useState } from "react"
 import { ArrowUp, ArrowDown, Home, Loader2, Gauge, OctagonX, Play } from "lucide-react"
 import { useStore } from "@/lib/store"
 import { activeNode } from "@/lib/selectors"
-import { DEFAULT_SEC_PER_SHELF, MIN_SEC_PER_SHELF, MAX_SEC_PER_SHELF, DEFAULT_RAMP_PCT } from "@/lib/filament"
+import {
+  DEFAULT_SEC_PER_SHELF,
+  MIN_SEC_PER_SHELF,
+  MAX_SEC_PER_SHELF,
+  DEFAULT_RAMP_PCT,
+  moveDutyFor,
+} from "@/lib/filament"
 import { Button } from "./ui/button"
 import { CalibrationDialog } from "./calibration-dialog"
 import { cn } from "@/lib/utils"
@@ -264,6 +270,38 @@ export function ManualControl() {
             <span>Sharp</span>
             <span>Gentle</span>
           </div>
+
+          {/* Direct PWM duty. The speed slider above is in seconds-per-shelf and
+              its duty curve is clamped to 25–100%, which cannot express the very
+              low duties a heavy carousel needs to stop coasting past the sensor
+              flag. This sends the duty to the motor as-is. */}
+          <div className="mt-4 flex items-center justify-between">
+            <p className="text-xs uppercase tracking-wider text-muted-foreground">Motor PWM</p>
+            <span className="font-mono text-xs text-foreground">
+              {node.pwmDuty === undefined ? "Auto" : `${Math.round(node.pwmDuty * 100)}%`}
+            </span>
+          </div>
+          <input
+            type="range"
+            aria-label="Direct motor PWM duty (percent)"
+            min={5}
+            max={100}
+            step={1}
+            value={Math.round((node.pwmDuty ?? moveDutyFor(node)) * 100)}
+            disabled={busy}
+            onChange={(e) =>
+              dispatch({ type: "SET_NODE_PWM", nodeId: node.id, pwmDuty: Number(e.target.value) / 100 })
+            }
+            className="mt-2 w-full accent-[var(--color-primary)] disabled:opacity-40"
+          />
+          <div className="flex justify-between text-[10px] uppercase tracking-wide text-muted-foreground">
+            <span>5%</span>
+            <span>100%</span>
+          </div>
+          <p className="mt-1 text-[10px] leading-relaxed text-muted-foreground">
+            Sent straight to the motor, overriding the speed slider. Lower it until the carousel stops
+            overshooting the shelf sensor.
+          </p>
 
           <Button
             variant="secondary"
