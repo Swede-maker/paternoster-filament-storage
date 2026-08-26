@@ -106,11 +106,21 @@ function toPersisted(state: AppState): PersistedState {
     // `linkError` is stripped alongside `connSeq`: it describes THIS device's
     // connection attempt, so syncing it would show a stale local network error
     // on every other device.
-    nodes: state.nodes.map(({ connSeq: _connSeq, linkError: _linkError, ...n }) => ({
-      ...n,
-      link: n.driver === "hardware" ? "offline" : "online",
-      machine: { ...n.machine, homed: true, status: "idle", targetShelf: null, direction: null, moveFrom: null },
-    })),
+    // `agentSimulated`/`agentSimReason` are stripped for the same reason: they
+    // describe the agent THIS device is talking to right now.
+    nodes: state.nodes.map(
+      ({
+        connSeq: _connSeq,
+        linkError: _linkError,
+        agentSimulated: _agentSimulated,
+        agentSimReason: _agentSimReason,
+        ...n
+      }) => ({
+        ...n,
+        link: n.driver === "hardware" ? "offline" : "online",
+        machine: { ...n.machine, homed: true, status: "idle", targetShelf: null, direction: null, moveFrom: null },
+      }),
+    ),
     activeNodeId: state.activeNodeId,
     printers: state.printers,
     activePrinterId: state.activePrinterId,
@@ -433,6 +443,7 @@ type Action =
   | { type: "SET_ACTIVE_NODE"; id: string }
   // Hardware bridge (events reported by a real Pi agent over WebSocket)
   | { type: "NODE_LINK"; nodeId: string; link: PrinterLinkStatus; reason?: string }
+  | { type: "NODE_AGENT_MODE"; nodeId: string; simulated: boolean; reason?: string }
   | { type: "NODE_POS"; nodeId: string; currentShelf: number }
   | { type: "NODE_ARRIVED"; nodeId: string; shelf: number }
   | { type: "NODE_HOMED"; nodeId: string; currentShelf?: number }
@@ -675,6 +686,8 @@ function coreReducer(state: AppState, action: Action): AppState {
             link: old.link,
             linkError: old.linkError,
             connSeq: old.connSeq,
+            agentSimulated: old.agentSimulated,
+            agentSimReason: old.agentSimReason,
             machine: keepMotion ? old.machine : n.machine,
           }
         }),
@@ -1274,6 +1287,15 @@ function coreReducer(state: AppState, action: Action): AppState {
             }
           : n,
       )
+
+    case "NODE_AGENT_MODE":
+      // Reported by the agent in its `hello` frame: is it actually driving GPIO,
+      // or only pretending? Recorded so the UI can warn that no motor will turn.
+      return withNode(state, action.nodeId, (n) => ({
+        ...n,
+        agentSimulated: action.simulated,
+        agentSimReason: action.simulated ? action.reason : undefined,
+      }))
 
     case "NODE_POS":
       // Live position update as the carousel passes each shelf sensor.

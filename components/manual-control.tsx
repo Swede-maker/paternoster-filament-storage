@@ -100,6 +100,22 @@ export function ManualControl() {
         </div>
       )}
 
+      {/* Connected but faking it. This is the dangerous case: everything looks
+          healthy and motion animates normally while the motor never turns. */}
+      {node.driver === "hardware" && node.link === "online" && node.agentSimulated && (
+        <div className="mb-3 rounded-xl border border-destructive/50 bg-destructive/10 p-3">
+          <p className="text-sm font-semibold text-foreground">Agent is simulating — motor will not move</p>
+          <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
+            The Pi agent is connected but reporting fake motion, so the app animates while the GPIO pins stay idle.
+            {node.agentSimReason ? ` Reason: ${node.agentSimReason}` : ""}
+          </p>
+          <p className="mt-2 text-xs leading-relaxed text-muted-foreground">
+            Remove <span className="font-mono">--simulate</span> from the service, or install the Pi 5 pin factory with{" "}
+            <span className="font-mono">sudo apt install -y python3-lgpio</span>, then restart the agent.
+          </p>
+        </div>
+      )}
+
       {stopped ? (
         /* Frozen after an emergency stop: the carousel stays put until the
            operator explicitly resumes the task or re-homes. */

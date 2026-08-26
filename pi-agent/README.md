@@ -103,8 +103,8 @@ If the carousel moves the opposite way from the app's up/down labels, flip
 ## Install & run on the Pi
 
 ```bash
-# 1. Copy this folder to the Pi (e.g. /home/pi/pi-agent) and install deps:
-cd /home/pi/pi-agent
+# 1. Copy this folder to the Pi (anywhere in your home dir), then:
+cd ~/pi-agent
 pip3 install -r requirements.txt
 
 # 2. Run it (must match the shelves count you set for this unit in the app):
@@ -113,12 +113,33 @@ python3 paternoster_agent.py --name "Paternoster 1" --shelves 9 --port 8765
 
 ### Start automatically on boot
 
+Use the installer — **don't copy the `.service` file by hand**:
+
 ```bash
-sudo cp paternoster-agent.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now paternoster-agent
+sudo ./install.sh
+# or: sudo ./install.sh --name "Unit 2" --shelves 12 --port 8766
 journalctl -u paternoster-agent -f   # live logs
 ```
+
+It detects your username and the real folder path, installs the dependencies,
+selects the right pin factory for your Pi model, adds you to the `gpio` group,
+and refuses to enable a unit that still has unfilled placeholders.
+
+> **Why not `cp paternoster-agent.service`?** That is what these docs used to say,
+> and the shipped unit hardcoded `User=pi` with `/home/pi/pi-agent`. Raspberry Pi
+> OS no longer creates a `pi` user, so on a Pi whose user is anything else systemd
+> fails with:
+>
+> ```
+> Failed to determine user credentials: No such process
+> Failed at step USER spawning /usr/bin/python3: No such process
+> Main process exited, code=exited, status=217/USER
+> ```
+>
+> The service then crash-loops, nothing listens on 8765, and the app shows
+> *"Connection refused"*. Re-running a plain `cp` silently restores the broken
+> user, which is why a reinstall could make a previously working unit fail.
+> `install.sh` fills in the real values, so this cannot recur.
 
 ### Try it with no hardware
 
@@ -128,6 +149,36 @@ motor and sensors so you can test the app end to end:
 ```bash
 python3 paternoster_agent.py --simulate --shelves 9 --port 8765
 ```
+
+### "The app says it moved, but the carousel didn't"
+
+If GPIO cannot be initialised, the agent falls back to that same simulator. It
+still connects, still accepts commands and still reports smooth motion — the app
+looks perfect while the motor pins stay idle. The connection is fine; the motion
+is fake. Check the log:
+
+```bash
+journalctl -u paternoster-agent -n 30 --no-pager | grep -i simulation
+```
+
+`WARNING: GPIO IS UNAVAILABLE — RUNNING IN SIMULATION` confirms it, and the app
+shows a red "Agent is simulating" banner in Manual Control with the reason.
+
+The usual cause on a **Pi 5** is gpiozero's default pin factory (RPi.GPIO), which
+does not support the Pi 5's new GPIO chip:
+
+```bash
+sudo apt install -y python3-lgpio
+sudo systemctl edit paternoster-agent   # add: Environment=GPIOZERO_PIN_FACTORY=lgpio
+sudo systemctl restart paternoster-agent
+```
+
+Other causes: `--simulate` left in the service's `ExecStart`, or the service user
+missing from the `gpio` group (`sudo usermod -aG gpio <user>`).
+
+To make this impossible to miss, add `--strict-gpio` to `ExecStart` on the real
+unit. The agent then refuses to start rather than silently pretending, so the
+failure is visible in `systemctl status` instead of looking like working hardware.
 
 ## Where the web app must run
 
