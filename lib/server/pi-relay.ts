@@ -86,6 +86,16 @@ interface Relay {
   lastError: string | null
   /** Reason sent in the last `link` frame, so a changed reason still broadcasts. */
   lastBroadcastReason: string | undefined
+  /**
+   * Last motion tuning (speed / soft start) the app asked for.
+   *
+   * The relay remembers it because the agent forgets: a Pi that reboots or a
+   * socket that drops comes back on its built-in defaults, and the reconnect
+   * `config` used to carry only `shelves` — so the carousel silently reverted to
+   * default speed until the operator happened to touch a slider again. Replaying
+   * this on every open keeps the hardware matching the UI.
+   */
+  motion: { moveSpeed?: number; homingSpeed?: number; rampPct?: number }
   closing: boolean
 }
 
@@ -224,9 +234,12 @@ function openSocket(relay: Relay) {
     relay.pingSentAt = null
     setLink(relay, "online")
     startHeartbeat(relay)
-    // Tell the agent the carousel geometry so it can wrap shelf indexes.
+    // Tell the agent the carousel geometry so it can wrap shelf indexes, and
+    // re-apply the motion tuning. Sending geometry alone here is what made a
+    // reconnected (or rebooted) Pi run at default speed regardless of the
+    // sliders.
     try {
-      ws.send(encodeCommand({ type: "config", shelves: relay.shelves }))
+      ws.send(encodeCommand({ type: "config", shelves: relay.shelves, ...relay.motion }))
     } catch {
       // ignore — heartbeat/reconnect will recover
     }
@@ -291,6 +304,7 @@ function getOrCreate(ip: string, port: number, shelves: number): Relay {
       lastState: null,
       lastError: null,
       lastBroadcastReason: undefined,
+      motion: {},
       closing: false,
     }
     registry.set(key, relay)
@@ -300,7 +314,7 @@ function getOrCreate(ip: string, port: number, shelves: number): Relay {
     relay.shelves = shelves
     if (relay.ws?.readyState === WebSocket.OPEN) {
       try {
-        relay.ws.send(encodeCommand({ type: "config", shelves }))
+        relay.ws.send(encodeCommand({ type: "config", shelves, ...relay.motion }))
       } catch {
         // ignore
       }
@@ -344,7 +358,24 @@ export function subscribe(ip: string, port: number, shelves: number, listener: L
 /** Forward a command to the Pi. Returns false if not currently connected. */
 export function sendCommand(ip: string, port: number, cmd: NodeCommand): boolean {
   const relay = registry.get(keyFor(ip, port))
-  if (!relay || !relay.ws || relay.ws.readyState !== WebSocket.OPEN) return false
+  if (!relay) return false
+
+  // Remember motion tuning even if the socket is down right now, so it is
+  // applied as soon as the Pi comes back rather than being lost.
+  if (cmd.type === "config") {
+    // `registry` is module-level and long-lived, so a relay can predate the code
+    // reading it — after a hot reload in dev, or an old object still in the map
+    // across a redeploy. Such a relay has no `motion` field at all, and writing
+    // straight through it threw "Cannot set properties of undefined", turning
+    // every slider POST into a 500. Heal the shape instead of assuming it.
+    if (!relay.motion) relay.motion = {}
+    if (cmd.moveSpeed !== undefined) relay.motion.moveSpeed = cmd.moveSpeed
+    if (cmd.homingSpeed !== undefined) relay.motion.homingSpeed = cmd.homingSpeed
+    if (cmd.rampPct !== undefined) relay.motion.rampPct = cmd.rampPct
+    if (cmd.shelves > 0) relay.shelves = cmd.shelves
+  }
+
+  if (!relay.ws || relay.ws.readyState !== WebSocket.OPEN) return false
   try {
     relay.ws.send(encodeCommand(cmd))
     return true

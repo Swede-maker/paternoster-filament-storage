@@ -269,29 +269,38 @@ export function NodeConnection() {
   // Keyed on the values themselves, so it re-sends whenever a slider moves and
   // also right after (re)connecting — a restarted Pi comes back on defaults and
   // must be told the current settings again.
+  //
+  // The link state MUST come from the store (`n.link`), not from
+  // `conns.current[id].online`. `conns` is a ref: flipping `online` is a plain
+  // mutation that triggers no re-render, so a signature built from it stays
+  // frozen at whatever it was on mount ("off", since the map starts empty) and
+  // this effect never re-fires on connect. Reading `n.link` — which is dispatched
+  // to the store right beside that mutation — makes connect/disconnect a real
+  // state change that recomputes the signature.
   const configSig = state.nodes
     .filter((n) => n.driver === "hardware")
-    .map((n) => {
-      const c = conns.current[n.id]
-      return [
+    .map((n) =>
+      [
         n.id,
-        c?.online ? "on" : "off",
+        n.link,
         n.storage.shelves,
         secPerShelfToDuty(n.secPerShelf),
         secPerShelfToHomingDuty(n.secPerShelf),
         n.rampPct ?? DEFAULT_RAMP_PCT,
-      ].join(":")
-    })
+      ].join(":"),
+    )
     .join("|")
 
   useEffect(() => {
     // Debounced: dragging a slider fires a change per pixel, and each one would
     // otherwise be a POST to the Pi.
     const timer = setTimeout(() => {
-      for (const node of state.nodes) {
+      for (const node of nodesRef.current) {
         if (node.driver !== "hardware") continue
-        const c = conns.current[node.id]
-        if (!c || !c.online) continue
+        // No ref-based online gate here either. The relay remembers motion
+        // settings and replays them when the Pi reconnects, so sending while the
+        // link is down is harmless (the route answers "Pi not connected") and
+        // strictly better than dropping the operator's setting on the floor.
         void fetch("/api/pi/command", {
           method: "POST",
           headers: { "Content-Type": "application/json" },

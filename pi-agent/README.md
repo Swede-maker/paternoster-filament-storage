@@ -287,9 +287,38 @@ The jam timeout scales with the chosen speed plus the ramp time, so a
 slow-but-healthy move is not misreported as a jam.
 
 Settings are re-sent on reconnect, because a restarted Pi comes back on defaults.
+The **relay** owns that memory (`relay.motion`), not the browser: it replays the
+last known tuning on every socket open, so a Pi reboot cannot silently revert the
+carousel to default speed.
+
+Two further faults were found by watching a live agent log while driving the real
+UI, either of which alone kept the sliders from reaching the hardware:
+
+- **The client effect was keyed on a ref.** `conns` is a `useRef`, so flipping
+  `conn.online` is a plain mutation that triggers no re-render. A signature built
+  from it stayed frozen at its mount value, so the effect never re-fired. The
+  signature now reads `n.link` from the store — dispatched right beside that
+  mutation, and real state that React can see.
+- **`sendCommand` threw a 500 on every config.** `registry` is module-level and
+  long-lived, so a relay object can outlive the code that reads it (hot reload in
+  dev, an old object surviving a redeploy). Those relays have no `motion` field,
+  and writing through it raised `Cannot set properties of undefined`: the POST
+  500'd and the agent log stayed frozen — indistinguishable from a UI that never
+  sent anything. `sendCommand` now heals the shape instead of assuming it.
+
+Note the speed slider is **inverted**: its DOM value is "fastness" (right =
+faster) and the displayed seconds-per-shelf is `MIN + MAX - value`. Driving the
+raw DOM value in a test therefore gives the opposite of what you expect.
 
 ```bash
 python3 test_speed_control.py   # asserts the duty actually changes
+```
+
+To confirm on real hardware, watch the agent while moving a slider — one line
+should appear per change:
+
+```bash
+journalctl -u paternoster-agent -f | grep "motion set"
 ```
 
 ### "The app says it moved, but the carousel didn't"
