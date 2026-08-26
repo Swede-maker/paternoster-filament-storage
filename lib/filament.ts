@@ -144,6 +144,39 @@ export function secPerShelfToStepMs(secPerShelf: number | undefined): number {
   return Math.round(Math.min(1200, Math.max(150, sec * 120)))
 }
 
+/**
+ * Convert the speed slider (seconds per shelf) into a PWM duty cycle (0..1) for
+ * the motor driver.
+ *
+ * The slider is in seconds-per-shelf because that is what calibration measures
+ * and what the operator sees, but the BTS7960 only understands duty. Without
+ * this conversion the slider could only ever retime the on-screen animation —
+ * which is exactly the bug it had.
+ *
+ * Inverted (fewer seconds = faster = higher duty) and clamped to the band the
+ * hardware can actually use: below ~0.25 a geared carousel does not break
+ * stiction and just buzzes. The agent clamps again, so this is defence in depth.
+ */
+export const MIN_MOTOR_DUTY = 0.25
+export const MAX_MOTOR_DUTY = 1
+
+export function secPerShelfToDuty(secPerShelf: number | undefined): number {
+  const sec = secPerShelf && secPerShelf > 0 ? secPerShelf : DEFAULT_SEC_PER_SHELF
+  const span = MAX_SEC_PER_SHELF - MIN_SEC_PER_SHELF
+  const t = Math.max(0, Math.min(1, (sec - MIN_SEC_PER_SHELF) / span)) // 0 fast … 1 slow
+  const duty = MAX_MOTOR_DUTY - t * (MAX_MOTOR_DUTY - MIN_MOTOR_DUTY)
+  return Math.round(duty * 100) / 100
+}
+
+/**
+ * Homing deliberately runs slower than normal moves so the index flag is not
+ * overshot, but it still tracks the slider so a carousel tuned slow homes slow.
+ */
+export function secPerShelfToHomingDuty(secPerShelf: number | undefined): number {
+  const duty = secPerShelfToDuty(secPerShelf) * 0.65
+  return Math.round(Math.max(MIN_MOTOR_DUTY, duty) * 100) / 100
+}
+
 /** Default soft start/stop ramp intensity (%) for a new/uncalibrated carousel. */
 export const DEFAULT_RAMP_PCT = 40
 /** How much the ends of a move can be slowed at full ramp (2.5x base delay). */

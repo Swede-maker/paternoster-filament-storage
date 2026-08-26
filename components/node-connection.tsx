@@ -4,6 +4,7 @@ import { useEffect, useRef } from "react"
 import { useStore } from "@/lib/store"
 import type { StorageNode } from "@/lib/types"
 import { parseEvent, type NodeCommand } from "@/lib/node-protocol"
+import { secPerShelfToDuty, secPerShelfToHomingDuty, DEFAULT_RAMP_PCT } from "@/lib/filament"
 
 /**
  * Owns the live connection to hardware nodes' Pi agents — via the app server.
@@ -257,6 +258,62 @@ export function NodeConnection() {
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [intentSig])
+
+  // --- Push machine settings (shelf count + motion tuning) to the agent. ---
+  //
+  // This effect did not exist, which is why the speed and soft-start sliders had
+  // no effect on the hardware: they updated local state that only retimed the
+  // on-screen animation, and no `config` command was ever sent. The agent kept
+  // running on its built-in defaults.
+  //
+  // Keyed on the values themselves, so it re-sends whenever a slider moves and
+  // also right after (re)connecting — a restarted Pi comes back on defaults and
+  // must be told the current settings again.
+  const configSig = state.nodes
+    .filter((n) => n.driver === "hardware")
+    .map((n) => {
+      const c = conns.current[n.id]
+      return [
+        n.id,
+        c?.online ? "on" : "off",
+        n.storage.shelves,
+        secPerShelfToDuty(n.secPerShelf),
+        secPerShelfToHomingDuty(n.secPerShelf),
+        n.rampPct ?? DEFAULT_RAMP_PCT,
+      ].join(":")
+    })
+    .join("|")
+
+  useEffect(() => {
+    // Debounced: dragging a slider fires a change per pixel, and each one would
+    // otherwise be a POST to the Pi.
+    const timer = setTimeout(() => {
+      for (const node of state.nodes) {
+        if (node.driver !== "hardware") continue
+        const c = conns.current[node.id]
+        if (!c || !c.online) continue
+        void fetch("/api/pi/command", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            ip: node.ip,
+            port: node.port,
+            command: {
+              type: "config",
+              shelves: node.storage.shelves,
+              moveSpeed: secPerShelfToDuty(node.secPerShelf),
+              homingSpeed: secPerShelfToHomingDuty(node.secPerShelf),
+              rampPct: node.rampPct ?? DEFAULT_RAMP_PCT,
+            },
+          }),
+        }).catch(() => {
+          // Settings are re-sent on the next change or reconnect.
+        })
+      }
+    }, 250)
+    return () => clearTimeout(timer)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [configSig])
 
   // Cleanup on unmount.
   useEffect(() => {

@@ -39,10 +39,24 @@ export interface StopCommand {
   type: "stop"
 }
 
-/** Tell the agent how many shelves this carousel has (sent after connect). */
+/**
+ * Push machine settings to the agent: shelf count plus the live motion tuning
+ * behind the speed and soft-start sliders. Sent after connect and again
+ * whenever the operator changes a slider.
+ *
+ * The motion fields are optional so an older agent can ignore them, but if they
+ * are omitted the agent keeps its previous values — the app must send them for
+ * the sliders to have any effect on the hardware.
+ */
 export interface ConfigCommand {
   type: "config"
   shelves: number
+  /** PWM duty (0..1) for normal moves, derived from seconds-per-shelf. */
+  moveSpeed?: number
+  /** PWM duty (0..1) used while homing. */
+  homingSpeed?: number
+  /** Soft start/stop ramp intensity, 0–100%. 0 = no easing. */
+  rampPct?: number
 }
 
 export type NodeCommand = HelloCommand | HomeCommand | GotoCommand | StopCommand | ConfigCommand
