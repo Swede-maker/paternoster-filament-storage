@@ -33,6 +33,8 @@ interface Conn {
   gotoTarget: number | null
   /** True between sending a home/goto and receiving its arrived/homed. */
   commandActive: boolean
+  /** True once an e-stop has been delivered for the current "stopped" state. */
+  stopSent: boolean
 }
 
 export function NodeConnection() {
@@ -201,6 +203,7 @@ export function NodeConnection() {
           homeSent: false,
           gotoTarget: null,
           commandActive: false,
+          stopSent: false,
         }
         connect(nodeId)
       }
@@ -229,8 +232,47 @@ export function NodeConnection() {
     for (const node of state.nodes) {
       if (node.driver !== "hardware") continue
       const c = conns.current[node.id]
-      if (!c || !c.online) continue
+      if (!c) continue
       const m = node.machine
+
+      // EMERGENCY STOP FIRST, and unconditionally.
+      //
+      // Checked BEFORE the `online` guard on purpose. A stop is a safety command,
+      // so it must be attempted even when this client currently believes the link
+      // is down: "we think it is offline" is not evidence the motor is off, and a
+      // stale/flapping `online` flag must never be what swallows it. Every other
+      // command still requires a live link (guard below).
+      //
+      // This branch did not exist. `EMERGENCY_STOP` puts the machine in the
+      // dedicated "stopped" status, which is neither "homing", "moving" nor
+      // "idle" — so it fell straight through this if/else chain and NO `stop`
+      // was ever sent to the Pi. The browser showed the "Emergency stopped"
+      // banner and froze its own animation while the real carousel carried on
+      // turning, which is exactly what happens mid-homing: homing is a long
+      // autonomous routine on the agent, so with no stop delivered it simply
+      // ran to completion.
+      //
+      // Deliberately NOT gated on `c.commandActive`. That flag only tracks what
+      // this app believes it started; an e-stop must also halt motion the app
+      // did not initiate (a resumed routine, or an agent restarted mid-move).
+      // Re-sending `stop` is idempotent and harmless.
+      if (m.status === "stopped") {
+        if (!c.stopSent) {
+          post(node, { type: "stop" })
+          c.stopSent = true
+        }
+        // Clear the command latches so RESUME re-issues home/goto rather than
+        // assuming the in-flight command survived the stop.
+        c.commandActive = false
+        c.homeSent = false
+        c.gotoTarget = null
+        continue
+      }
+      c.stopSent = false
+
+      // Everything past this point is a normal motion command, which is only
+      // meaningful on a live link.
+      if (!c.online) continue
 
       if (m.status === "homing") {
         if (!c.homeSent) {
