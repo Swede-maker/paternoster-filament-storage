@@ -321,6 +321,57 @@ should appear per change:
 journalctl -u paternoster-agent -f | grep "motion set"
 ```
 
+### "It skips a shelf — shelf 1 runs past the sensor instead of shelf 2 arriving"
+
+This looked like the sensor miscounting the parked shelf, but the sensor was
+fine; the blanking window was being measured from the wrong instant.
+
+`_drive()` **blocks** for the whole soft-start ramp (0.48s at `rampPct` 40%, up
+to `MAX_RAMP_SECONDS` = 1.2s). The old order was *drive → sleep(PULSE_BLANKING)
+→ reset_pulses()*, so pulses were discarded for the ramp **plus** another 0.15s
+— about 0.63s. A shelf only takes ~0.5s to pass, so the target shelf's genuine
+pulse landed inside that window and was thrown away, and the **next** carrier
+was counted in its place: exactly one shelf of overshoot.
+
+Three things now keep a one-shelf request to one shelf:
+
+- Blanking is timed from `motor_start`, before the blocking ramp, and only
+  sleeps for whatever of the window has not already elapsed. Once it is over,
+  every pulse counts.
+- A single-shelf hop runs entirely at the gentle approach duty. There is no room
+  to cruise fast and then slow down, so a 1-shelf move at full speed always
+  coasted well past the target.
+- Deceleration after the target pulse is pure overshoot, so the stop ramp is
+  capped by `STOP_RAMP_SECONDS` (0.25s) instead of the full ramp budget.
+
+The same blocking ramp also explains why the speed slider felt dead even after
+the config plumbing was fixed: a 1.2s soft start across a ~0.5s move meant the
+motor was still accelerating when it arrived and never reached the requested
+duty. Short moves now get a capped soft start.
+
+`test_shelf_counting.py` measures **physical shelves travelled** (not the
+reported number) across every speed/ramp combination. Against the pre-fix code
+it fails 15 times, reproducing the reported symptom — a 1-shelf request moving
+1.58, 2.77, even 4.90 shelves:
+
+```bash
+python3 test_shelf_counting.py   # one-shelf request must move one shelf
+```
+
+### "The browser shows shelf 3, but jumps to 2 after a refresh"
+
+Two bugs in the debounced save in `lib/store.tsx`, both losing the last write:
+
+- The timer captured `state` from its own render. The debounce is reset by every
+  `pos` tick, so the timer that eventually fired belonged to an **earlier**
+  render and wrote that older shelf. It now reads `stateRef.current`.
+- The effect cleanup cancelled the armed timer. Keyed on `[sig]`, it also ran
+  when the next render bailed out at the `sig === lastSavedSig` guard — killing
+  a save nothing ever rescheduled.
+
+A pending save is also flushed on `visibilitychange`, so refreshing inside the
+600ms debounce no longer drops the position.
+
 ### "The app says it moved, but the carousel didn't"
 
 If GPIO cannot be initialised, the agent falls back to that same simulator. It
