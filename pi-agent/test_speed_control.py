@@ -37,6 +37,11 @@ class RecordingHW:
         self._tick = threading.Event()
         self._moving = False
         self._pulse_every = pulse_every
+        # The carousel parks INSIDE the sensor window, so a move starts with the
+        # sensor active and clears once the flag is driven out. This fake has no
+        # position model, so the departure is modelled as "active until the motor
+        # has run", which is all the duty-tracking assertions need.
+        self._shelf_active = True
         self._alive = True
         threading.Thread(target=self._spin, daemon=True).start()
 
@@ -57,6 +62,10 @@ class RecordingHW:
         with self._lock:
             self.events.append(("stop", 0.0))
             self._moving = False
+            # Stopping means the target shelf has arrived at the window, so the
+            # post-move alignment check finds the sensor active and settles
+            # without needing to crawl.
+            self._shelf_active = True
 
     # --- sensors: pulses arrive while powered, independent of duty ---
     def _spin(self):
@@ -101,6 +110,21 @@ class RecordingHW:
         return True
 
     def index_active(self):
+        return False
+
+    def shelf_active(self):
+        with self._lock:
+            return self._shelf_active
+
+    def shelf_clear(self, timeout):
+        # The flag leaves the window shortly after the motor starts turning.
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            with self._lock:
+                if self._moving:
+                    self._shelf_active = False
+                    return True
+            time.sleep(0.005)
         return False
 
     def cleanup(self):
@@ -170,9 +194,20 @@ def main():
     gentle = run_move(0.9, 100)
     # Count distinct duty steps before the peak: a ramp climbs through many
     # intermediate values, a hard start jumps straight to target.
+    # Only the duties up to the FIRST peak belong to the soft start. Parking on
+    # the sensor means a move also crawls at MIN_DUTY to drive the parked flag
+    # out of the window beforehand, and nudges at MIN_DUTY to centre it
+    # afterwards. Both are legitimately below peak but are alignment, not ramp,
+    # so counting every sub-peak duty would report a climb even at ramp 0%.
     def climb_steps(hw):
-        peak = max(hw.duties) if hw.duties else 0
-        return len([d for d in hw.duties if d < peak - 1e-9])
+        if not hw.duties:
+            return 0
+        peak = max(hw.duties)
+        climb = hw.duties[: hw.duties.index(peak)]
+        # Drop the leading departure crawl at MIN_DUTY.
+        while climb and climb[0] <= pa.MIN_DUTY + 1e-9:
+            climb.pop(0)
+        return len([d for d in climb if d < peak - 1e-9])
     sharp_steps = climb_steps(sharp)
     gentle_steps = climb_steps(gentle)
     check("ramp 0% starts at full duty immediately", sharp_steps == 0, f"intermediate={sharp_steps}")

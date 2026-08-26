@@ -27,6 +27,9 @@ class FakeHW:
         self._index_tick = threading.Event()
         # The whole point: the sensor is covered while parked.
         self._on_flag = start_on_flag
+        # Parked at 0.0 means the shelf window is already active, so seed the
+        # edge detector True or startup fabricates a pulse that never happened.
+        self._shelf_was_active = True
         self.motor_on_time = 0.0
         self.power_cycles = 0
         self._running = True
@@ -42,19 +45,27 @@ class FakeHW:
             with self._lock:
                 if self._dir != 0 and self._speed > 0:
                     self.motor_on_time += dt
-                    before = self._pos
                     self._pos += self._dir * dt * (self._speed / 0.4)
                     # Moving even a little drives us off the parked flag.
                     if abs(self._pos) > 0.25:
                         self._on_flag = False
-                    if int(before) != int(self._pos):
-                        self._shelf_pulses += 1
-                        self._shelf_tick.set()
-                        if int(round(self._pos)) % self.shelves == 0:
-                            self._index_pulses += 1
-                            self._index_tick.set()
-                            self._on_flag = True
+                # Shelf edges are derived from the window LEVEL, matching both
+                # gpiozero's when_activated and SimHardware. A zero-width
+                # tripwire is never active at rest, so it cannot model a
+                # carousel parked inside the sensor window.
+                active = self._shelf_window_active()
+                if active and not self._shelf_was_active:
+                    self._shelf_pulses += 1
+                    self._shelf_tick.set()
+                    if int(round(self._pos)) % self.shelves == 0:
+                        self._index_pulses += 1
+                        self._index_tick.set()
+                        self._on_flag = True
+                self._shelf_was_active = active
             time.sleep(0.002)
+
+    def _shelf_window_active(self):
+        return abs(self._pos - round(self._pos)) <= pa.SIM_SENSOR_HALF_WIDTH
 
     def forward(self, speed):
         with self._lock:
@@ -108,6 +119,18 @@ class FakeHW:
     def index_clear(self, timeout):
         deadline = time.monotonic() + timeout
         while self.index_active():
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.005)
+        return True
+
+    def shelf_active(self):
+        with self._lock:
+            return self._shelf_window_active()
+
+    def shelf_clear(self, timeout):
+        deadline = time.monotonic() + timeout
+        while self.shelf_active():
             if time.monotonic() >= deadline:
                 return False
             time.sleep(0.005)

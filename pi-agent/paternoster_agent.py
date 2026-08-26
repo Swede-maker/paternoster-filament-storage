@@ -71,13 +71,42 @@ SENSOR_BOUNCE = 0.01  # debounce (s) for the inductive sensors
 # Max time to drive off the index flag when homing starts while already on it.
 # The motor runs throughout; this only bounds how long we watch for it to clear.
 INDEX_CLEAR_TIMEOUT = 10.0
-# The carousel always halts a hair PAST a sensor edge, so the shelf is still
-# near the window. Starting up again — especially in the opposite direction —
-# re-enters that window and fires a phantom pulse within a few milliseconds.
-# Pulses arriving this soon after the motor starts are therefore discarded.
+# Fallback blanking for the rare case where a move STARTS with the shelf window
+# already empty (an aborted move, or a fault that left the carousel mid-travel).
+# In the normal case the flag is sitting in the window and the far more accurate
+# `shelf_clear()` wait below is used instead of this fixed guess.
 # The motor runs normally during this window: it filters counting, not power.
 # Keep it well under the real per-shelf travel time (~0.5s at MOVE_SPEED).
 PULSE_BLANKING = 0.15
+
+# ---- Parking ON the sensor -----------------------------------------------
+# The carousel parks with the target shelf's flag still INSIDE the sensor
+# window, so "in position" is a fact that can be re-checked at any time rather
+# than dead reckoning. Two consequences drive the motion code:
+#   * A move BEGINS with the sensor already active. The flag must be driven out
+#     of the window before counting starts, or the level dropping as it leaves
+#     (or a bounce right on the boundary) is counted as the target's arrival and
+#     the move ends after ~30mm.
+#   * A move must END inside the window. A soft stop always coasts, so after
+#     stopping the sensor is re-checked and the shelf is crept back into the
+#     window if it drifted out.
+# Bounds how long we watch the parked flag leave the window. The motor runs
+# throughout; this only limits the wait, exactly like INDEX_CLEAR_TIMEOUT.
+SHELF_CLEAR_TIMEOUT = 10.0
+# Realignment crawl. MIN_DUTY is the slowest duty that still breaks stiction,
+# which is precisely what "go even more slow in reverse" needs.
+CREEP_DUTY = MIN_DUTY
+CREEP_TIMEOUT = 6.0
+# Extra crawl after the window edge is found, so the flag settles nearer the
+# MIDDLE of the window instead of balancing on its boundary, where the smallest
+# vibration or drift would read as "not in position".
+CENTER_NUDGE_SECONDS = 0.12
+# SIMULATION ONLY. Half-width of the sensor window in shelf units, i.e. how much
+# of the travel between two shelves reads "detected". A ~35mm flag on a ~200mm
+# shelf pitch is about 0.18. Without a window the simulated sensor is a zero-
+# width tripwire that is never active while parked, which cannot reproduce any
+# of the park-on-sensor behaviour this code exists to get right.
+SIM_SENSOR_HALF_WIDTH = 0.18
 
 # Output type of the inductive proximity sensors. This decides which logic level
 # counts as "shelf detected", so getting it wrong makes the sensors look dead and
@@ -233,6 +262,25 @@ class RealHardware:
     def index_active(self) -> bool:
         return bool(self.index.is_active)
 
+    def shelf_clear(self, timeout: float) -> bool:
+        """
+        Block until the shelf window is EMPTY, leaving motor power untouched so
+        the carousel keeps driving off the flag while we watch.
+
+        This is the counterpart to `index_clear` for the per-shelf sensor, and it
+        is what makes parking ON the sensor safe: the level is only consulted to
+        decide when COUNTING may begin, never whether the motor is energised.
+        """
+        deadline = time.monotonic() + timeout
+        while self.shelf.is_active:
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.005)
+        return True
+
+    def shelf_active(self) -> bool:
+        return bool(self.shelf.is_active)
+
     def cleanup(self) -> None:
         try:
             self.motor.stop()
@@ -263,9 +311,20 @@ class SimHardware:
         self._index_pulses = 0
         self._shelf_tick = threading.Event()
         self._index_tick = threading.Event()
+        # Position 0.0 is a shelf in place, so the window starts ACTIVE. Seeding
+        # this True is what stops a phantom pulse being reported at startup.
+        self._shelf_was_active = True
         self._running = True
         self._t = threading.Thread(target=self._loop, daemon=True)
         self._t.start()
+
+    # ---- sensor geometry (lock-free; callers already hold the lock) ----
+    def _shelf_window_active(self) -> bool:
+        """True while a shelf flag is inside the sensor window."""
+        return abs(self._pos - round(self._pos)) <= SIM_SENSOR_HALF_WIDTH
+
+    def _index_window_active(self) -> bool:
+        return self._shelf_window_active() and int(round(self._pos)) % self.shelves == 0
 
     def _loop(self) -> None:
         last = time.monotonic()
@@ -275,15 +334,22 @@ class SimHardware:
             last = now
             with self._lock:
                 if self._dir != 0 and self._speed > 0:
-                    before = self._pos
                     # ~1 shelf every (0.4 / speed) seconds.
                     self._pos += self._dir * dt * (self._speed / 0.4)
-                    if int(before) != int(self._pos):
-                        self._shelf_pulses += 1
-                        self._shelf_tick.set()
-                        if int(round(self._pos)) % self.shelves == 0:
-                            self._index_pulses += 1
-                            self._index_tick.set()
+                # Derive the LEVEL from geometry, then the EDGE from the level —
+                # the same order as the real hardware, where gpiozero raises
+                # `when_activated` on an inactive->active transition. The old
+                # `int(before) != int(pos)` test was a zero-width tripwire: it
+                # fired mid-way between shelves and was never active at rest, so
+                # a parked-on-sensor carousel was impossible to simulate.
+                active = self._shelf_window_active()
+                if active and not self._shelf_was_active:
+                    self._shelf_pulses += 1
+                    self._shelf_tick.set()
+                    if self._index_window_active():
+                        self._index_pulses += 1
+                        self._index_tick.set()
+                self._shelf_was_active = active
             time.sleep(0.005)
 
     def forward(self, speed: float) -> None:
@@ -341,7 +407,19 @@ class SimHardware:
 
     def index_active(self) -> bool:
         with self._lock:
-            return int(round(self._pos)) % self.shelves == 0
+            return self._index_window_active()
+
+    def shelf_clear(self, timeout: float) -> bool:
+        deadline = time.monotonic() + timeout
+        while self.shelf_active():
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.005)
+        return True
+
+    def shelf_active(self) -> bool:
+        with self._lock:
+            return self._shelf_window_active()
 
     def cleanup(self) -> None:
         self._running = False
@@ -468,6 +546,103 @@ class Carousel:
             time.sleep(RAMP_STEP_SECONDS)
         self.hw.stop()
 
+    def _creep_until_active(self, direction: str, timeout: float) -> bool:
+        """
+        Crawl in `direction` at CREEP_DUTY until the shelf window reads active.
+
+        On success the motor is left RUNNING so the caller can keep crawling a
+        little further to centre the flag. On failure or abort it is stopped.
+        """
+        drive = self.hw.backward if direction == "up" else self.hw.forward
+        drive(CREEP_DUTY)
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if self._abort.is_set():
+                self.hw.stop()
+                return False
+            if self.hw.shelf_active():
+                return True
+            time.sleep(0.005)
+        self.hw.stop()
+        return False
+
+    def _settle_on_sensor(self, direction: str) -> None:
+        """
+        Leave the carousel parked with the shelf flag INSIDE the sensor window.
+
+        A soft stop always coasts, so counting alone cannot guarantee where the
+        shelf physically ended up. This consults the sensor and corrects:
+
+        * Window empty  -> overshot. Crawl back the way we came at CREEP_DUTY
+          until the window is found again.
+        * Window active -> we are balanced on the edge we just entered, since a
+          pulse fires the moment the flag reaches the window boundary.
+
+        Either way the flag is then eased a little deeper into the window, so it
+        settles nearer the middle than the boundary. Parking on the very edge is
+        what makes a shelf read as "not in position" after a nudge or a power
+        cycle, and it is also what turns the next move's departure into a
+        bounce-prone miscount.
+        """
+        if self._abort.is_set():
+            return
+
+        reverse = "down" if direction == "up" else "up"
+        nudge = CENTER_NUDGE_SECONDS
+        if self.hw.shelf_active():
+            # Already inside; centre it by continuing the way we were going.
+            nudge_dir = direction
+        else:
+            if not self._creep_until_active(reverse, CREEP_TIMEOUT):
+                self.hw.stop()
+                self.hw.reset_pulses()
+                self.emit({"type": "fault",
+                           "message": "Shelf not aligned: sensor never re-triggered"})
+                return
+            # Found the window from the far side, so "deeper in" is that way too.
+            # We stopped the instant the boundary was detected, so the flag is
+            # right on the edge and gets the full nudge to reach the middle.
+            nudge_dir = reverse
+
+        drive = self.hw.backward if nudge_dir == "up" else self.hw.forward
+        drive(CREEP_DUTY)
+        # Creep in short slices, stopping the moment the flag leaves the window,
+        # so a nudge can never push it out the far side. A single blind sleep is
+        # what stranded the shelf between shelves when the move started
+        # mid-travel and the crawl entered the window already past its centre.
+        slice_s = 0.02
+        waited = 0.0
+        while waited < nudge:
+            time.sleep(slice_s)
+            waited += slice_s
+            if self._abort.is_set() or not self.hw.shelf_active():
+                break
+        self.hw.stop()
+
+        # If the nudge itself carried the flag out the far side, come back and
+        # accept the edge rather than leaving the shelf parked outside the
+        # window: being on the boundary is imperfect, being outside is a fault.
+        #
+        # Retry from alternating sides. A single attempt was not enough: when a
+        # move begins mid-travel the crawl can cross the whole window, and one
+        # unchecked correction left the shelf stranded between two shelves.
+        for attempt in range(3):
+            if self.hw.shelf_active() or self._abort.is_set():
+                break
+            back = "down" if nudge_dir == "up" else "up"
+            probe = back if attempt % 2 == 0 else nudge_dir
+            self._creep_until_active(probe, CREEP_TIMEOUT)
+            self.hw.stop()
+
+        self.hw.stop()
+        if not self.hw.shelf_active() and not self._abort.is_set():
+            self.emit({"type": "fault",
+                       "message": "Shelf not aligned: could not settle on sensor"})
+
+        # Alignment is not travel. Drop the edges it produced so the next move
+        # does not count them as shelves.
+        self.hw.reset_pulses()
+
     def shutdown(self) -> None:
         self._alive = False
         self._abort.set()
@@ -511,7 +686,8 @@ class Carousel:
         self.hw.reset_pulses()
         # Soft-started at the CURRENT homing speed, not the module default, so
         # the sliders affect homing too.
-        self._drive("up" if HOMING_DIRECTION == "down" else "down", self.homing_speed)
+        home_direction = "up" if HOMING_DIRECTION == "down" else "down"
+        self._drive(home_direction, self.homing_speed)
 
         # Classic "already sitting on the switch" problem: if the carousel is
         # parked with a shelf inside the index window, the flag is active before
@@ -533,6 +709,12 @@ class Carousel:
             self.status = "idle"
             self.emit({"type": "fault", "message": "Homing timed out: index sensor not found"})
             return
+        # Homing stops on the index edge, which leaves the shelf flag on the
+        # boundary of the shelf window rather than inside it. Every move now
+        # assumes it starts parked in that window, so align before declaring
+        # home — otherwise the very first move after homing takes the degraded
+        # blanking path instead of waiting for a real departure edge.
+        self._settle_on_sensor(home_direction)
         self.current_shelf = 0
         self.homed = True
         self.status = "idle"
@@ -582,25 +764,46 @@ class Carousel:
         # a big coast past the target. Do the whole hop at the approach duty.
         cruise = approach if steps <= 1 else speed
 
-        # Blanking is measured from the moment the motor STARTS, not from the end
-        # of the soft-start ramp. `_drive` BLOCKS for the whole ramp (0.48s at
-        # ramp 40%, up to 1.2s), so the old "ramp, then sleep, then reset" order
-        # discarded every pulse in the first ~0.63s. Per-shelf travel is only
-        # ~0.5s, so the genuine first pulse was thrown away and the NEXT carrier
-        # got counted in its place — the carousel overshot by exactly one shelf,
-        # which looks precisely like the sensor miscounting the parked shelf.
+        # The carousel parks INSIDE the sensor window, so a move normally starts
+        # with the sensor already active. The parked flag must be driven OUT of
+        # the window before counting begins, otherwise the level dropping as it
+        # leaves — or the smallest bounce on that boundary — is counted as the
+        # target shelf arriving and the move ends after ~30mm.
+        #
+        # This happens at MIN_DUTY, BEFORE the soft start, and the order matters:
+        # `_drive` blocks for the whole ramp (up to 1.2s), which is long enough
+        # to carry the carousel past an entire shelf. Waiting for the window
+        # afterwards would then discard pulses for shelves already travelled and
+        # overshoot by nearly a full shelf. Detecting the departure at crawl
+        # speed keeps it unambiguous.
         motor_start = time.monotonic()
-        # Short moves get a capped soft start so the requested duty is actually
-        # reached while there is still travel left to feel it.
+        if direction == "up":
+            self.hw.backward(MIN_DUTY)
+        else:
+            self.hw.forward(MIN_DUTY)
+
+        if self.hw.shelf_active():
+            if not self.hw.shelf_clear(SHELF_CLEAR_TIMEOUT):
+                self.hw.stop()
+                self.status = "idle"
+                self.emit({"type": "fault",
+                           "message": "Shelf sensor never cleared; check sensor wiring or jam"})
+                return
+            self.hw.reset_pulses()  # drop the edge produced by leaving the flag
+        else:
+            # Window already empty (an aborted move or fault left the carousel
+            # mid-travel). There is no departure edge to wait for, so fall back
+            # to blanking against a phantom re-entry pulse.
+            elapsed = time.monotonic() - motor_start
+            if elapsed < PULSE_BLANKING:
+                time.sleep(PULSE_BLANKING - elapsed)
+            self.hw.reset_pulses()
+
+        # Now the soft start proper, continuing up from the crawl duty the motor
+        # is already running at. Short moves get a capped ramp so the requested
+        # duty is actually reached while there is still travel left to feel it.
         self._drive(direction, cruise, max_seconds=STOP_RAMP_SECONDS if steps <= 1 else None)
         speed = cruise
-
-        # Only discard pulses if we are still genuinely inside the blanking
-        # window. Once it has elapsed, every pulse is real and must be counted.
-        elapsed = time.monotonic() - motor_start
-        if elapsed < PULSE_BLANKING:
-            time.sleep(PULSE_BLANKING - elapsed)
-            self.hw.reset_pulses()
 
         # A slow speed or a long soft start means the first shelf legitimately
         # takes longer to arrive. Scaling the jam timeout keeps a slow-but-
@@ -608,6 +811,10 @@ class Carousel:
         pulse_timeout = PULSE_TIMEOUT * (MOVE_SPEED / max(MIN_DUTY, speed)) + self._ramp_seconds()
 
         counted = 0
+        # True once a shelf has been counted and we are waiting for that shelf's
+        # departure edge. The move starts with the parked flag already driven out
+        # of the window, so the next edge is a genuine arrival.
+        pending_departure = False
         while counted < steps:
             if self._abort.is_set():
                 self.hw.stop()
@@ -621,6 +828,21 @@ class Carousel:
                 self.status = "idle"
                 self.emit({"type": "fault", "message": "Jam? No shelf pulse within timeout"})
                 return
+            # An inductive sensor is a LEVEL, so each shelf passing can produce
+            # TWO edges: one as the flag enters the window and one as it leaves.
+            # Counting raw edges counted every shelf twice and ended a 3-shelf
+            # move after about 2 shelves. A shelf counts only on ARRIVAL; the
+            # matching departure edge is consumed and discarded.
+            #
+            # Reading the level to classify the edge is racy on its own: at speed
+            # the flag can cross the whole window before we get to look. So the
+            # level is only trusted while it still says "inside", and otherwise
+            # we fall back to alternating arrival/departure, which is what a
+            # level sensor always does.
+            if pending_departure and not self.hw.shelf_active():
+                pending_departure = False
+                continue
+            pending_departure = True
             counted += 1
             # Soft stop, part 1: with one shelf left to travel, drop to a slower
             # approach duty so the carousel is already crawling when it reaches
@@ -648,6 +870,9 @@ class Carousel:
         # Soft stop, part 2: ease the duty down to a halt rather than cutting
         # power dead. `_decelerate` falls through to a plain stop at ramp 0%.
         self._decelerate(direction, speed, max_seconds=STOP_RAMP_SECONDS)
+        # Counting says we arrived; the sensor says where we actually are. Park
+        # the shelf inside the window so "in position" stays verifiable.
+        self._settle_on_sensor(direction)
         self.status = "idle"
         if self.homed:
             self.current_shelf = target
