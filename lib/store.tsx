@@ -300,6 +300,19 @@ function freshMachine(): Machine {
   return { currentShelf: 0, homed: false, status: "idle", targetShelf: null, direction: null, moveFrom: null }
 }
 
+/**
+ * Can this unit actually be commanded right now?
+ *
+ * A hardware node is only drivable while its Pi agent is connected. Without this
+ * guard the reducer happily enters "homing"/"moving" on an offline unit, but
+ * NodeConnection skips offline nodes so no command is ever sent — the spinner
+ * then runs forever and it looks like the app moved a motor that never turned.
+ * Simulated nodes run on in-app timers and are always drivable.
+ */
+function isDrivable(n: StorageNode): boolean {
+  return n.driver !== "hardware" || n.link === "online"
+}
+
 /** Shelf nodes have no hardware, so their "machine" is permanently homed/idle. */
 function shelfMachine(): Machine {
   return { currentShelf: 0, homed: true, status: "idle", targetShelf: null, direction: null, moveFrom: null }
@@ -633,8 +646,40 @@ function prefetchOtherNodes(state: AppState): AppState {
  */
 function coreReducer(state: AppState, action: Action): AppState {
   switch (action.type) {
-    case "HYDRATE":
-      return action.state
+    case "HYDRATE": {
+      // A hydrate carries the SHARED document, which deliberately omits this
+      // device's live state: `toPersisted` blanks it and `migrate` rebuilds every
+      // hardware node as `link: "offline"` with idle motion fields.
+      //
+      // So a blind `return action.state` on every sync poll broke hardware twice:
+      //   1. It reset `link` to "offline" even while the relay socket was live.
+      //      The relay only broadcasts `link` frames on CHANGE, so it never
+      //      re-sent "online" — the unit stayed stuck offline forever and every
+      //      command was silently skipped, while the server was talking to the Pi
+      //      perfectly well.
+      //   2. It snapped motion fields to idle mid-move, so a rotation jumped to
+      //      its destination instantly instead of animating.
+      //
+      // Carry both over from the node we already have. On first load there are no
+      // existing nodes, so this is a no-op and the document applies as-is.
+      const prev = new Map(state.nodes.map((n) => [n.id, n]))
+      return {
+        ...action.state,
+        nodes: action.state.nodes.map((n) => {
+          const old = prev.get(n.id)
+          if (!old) return n
+          // Mid-motion locally? Keep the live machine so the animation survives.
+          const keepMotion = old.machine.status !== "idle"
+          return {
+            ...n,
+            link: old.link,
+            linkError: old.linkError,
+            connSeq: old.connSeq,
+            machine: keepMotion ? old.machine : n.machine,
+          }
+        }),
+      }
+    }
 
     case "SETUP": {
       const base = makeInitialState()
@@ -1058,7 +1103,10 @@ function coreReducer(state: AppState, action: Action): AppState {
     }
 
     // ----- machine (per node) -----
-    case "HOME_START":
+    case "HOME_START": {
+      // Refuse rather than spin forever on a disconnected unit.
+      const target = getNode(state, action.nodeId)
+      if (!target || !isDrivable(target)) return state
       return withNode(state, action.nodeId, (n) => ({
         ...n,
         machine: {
@@ -1071,6 +1119,7 @@ function coreReducer(state: AppState, action: Action): AppState {
           resumeStatus: null,
         },
       }))
+    }
 
     case "HOME_DONE":
       return withNode(state, action.nodeId, (n) => ({
@@ -1090,6 +1139,7 @@ function coreReducer(state: AppState, action: Action): AppState {
     case "MANUAL_MOVE": {
       const node = getNode(state, action.nodeId)
       if (!node || node.machine.status !== "idle" || !node.machine.homed) return state
+      if (!isDrivable(node)) return state
       const { shelves } = node.storage
       const delta = action.direction === "down" ? 1 : -1
       const target = (node.machine.currentShelf + delta + shelves) % shelves
@@ -1113,6 +1163,7 @@ function coreReducer(state: AppState, action: Action): AppState {
     case "GOTO_SHELF": {
       const node = getNode(state, action.nodeId)
       if (!node || !node.machine.homed || node.machine.status !== "idle" || state.job) return state
+      if (!isDrivable(node)) return state
       if (action.shelf === node.machine.currentShelf) return state
       const { direction } = shortestRotation(node.machine.currentShelf, action.shelf, node.storage.shelves)
       return withNode(state, action.nodeId, (n) => ({

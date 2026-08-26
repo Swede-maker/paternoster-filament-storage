@@ -161,8 +161,14 @@ to `127.0.0.1` — the app server and the agent are now the same machine, so the
 connection is local and always works. Any other always-on LAN machine (NAS,
 mini-PC) works too; point it at the Pi's LAN IP instead.
 
-The app needs `DATABASE_URL` in a `.env.local` file to start, since the shared
-state lives in Postgres.
+No environment variables or database server are needed: state is kept in a local
+SQLite file on the machine running the app. If the app reports a load error after
+an update, rebuild the native module with `pnpm rebuild better-sqlite3`.
+
+> **The v0 preview cannot drive hardware.** Its server runs in the cloud, so
+> `127.0.0.1` there means the cloud sandbox — not your Pi — and there are no GPIO
+> pins. Use the preview for UI work only; motors move only from an app server
+> running on the Pi.
 
 > Exposing the Pi to a cloud-hosted app server (Tailscale, Cloudflare Tunnel)
 > also works, but the agent has **no authentication** — anyone who can reach the
@@ -201,8 +207,7 @@ coordinator and every Pi is an equal peer running the same agent.
 `paternoster_agent.py` is **self-contained** — it imports only the Python standard
 library plus `gpiozero` and `websockets`, and nothing from the rest of the repo. So
 copy the `pi-agent/` folder and nothing else. You do **not** need Node.js, pnpm,
-`node_modules/`, `app/`, `components/`, `lib/`, Postgres, or `DATABASE_URL` on this
-Pi.
+`node_modules/`, `app/`, `components/`, or `lib/` on this Pi.
 
 Strictly, one file is mandatory (`paternoster_agent.py`); the other two just make
 installation and autostart easier:

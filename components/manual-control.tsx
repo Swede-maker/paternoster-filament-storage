@@ -14,7 +14,15 @@ export function ManualControl() {
   const node = activeNode(state)
   const { currentShelf, homed, status } = node.machine
   const idle = status === "idle" && !state.job
-  const canJog = homed && idle
+  // A hardware unit whose Pi agent isn't connected cannot be commanded at all:
+  // the store refuses the action, so the controls must say so rather than look
+  // live and do nothing.
+  const offline = node.driver === "hardware" && node.link !== "online"
+  // "checking" (handshake still hanging) and "offline" (socket rejected/closed)
+  // have OPPOSITE causes — dropped packets or a wrong address vs. nothing
+  // listening — so they must never look the same while diagnosing.
+  const checking = node.driver === "hardware" && node.link === "checking"
+  const canJog = homed && idle && !offline
   const [calibrating, setCalibrating] = useState(false)
 
   // Speed controls only apply to a motorized carousel, not manual shelf storage.
@@ -71,6 +79,27 @@ export function ManualControl() {
     <section aria-label="Manual control" className="border-t border-border px-4 py-4">
       <h2 className="pb-3 text-xs font-semibold uppercase tracking-wider text-muted-foreground">Manual Control</h2>
 
+      {/* Explain up front why the motion controls are dead, so a disconnected
+          unit can't be mistaken for a broken one. */}
+      {offline && (
+        <div className="mb-3 rounded-xl border border-warning/40 bg-warning/10 p-3">
+          <p className="text-sm font-semibold text-foreground">
+            {checking ? "Connecting to Pi agent…" : "Pi agent not connected"}
+          </p>
+          <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
+            {checking
+              ? "The handshake has not completed. If it stays here, the packets are being dropped (firewall) or the address is wrong — a Pi that is up but idle refuses instantly instead."
+              : (node.linkError ??
+                "This unit is offline, so the motor cannot be commanded. Check the agent in Settings.")}
+          </p>
+          {/* The address the server is actually dialling — the fastest way to
+              spot a unit still pointing at the wrong host. */}
+          <p className="mt-2 font-mono text-[11px] text-muted-foreground/80">
+            {`ws://${node.ip}:${node.port}`}
+          </p>
+        </div>
+      )}
+
       {stopped ? (
         /* Frozen after an emergency stop: the carousel stays put until the
            operator explicitly resumes the task or re-homes. */
@@ -93,6 +122,7 @@ export function ManualControl() {
               variant="outline"
               size="md"
               className="w-full"
+              disabled={offline}
               onClick={() => {
                 // Homing abandons any in-progress task, so clear the job too.
                 if (state.job) dispatch({ type: "CANCEL_JOB" })
@@ -150,7 +180,7 @@ export function ManualControl() {
             variant="outline"
             size="md"
             className="mt-3 w-full"
-            disabled={busy}
+            disabled={busy || offline}
             onClick={() => dispatch({ type: "HOME_START", nodeId: node.id })}
           >
             {status === "homing" ? <Loader2 className="h-4 w-4 animate-spin" /> : <Home className="h-4 w-4" />}
