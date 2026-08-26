@@ -372,16 +372,23 @@ async def serve(args) -> None:
     if args.simulate:
         hw = SimHardware(shelves)
         sim_reason = "started with --simulate"
-        print(f"[agent] running in SIMULATION mode ({shelves} shelves)")
+        print(f"[agent] running in SIMULATION mode ({shelves} shelves)", flush=True)
     else:
         try:
             hw = RealHardware()
-            print("[agent] GPIO ready: driving real hardware")
+            # flush=True matters under systemd: stdout is a pipe, not a TTY, so
+            # Python block-buffers it and this line can sit unflushed indefinitely.
+            # Without it `journalctl | grep -i gpio` returns nothing from the
+            # agent, making a perfectly healthy agent look silent and dead.
+            print("[agent] GPIO ready: driving real hardware", flush=True)
         except Exception as exc:
             if args.strict_gpio:
                 # Refuse to pretend. Better a dead service you can see in
                 # `systemctl status` than a live one that quietly does nothing.
-                print(f"[agent] FATAL: GPIO unavailable ({exc}); --strict-gpio set, refusing to simulate")
+                print(
+                    f"[agent] FATAL: GPIO unavailable ({exc}); --strict-gpio set, refusing to simulate",
+                    flush=True,
+                )
                 raise SystemExit(1)
             sim_reason = f"GPIO unavailable: {exc}"
             hw = SimHardware(shelves)
@@ -450,7 +457,7 @@ async def serve(args) -> None:
         finally:
             clients.discard(ws)
 
-    print(f"[agent] '{args.name}' listening on ws://0.0.0.0:{args.port}/")
+    print(f"[agent] '{args.name}' listening on ws://0.0.0.0:{args.port}/", flush=True)
     async with websockets.serve(handler, "0.0.0.0", args.port):
         try:
             await asyncio.Future()  # run forever

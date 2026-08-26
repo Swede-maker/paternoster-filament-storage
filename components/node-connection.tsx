@@ -122,8 +122,23 @@ export function NodeConnection() {
               reason: ev.simReason ?? undefined,
             })
             break
+          // A `state` frame is the agent's opening summary on connect. It must
+          // NOT be treated like a `pos` frame: the agent keeps position purely
+          // in memory and resets to `current_shelf = 0, homed = False` on every
+          // start, so a freshly (re)started agent reports a position it has not
+          // actually verified. Adopting it overwrote the correct persisted shelf
+          // on every browser refresh — and if the agent restarted mid-home the
+          // number varied, which is why the jump looked random.
+          //
+          // An un-homed agent knows nothing about where the carousel is, so the
+          // persisted position stays authoritative until it genuinely homes.
           case "state":
+            if (ev.homed) {
+              dispatch({ type: "NODE_POS", nodeId, currentShelf: ev.shelf })
+            }
+            break
           case "pos":
+            // Real sensor crossing during motion — always authoritative.
             dispatch({ type: "NODE_POS", nodeId, currentShelf: ev.shelf })
             break
           case "arrived":
