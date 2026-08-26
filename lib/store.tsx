@@ -1847,8 +1847,17 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     if (saveTimer.current) clearTimeout(saveTimer.current)
     saveInFlight.current = true
     saveTimer.current = setTimeout(async () => {
+      // Persist the NEWEST state, not the render that scheduled this timer.
+      // Capturing `state` from the closure is why the carousel position jumped
+      // back a shelf on refresh: the debounce is reset by every `pos` tick, so
+      // the timer that finally fires belongs to an EARLIER render and wrote that
+      // older shelf. The final `arrived` position produced no further change to
+      // re-trigger the effect, so it was never written at all — the UI showed 3
+      // while the database still held 2.
+      const snapshot = stateRef.current
+      const snapshotSig = persistedSig(snapshot)
       try {
-        let payload = toPersisted(state)
+        let payload = toPersisted(snapshot)
         // Before a last-write-wins save, fold in any catalog additions another
         // device made since our last sync (profiles, barcodes, containers,
         // custom materials/brands, orders) so this save can't drop them — while
@@ -1863,7 +1872,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         }
         const { version } = await saveSystemState(payload)
         dbVersion.current = version
-        lastSavedSig.current = sig
+        lastSavedSig.current = snapshotSig
         // The document we just wrote is now the server truth — adopt it as the
         // baseline so subsequent deletes diff against what's actually stored.
         baselineRef.current = payload
@@ -1873,10 +1882,40 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         saveInFlight.current = false
       }
     }, 600)
-    return () => {
-      if (saveTimer.current) clearTimeout(saveTimer.current)
-    }
+    // Deliberately no cleanup cancelling the timer. The debounce is already
+    // maintained by the clearTimeout above, whereas a cleanup keyed on [sig]
+    // also fired when the next render bailed out at the `sig === lastSavedSig`
+    // check — killing an armed save that nothing ever rescheduled, so the write
+    // was silently lost.
   }, [sig])
+
+  // A refresh during the 600ms debounce would still lose the pending write, so
+  // flush it when the page is hidden. `visibilitychange` is the reliable hook
+  // (`beforeunload` is skipped on mobile), and firing the timer early is safe
+  // because it now reads `stateRef.current` rather than a stale closure.
+  useEffect(() => {
+    const flush = () => {
+      if (document.visibilityState !== "hidden") return
+      if (!saveTimer.current) return
+      const timer = saveTimer.current
+      saveTimer.current = null
+      clearTimeout(timer)
+      void (async () => {
+        try {
+          const payload = toPersisted(stateRef.current)
+          const savedSig = persistedSig(stateRef.current)
+          const { version } = await saveSystemState(payload)
+          dbVersion.current = version
+          lastSavedSig.current = savedSig
+          baselineRef.current = payload
+        } catch {
+          // Nothing more we can do as the page goes away.
+        }
+      })()
+    }
+    document.addEventListener("visibilitychange", flush)
+    return () => document.removeEventListener("visibilitychange", flush)
+  }, [])
 
   // Poll the DB so edits made on OTHER devices show up here. If the server
   // version moved past ours and it wasn't our own write, reload the document.
