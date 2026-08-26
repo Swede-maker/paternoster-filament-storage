@@ -78,6 +78,12 @@ INDEX_CLEAR_TIMEOUT = 10.0
 # The motor runs normally during this window: it filters counting, not power.
 # Keep it well under the real per-shelf travel time (~0.5s at MOVE_SPEED).
 PULSE_BLANKING = 0.15
+# How long to wait for the parked flag to slide back INTO the window when a move
+# reverses out of an empty window. Only needs to cover the small overshoot the
+# previous stop coasted past the sensor, so it is short. If it expires the flag
+# was never there (the machine was left mid-travel), and counting simply starts
+# with the next real shelf.
+REVERSE_REENTRY_TIMEOUT = 1.5
 
 # ---- Parking ON the sensor -----------------------------------------------
 # The carousel parks with the target shelf's flag still INSIDE the sensor
@@ -485,6 +491,19 @@ class Carousel:
         self.current_shelf = 0
         self.homed = False
         self.status = "idle"  # idle | moving | homing
+
+        # Direction the carousel last physically travelled ("up"/"down", None if
+        # it has not moved yet).
+        #
+        # This exists because the sensor is a LEVEL over a flag of real width,
+        # and the machine only begins braking AFTER the flag is detected — so a
+        # move routinely ends with the flag stopped just PAST the window. Set off
+        # again the same way and the next edge is genuinely the next shelf. But
+        # REVERSE, and the very first thing the sensor sees is the flag we are
+        # already parked at sliding back into the window. Counted blindly, that
+        # is the shelf we are on being counted as the next one along, so every
+        # change of direction lost a shelf and the display drifted one out.
+        self._last_direction: Optional[str] = None
 
         # Live motion settings. The app pushes these with `config` whenever the
         # speed or soft-start slider moves, so they must be INSTANCE state, not
@@ -923,6 +942,9 @@ class Carousel:
 
         self.current_shelf = 0
         self.homed = True
+        # Homing is travel too, so the first move after it must know which way we
+        # came in — otherwise that move cannot tell whether it is reversing.
+        self._last_direction = home_direction
         self.status = "idle"
         self.emit({"type": "homed", "shelf": 0})
 
@@ -948,6 +970,16 @@ class Carousel:
             direction, steps = "up", up_steps
         else:
             direction, steps = "down", down_steps
+
+        # Is this a change of direction? Only matters when the previous move
+        # coasted clear of its flag: reversing then drags that same flag back
+        # through the window, and counting it would skip a shelf.
+        reversing = (self._last_direction is not None
+                     and direction != self._last_direction)
+        # Record it now, not on success: an aborted or faulted move still leaves
+        # the carousel physically pointing the way it was last travelling, and
+        # the next move has to reason about where the flag actually is.
+        self._last_direction = direction
 
         # Drop stale counts, then energise the motor ONCE. It now runs
         # continuously for the whole move: the loop below only *counts* shelves
@@ -997,12 +1029,29 @@ class Carousel:
                 return
             self.hw.reset_pulses()  # drop the edge produced by leaving the flag
         else:
-            # Window already empty (an aborted move or fault left the carousel
-            # mid-travel). There is no departure edge to wait for, so fall back
-            # to blanking against a phantom re-entry pulse.
-            elapsed = time.monotonic() - motor_start
-            if elapsed < PULSE_BLANKING:
-                time.sleep(PULSE_BLANKING - elapsed)
+            # Window already empty: the last move braked AFTER detecting the flag
+            # and coasted clear of it (or an abort/fault left us mid-travel).
+            # There is no departure edge to wait for.
+            if reversing:
+                # Turning back the way we came, so the flag we are parked just
+                # past is about to slide INTO the window again. It is the shelf we
+                # are already on, not the next one, so consume that whole
+                # crossing — in, then out — before counting starts.
+                #
+                # A fixed blanking delay cannot do this job: how long the re-entry
+                # takes depends on how far the previous stop overshot, which is
+                # exactly what we do not know. Watching for the crossing itself
+                # works no matter how far past the window we stopped, and is why
+                # counting now survives a change of direction.
+                if self.hw.take_shelf_pulse(REVERSE_REENTRY_TIMEOUT):
+                    self.hw.shelf_clear(SHELF_CLEAR_TIMEOUT)
+            else:
+                # Same direction as last time: the flag is behind us and receding,
+                # so the next edge is a genuine new shelf. Only guard against a
+                # bounce right on the boundary we just left.
+                elapsed = time.monotonic() - motor_start
+                if elapsed < PULSE_BLANKING:
+                    time.sleep(PULSE_BLANKING - elapsed)
             self.hw.reset_pulses()
 
         # Now the soft start proper, continuing up from the crawl duty the motor
