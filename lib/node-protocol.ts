@@ -57,6 +57,15 @@ export interface HelloEvent {
   name?: string
   shelves?: number
   firmware?: string
+  /**
+   * True when the agent is faking motion instead of driving GPIO — either from
+   * `--simulate` or because gpiozero failed to initialise. Critically, such an
+   * agent still connects and reports perfect motion, so without this flag a
+   * dead motor is indistinguishable from a working one.
+   */
+  simulated?: boolean
+  /** Human-readable cause, e.g. the gpiozero import/pin-factory error. */
+  simReason?: string | null
 }
 
 /** Full status snapshot; sent on connect and whenever something changes. */

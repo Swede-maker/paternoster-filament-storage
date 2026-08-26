@@ -1,15 +1,23 @@
 # systemd unit so the agent starts on boot and restarts on crash.
 #
-# Install:
-#   sudo cp paternoster-agent.service /etc/systemd/system/
-#   sudo systemctl daemon-reload
-#   sudo systemctl enable --now paternoster-agent
+# DO NOT copy this file directly — the __PLACEHOLDERS__ below must be filled in
+# with the real user and path first. Run the installer instead:
+#
+#   sudo ./install.sh
+#
+# It fills in the placeholders, adds the user to the `gpio` group, picks the
+# right pin factory for your Pi model, and enables the service.
 #
 # Check status / logs:
 #   systemctl status paternoster-agent
 #   journalctl -u paternoster-agent -f
 #
-# Edit --name / --shelves / --port below to match this unit.
+# Why placeholders instead of a real user: this file used to hardcode `User=pi`
+# and `/home/pi/...`. Raspberry Pi OS no longer creates a `pi` user by default,
+# so on any system with a different username systemd refused to start with
+# `status=217/USER` ("Failed to determine user credentials"). Worse, reinstalling
+# restored the hardcoded values and silently re-broke a working setup. Leaving
+# them obviously-invalid makes that failure impossible to repeat quietly.
 
 [Unit]
 Description=PAX paternoster GPIO agent
@@ -18,9 +26,11 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=pi
-WorkingDirectory=/home/pi/pi-agent
-ExecStart=/usr/bin/python3 /home/pi/pi-agent/paternoster_agent.py --name "Paternoster 1" --shelves 9 --port 8765
+User=__USER__
+WorkingDirectory=__DIR__
+ExecStart=/usr/bin/python3 __DIR__/paternoster_agent.py --name "__NAME__" --shelves __SHELVES__ --port __PORT__ __EXTRA_ARGS__
+# Set by install.sh when needed (a Pi 5 requires the lgpio pin factory).
+__ENVIRONMENT__
 Restart=on-failure
 RestartSec=3
 

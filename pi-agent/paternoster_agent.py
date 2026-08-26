@@ -362,15 +362,38 @@ async def serve(args) -> None:
 
     shelves = max(1, args.shelves)
 
+    # Why this is reported instead of just logged: a silent fall back to
+    # simulation is indistinguishable from working hardware. The agent connects,
+    # accepts commands and reports smooth motion while the motor pins stay idle,
+    # so the app looks healthy and the carousel never turns. The app therefore
+    # gets told, in every `hello`, whether it is talking to real GPIO.
+    sim_reason: Optional[str] = None
+
     if args.simulate:
         hw = SimHardware(shelves)
+        sim_reason = "started with --simulate"
         print(f"[agent] running in SIMULATION mode ({shelves} shelves)")
     else:
         try:
             hw = RealHardware()
+            print("[agent] GPIO ready: driving real hardware")
         except Exception as exc:
-            print(f"[agent] gpiozero unavailable ({exc}); falling back to --simulate")
+            if args.strict_gpio:
+                # Refuse to pretend. Better a dead service you can see in
+                # `systemctl status` than a live one that quietly does nothing.
+                print(f"[agent] FATAL: GPIO unavailable ({exc}); --strict-gpio set, refusing to simulate")
+                raise SystemExit(1)
+            sim_reason = f"GPIO unavailable: {exc}"
             hw = SimHardware(shelves)
+            print("=" * 72, flush=True)
+            print("[agent] WARNING: GPIO IS UNAVAILABLE — RUNNING IN SIMULATION", flush=True)
+            print(f"[agent] reason: {exc}", flush=True)
+            print("[agent] The motor will NOT move. Commands will look like they", flush=True)
+            print("[agent] succeed because motion is faked in software.", flush=True)
+            print("[agent] On a Pi 5, gpiozero needs the lgpio pin factory:", flush=True)
+            print("[agent]     sudo apt install -y python3-lgpio", flush=True)
+            print("[agent]     GPIOZERO_PIN_FACTORY=lgpio", flush=True)
+            print("=" * 72, flush=True)
     loop = asyncio.get_running_loop()
     clients: "set[object]" = set()
 
@@ -397,7 +420,7 @@ async def serve(args) -> None:
             # ConnectionClosedError straight out of the handler — which both
             # prints a scary traceback and skips the `finally` below, leaking the
             # dead socket in `clients` forever.
-            await ws.send(json.dumps({"type": "hello", "name": args.name, "shelves": carousel.shelves, "firmware": "pax-agent-1.0"}))
+            await ws.send(json.dumps({"type": "hello", "name": args.name, "shelves": carousel.shelves, "firmware": "pax-agent-1.0", "simulated": sim_reason is not None, "simReason": sim_reason}))
             await ws.send(json.dumps(carousel.snapshot()))
             async for raw in ws:
                 try:
@@ -416,7 +439,7 @@ async def serve(args) -> None:
                 elif t == "config":
                     carousel.set_shelves(int(msg.get("shelves", carousel.shelves)))
                 elif t == "hello":
-                    await ws.send(json.dumps({"type": "hello", "name": args.name, "shelves": carousel.shelves}))
+                    await ws.send(json.dumps({"type": "hello", "name": args.name, "shelves": carousel.shelves, "simulated": sim_reason is not None, "simReason": sim_reason}))
         except ConnectionClosed:
             # Routine, not an error: the app drops the socket when its last
             # viewer leaves, and a dev-server restart drops it abruptly (which
@@ -442,6 +465,11 @@ def main() -> None:
     p.add_argument("--port", type=int, default=8765, help="WebSocket port (match the app)")
     p.add_argument("--shelves", type=int, default=9, help="Number of shelves on this carousel")
     p.add_argument("--simulate", action="store_true", help="Run without real GPIO (fake motion)")
+    p.add_argument(
+        "--strict-gpio",
+        action="store_true",
+        help="Exit instead of silently simulating when GPIO is unavailable (recommended for the real unit)",
+    )
     args = p.parse_args()
     try:
         asyncio.run(serve(args))

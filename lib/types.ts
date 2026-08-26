@@ -427,6 +427,16 @@ export interface StorageNode {
    */
   connSeq?: number
   /**
+   * True when the connected agent reported it is faking motion rather than
+   * driving GPIO (`--simulate`, or gpiozero failed to initialise). Such an agent
+   * connects and reports flawless motion while the motor never turns, so this
+   * must be shown prominently. Ephemeral: it describes the live agent, so it is
+   * stripped from the persisted document like `link`.
+   */
+  agentSimulated?: boolean
+  /** Agent-reported cause of simulation, e.g. the gpiozero pin-factory error. */
+  agentSimReason?: string
+  /**
    * Calibrated carousel travel time between adjacent shelves, in seconds. This
    * is the real-world speed found by auto-calibration (target ~3.5 s) and also
    * adjustable with the manual speed slider. Drives how fast the carousel

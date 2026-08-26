@@ -111,6 +111,16 @@ export function NodeConnection() {
         if (!ev) return
         switch (ev.type) {
           case "hello":
+            // The agent tells us here whether it is driving real GPIO. A
+            // simulating agent reports perfect motion with idle motor pins, so
+            // this is the only way to catch a carousel that "works" but never
+            // physically moves.
+            dispatch({
+              type: "NODE_AGENT_MODE",
+              nodeId,
+              simulated: ev.simulated === true,
+              reason: ev.simReason ?? undefined,
+            })
             break
           case "state":
           case "pos":
