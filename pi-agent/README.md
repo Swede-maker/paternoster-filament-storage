@@ -189,6 +189,10 @@ carousel by hand, then runs the motor in short low-speed bursts. It imports the
 pin numbers and `SENSOR_TYPE` from `paternoster_agent.py`, so it tests the real
 configuration rather than a copy that can drift out of sync.
 
+Step 1 may print `gpiozero : unknown` or `board : unknown (AttributeError)`.
+That is harmless — not every gpiozero build exposes a version or board info, and
+only the `✓ GPIO is reachable` line decides whether the check passed.
+
 This splits the problem in a single run:
 
 - **Motor turns here** → the wiring is fine and the fault is in the agent/app layer.
