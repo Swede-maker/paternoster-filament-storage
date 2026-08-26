@@ -28,6 +28,11 @@ Wants=network-online.target
 Type=simple
 User=__USER__
 WorkingDirectory=__DIR__
+# Without this, Python block-buffers stdout because the journal is a pipe rather
+# than a terminal, so agent log lines are withheld — often indefinitely. That
+# makes `journalctl` show only systemd's own "Started ..." lines and none of the
+# agent's, which reads as a dead agent even when it is running perfectly.
+Environment=PYTHONUNBUFFERED=1
 ExecStart=/usr/bin/python3 __DIR__/paternoster_agent.py --name "__NAME__" --shelves __SHELVES__ --port __PORT__ __EXTRA_ARGS__
 # Set by install.sh when needed (a Pi 5 requires the lgpio pin factory).
 __ENVIRONMENT__

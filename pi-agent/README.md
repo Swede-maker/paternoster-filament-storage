@@ -136,10 +136,33 @@ and refuses to enable a unit that still has unfilled placeholders.
 > Main process exited, code=exited, status=217/USER
 > ```
 >
-> The service then crash-loops, nothing listens on 8765, and the app shows
+> The sibling failure is `status=200/CHDIR` — *"Changing to the requested working
+> directory failed"* — which means `WorkingDirectory` points at a folder that does
+> not exist, e.g. `/home/pi/pi-agent` when the agent really lives in
+> `/home/raspberry/pax/pi-agent`.
+>
+> Either way the service crash-loops, nothing listens on 8765, and the app shows
 > *"Connection refused"*. Re-running a plain `cp` silently restores the broken
-> user, which is why a reinstall could make a previously working unit fail.
-> `install.sh` fills in the real values, so this cannot recur.
+> user and path, which is why a reinstall could make a previously working unit
+> fail. `install.sh` fills in the real values, so this cannot recur.
+
+### The journal shows only "Started …", nothing from the agent
+
+Python block-buffers stdout when it is a pipe rather than a terminal, so under
+systemd the agent's own lines can be withheld indefinitely. `journalctl -u
+paternoster-agent | grep -i gpio` then matches only systemd's own `Started … PAX
+paternoster GPIO agent.` lines — which looks like a dead agent even when it is
+running perfectly. The unit sets `Environment=PYTHONUNBUFFERED=1` and the agent
+flushes its startup lines, so `GPIO ready` (or the simulation warning) appears
+immediately.
+
+Rapidly repeating `Started` lines a few seconds apart are a crash loop, not a
+healthy service. Check the real reason with:
+
+```bash
+systemctl status paternoster-agent --no-pager
+journalctl -u paternoster-agent -n 40 --no-pager | grep -E "status=|Failed"
+```
 
 ### Try it with no hardware
 
@@ -149,6 +172,29 @@ motor and sensors so you can test the app end to end:
 ```bash
 python3 paternoster_agent.py --simulate --shelves 9 --port 8765
 ```
+
+## Hardware test — start here when the carousel does not move
+
+Before debugging the app, prove the hardware works. `motor_test.py` bypasses the
+web app, the WebSocket and systemd entirely and drives the pins directly:
+
+```bash
+sudo systemctl stop paternoster-agent   # release the pins
+cd ~/pax/pi-agent
+python3 motor_test.py
+```
+
+It checks GPIO access, claims the pins, watches both sensors while you turn the
+carousel by hand, then runs the motor in short low-speed bursts. It imports the
+pin numbers and `SENSOR_TYPE` from `paternoster_agent.py`, so it tests the real
+configuration rather than a copy that can drift out of sync.
+
+This splits the problem in a single run:
+
+- **Motor turns here** → the wiring is fine and the fault is in the agent/app layer.
+- **Motor does not turn** → the fault is electrical, and no app-side fix will help.
+  Check bridge power, then **common ground between Pi and driver** (the most common
+  cause — without it the PWM signal has no reference), then the BCM pin numbers.
 
 ### "The app says it moved, but the carousel didn't"
 
@@ -273,21 +319,16 @@ installation and autostart easier:
 From your dev machine, copy just that folder:
 
 ```bash
-scp -r pi-agent pi@192.168.1.51:/home/pi/
+scp -r pi-agent <user>@192.168.1.51:~/
 ```
 
-Then on the slave Pi:
+Then on the slave Pi — the installer takes this unit's name and shelf count as
+flags, so there is no unit file to hand-edit:
 
 ```bash
-cd /home/pi/pi-agent
+cd ~/pi-agent
 sudo apt update && sudo apt install -y python3-pip
-pip3 install -r requirements.txt --break-system-packages
-
-# Give this unit its own name and shelf count before installing the service.
-sudo cp paternoster-agent.service /etc/systemd/system/
-sudo nano /etc/systemd/system/paternoster-agent.service   # edit --name / --shelves
-sudo systemctl daemon-reload
-sudo systemctl enable --now paternoster-agent
+sudo ./install.sh --name "Paternoster 2" --shelves 12
 ```
 
 Verify it's up and listening on **all** interfaces (`0.0.0.0`, which the agent
