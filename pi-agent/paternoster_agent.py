@@ -97,10 +97,54 @@ SHELF_CLEAR_TIMEOUT = 10.0
 # which is precisely what "go even more slow in reverse" needs.
 CREEP_DUTY = MIN_DUTY
 CREEP_TIMEOUT = 6.0
-# Extra crawl after the window edge is found, so the flag settles nearer the
-# MIDDLE of the window instead of balancing on its boundary, where the smallest
-# vibration or drift would read as "not in position".
-CENTER_NUDGE_SECONDS = 0.12
+# The crawl is PULSED, not continuous: drive for CREEP_PULSE_ON, cut power, let
+# it settle for CREEP_PULSE_OFF, then read the sensor. A continuous crawl cannot
+# be stopped inside a narrow window — by the time the level is read and `stop()`
+# lands, the flag has already coasted out the far side, so the correction
+# overshoots in the new direction and the carousel oscillates on one shelf
+# forever. Pulsing bounds how far a single step can travel and guarantees the
+# sensor is read while the motor is genuinely stopped.
+CREEP_PULSE_ON = 0.04
+CREEP_PULSE_OFF = 0.05
+# How long to wait after cutting power before trusting a sensor reading. Cutting
+# power does not stop a loaded carousel; it coasts. Raise this if the machine is
+# heavy and alignment decisions still seem to be made on a moving flag.
+MOTION_SETTLE = 0.20
+# How many verify-and-correct rounds to attempt before declaring the position
+# unknown. Bounded on purpose: if the carousel coasts further than the sensor
+# window is wide, no amount of retrying can park inside it, and looping forever
+# is exactly the "spins back and forth on one shelf" failure. Better to stop and
+# ask for a re-home.
+SETTLE_ATTEMPTS = 4
+# Longest we will wait for a coast to finish before calling the position
+# unknown. Must exceed the machine's real coast-down time; a carousel that
+# genuinely cannot hold the sensor within this window needs mechanical
+# attention (or a lower move speed), not a longer timeout.
+COAST_MAX = 3.0
+# How long the sensor level must stay unchanged before the carousel is believed
+# to be at rest. This must be LONGER than the slowest credible crossing of the
+# sensor window, because a machine drifting through the window also holds the
+# level steady — just not for long. Too small and a slow coast reads as a park
+# (the flag then drifts out and the position silently goes wrong); too large and
+# every move pays the wait. It only needs to exceed window_width / creep_speed.
+REST_STABLE = 0.9
+# Hard cap on ONE correction attempt. Realignment only ever recovers a flag we
+# just coasted past, so it should need a fraction of a shelf. Bounding it stops a
+# failed correction from turning into an open-ended hunt that parks on a
+# different shelf than the one being reported.
+CREEP_BUDGET = 1.5
+# Hard cap on how many creep pulses one recovery may use. This is the distance
+# bound that keeps alignment honest: a recovery that crawls far enough will
+# eventually reach the NEXT shelf's flag, pass the "on a flag" test, and report
+# the wrong shelf as correct. Sized so the total crawl stays well under one
+# shelf pitch. Lower it if a failed alignment ever ends up a shelf out.
+CREEP_MAX_PULSES = 12
+# Total sensor edges the ENTIRE alignment may pass, across all retries. A single
+# attempt being bounded is not enough — several bounded attempts still add up to
+# a different shelf. Two is the honest limit: leaving the flag we overshot and
+# re-entering it. A third edge means we have entered a DIFFERENT window, and
+# anything found there is a different shelf no matter how well centred it is.
+SETTLE_MAX_EDGES = 2
 # SIMULATION ONLY. Half-width of the sensor window in shelf units, i.e. how much
 # of the travel between two shelves reads "detected". A ~35mm flag on a ~200mm
 # shelf pitch is about 0.18. Without a window the simulated sensor is a zero-
@@ -546,102 +590,247 @@ class Carousel:
             time.sleep(RAMP_STEP_SECONDS)
         self.hw.stop()
 
-    def _creep_until_active(self, direction: str, timeout: float) -> bool:
-        """
-        Crawl in `direction` at CREEP_DUTY until the shelf window reads active.
-
-        On success the motor is left RUNNING so the caller can keep crawling a
-        little further to centre the flag. On failure or abort it is stopped.
-        """
+    def _creep_pulse(self, direction: str) -> None:
+        """One bounded crawl step: drive briefly, then stop and let it settle."""
         drive = self.hw.backward if direction == "up" else self.hw.forward
         drive(CREEP_DUTY)
+        time.sleep(CREEP_PULSE_ON)
+        self.hw.stop()
+        time.sleep(CREEP_PULSE_OFF)
+
+    def _drain_shelf_edges(self) -> int:
+        """
+        Consume and count every shelf edge recorded so far, without waiting.
+
+        Edges are logged by an interrupt in the real hardware, which is why this
+        is trustworthy as a distance measure during a slow crawl: nothing is
+        missed even if the crossing happens while this thread is sleeping.
+        """
+        n = 0
+        while self.hw.take_shelf_pulse(0):
+            n += 1
+        return n
+
+    def _creep_until_active(self, direction: str, timeout: float,
+                            active_fn=None, budget: int = 0) -> tuple:
+        """
+        Crawl in `direction` in bounded pulses until the sensor reads active,
+        then STOP. The motor is always left stopped, whatever the outcome.
+
+        Pulsing is what makes "reverse slowly until it triggers again" actually
+        stop on the flag. A continuous crawl kept coasting straight through the
+        window, so each correction overshot the other way and the carousel
+        oscillated on the same shelf indefinitely.
+
+        `budget` is the edge count already spent by the caller, and the returned
+        `(ok, budget)` carries the updated total back. Threading one shared total
+        through every attempt is what stops a series of individually-bounded
+        crawls from adding up to a whole shelf of travel.
+        """
+        if active_fn is None:
+            active_fn = self.hw.shelf_active
         deadline = time.monotonic() + timeout
+        pulses = 0
+        # Measure how far the recovery has travelled using the SENSOR EDGE
+        # COUNTER. Polling the level in this loop cannot do it: a single creep
+        # pulse on a heavy machine can cross an entire flag while we are asleep
+        # inside `_creep_pulse`, so the crossing is simply never observed and the
+        # crawl wanders on. The edge counter is interrupt-driven in the real
+        # hardware, so it cannot miss a crossing however briefly it happens.
+        #
+        # This matters because an unbounded crawl eventually reaches a
+        # NEIGHBOURING shelf's flag, passes the "am I on a flag?" test, and
+        # reports the wrong shelf as correct.
+        #
+        # Deliberately NOT reset here: the counter is shared with the caller's
+        # running total. Clearing it discarded travel from earlier attempts, so
+        # several "bounded" attempts silently added up to a whole shelf and the
+        # wrong flag was accepted as the target.
+        edges = budget
         while time.monotonic() < deadline:
             if self._abort.is_set():
                 self.hw.stop()
-                return False
-            if self.hw.shelf_active():
-                return True
-            time.sleep(0.005)
+                return False, edges
+            edges += self._drain_shelf_edges()
+            if edges > SETTLE_MAX_EDGES or pulses >= CREEP_MAX_PULSES:
+                # Travelled as far as a recovery may ever go. Stop and let the
+                # caller declare the position unknown rather than parking on some
+                # other shelf and calling it success.
+                self.hw.stop()
+                return False, edges
+            if active_fn():
+                # Triggered — but possibly still coasting. Only a reading that
+                # HOLDS once the machine is at rest proves we stopped on the
+                # flag rather than sailing through the window.
+                self.hw.stop()
+                parked = self._parked_on_flag(active_fn)
+                # Count the coast's OWN travel before judging. Waiting for the
+                # machine to stop is itself movement, and on a heavy carousel that
+                # coast can cross a whole flag — so the crawl comes to rest neatly
+                # on the NEXT shelf's flag, which satisfies "on a flag" while
+                # being a shelf wrong. Draining after the decision made this a
+                # race: the same move randomly reported an arrival or a fault.
+                edges += self._drain_shelf_edges()
+                if parked:
+                    return edges <= SETTLE_MAX_EDGES, edges
+                # Coasted straight past the window. Fall through and keep
+                # crawling: the timeout and the caller's bounded retry decide
+                # when to give up, so this cannot spin forever.
+            self._creep_pulse(direction)
+            pulses += 1
         self.hw.stop()
-        return False
+        edges += self._drain_shelf_edges()
+        ok = self._parked_on_flag(active_fn) and edges <= SETTLE_MAX_EDGES
+        return ok, edges
 
-    def _settle_on_sensor(self, direction: str) -> None:
+    def _settle_on_sensor(self, direction: str, active_fn=None,
+                          label: str = "Shelf") -> bool:
         """
-        Leave the carousel parked with the shelf flag INSIDE the sensor window.
+        Leave the carousel parked with the flag INSIDE the sensor window, and
+        report whether that actually succeeded.
 
-        A soft stop always coasts, so counting alone cannot guarantee where the
-        shelf physically ended up. This consults the sensor and corrects:
+        A soft stop always coasts, so counting alone cannot say where the shelf
+        physically stopped. The rule is deliberately simple:
 
-        * Window empty  -> overshot. Crawl back the way we came at CREEP_DUTY
-          until the window is found again.
-        * Window active -> we are balanced on the edge we just entered, since a
-          pulse fires the moment the flag reaches the window boundary.
+        * Already resting on the flag -> done. Leave it exactly where it is.
+        * Otherwise -> we overshot. Crawl BACK the way we came in small pulses
+          and stop the moment the sensor triggers AND holds at rest.
 
-        Either way the flag is then eased a little deeper into the window, so it
-        settles nearer the middle than the boundary. Parking on the very edge is
-        what makes a shelf read as "not in position" after a nudge or a power
-        cycle, and it is also what turns the next move's departure into a
-        bounce-prone miscount.
+        Every judgement is made with the machine stopped, and every crawl is
+        bounded in distance. If the flag still cannot be held, the position is
+        unknown: this returns False and the caller must refuse to claim an
+        arrival. Guessing is what let the browser advance through shelves while
+        the carousel shuffled around one spot.
         """
+        if active_fn is None:
+            active_fn = self.hw.shelf_active
         if self._abort.is_set():
-            return
+            return False
 
         reverse = "down" if direction == "up" else "up"
-        nudge = CENTER_NUDGE_SECONDS
-        if self.hw.shelf_active():
-            # Already inside; centre it by continuing the way we were going.
-            nudge_dir = direction
-        else:
-            if not self._creep_until_active(reverse, CREEP_TIMEOUT):
-                self.hw.stop()
-                self.hw.reset_pulses()
-                self.emit({"type": "fault",
-                           "message": "Shelf not aligned: sensor never re-triggered"})
-                return
-            # Found the window from the far side, so "deeper in" is that way too.
-            # We stopped the instant the boundary was detected, so the flag is
-            # right on the edge and gets the full nudge to reach the middle.
-            nudge_dir = reverse
 
-        drive = self.hw.backward if nudge_dir == "up" else self.hw.forward
-        drive(CREEP_DUTY)
-        # Creep in short slices, stopping the moment the flag leaves the window,
-        # so a nudge can never push it out the far side. A single blind sleep is
-        # what stranded the shelf between shelves when the move started
-        # mid-travel and the crawl entered the window already past its centre.
-        slice_s = 0.02
-        waited = 0.0
-        while waited < nudge:
-            time.sleep(slice_s)
-            waited += slice_s
-            if self._abort.is_set() or not self.hw.shelf_active():
-                break
-        self.hw.stop()
-
-        # If the nudge itself carried the flag out the far side, come back and
-        # accept the edge rather than leaving the shelf parked outside the
-        # window: being on the boundary is imperfect, being outside is a fault.
+        # Cutting power does not stop the carousel — it coasts. Let it come fully
+        # to rest and THEN look, before touching the motor again.
         #
-        # Retry from alternating sides. A single attempt was not enough: when a
-        # move begins mid-travel the crawl can cross the whole window, and one
-        # unchecked correction left the shelf stranded between two shelves.
-        for attempt in range(3):
-            if self.hw.shelf_active() or self._abort.is_set():
+        # There is deliberately no "centring" nudge here. Nudging deeper into the
+        # window looked harmless but ran while the machine was still rolling, so
+        # it added to the momentum and threw the flag clear out the far side. The
+        # recovery crawl then ran backwards past the target and parked on the
+        # PREVIOUS shelf's flag — which passes an "am I on a flag?" test while
+        # being one shelf wrong. That is the loop where the browser kept changing
+        # shelves while the carousel shuffled around the same place. A flag that
+        # merely reads off-centre is fine; a flag on the wrong shelf is not.
+        # Count the post-move coast before trusting this first reading: the flag
+        # it comes to rest on may not be the one the move was counting.
+        self.hw.reset_pulses()
+        if self._parked_on_flag(active_fn):
+            coasted = self._drain_shelf_edges()
+            if coasted <= SETTLE_MAX_EDGES:
+                self.hw.reset_pulses()
+                return True
+
+        # Verify-and-correct. Each round comes to a complete REST before judging,
+        # then requires the sensor to stay triggered. Sampling a moving flag was
+        # reporting success while the carousel was merely passing THROUGH the
+        # window, which is how an arrival got claimed for a machine that could
+        # not stop there at all.
+        #
+        # ONE edge budget for the WHOLE alignment, not per attempt. Each retry
+        # travels, and several bounded retries still add up to a different shelf.
+        # Without this running total the last attempt could come to rest on a
+        # neighbouring flag and be accepted, because "am I on a flag?" is true
+        # there too — the carousel then sat one shelf off while the browser
+        # happily displayed the target.
+        # Seed the budget with the travel already spent overshooting, rather than
+        # resetting it. That coast is part of how far we have strayed from the
+        # flag the move was counting, so forgetting it would let the correction
+        # wander a further whole shelf and still call the result a success.
+        drift = self._drain_shelf_edges()
+        probe = reverse
+        for _ in range(SETTLE_ATTEMPTS):
+            if self._abort.is_set():
                 break
-            back = "down" if nudge_dir == "up" else "up"
-            probe = back if attempt % 2 == 0 else nudge_dir
-            self._creep_until_active(probe, CREEP_TIMEOUT)
-            self.hw.stop()
+            drift += self._drain_shelf_edges()
+            if drift > SETTLE_MAX_EDGES:
+                break
+            parked = self._parked_on_flag(active_fn)
+            # Settle-waiting is travel too, so count it before trusting `parked`.
+            drift += self._drain_shelf_edges()
+            if drift > SETTLE_MAX_EDGES:
+                break
+            if parked:
+                self.hw.reset_pulses()
+                return True
+            # Not on the flag. Crawl back onto it, alternating sides so a
+            # correction that itself overshoots is undone rather than repeated
+            # in the same direction forever.
+            #
+            # Each attempt is strictly BOUNDED (CREEP_BUDGET). Alignment is a
+            # nudge back onto a flag we just left, never a search: an unbounded
+            # crawl walked several shelves away while hunting and then parked on
+            # the WRONG one while still reporting success — the "browser changes
+            # shelves but the carousel is somewhere else" failure.
+            ok, drift = self._creep_until_active(probe, CREEP_BUDGET,
+                                                 active_fn, drift)
+            if ok:
+                self.hw.reset_pulses()
+                return True
+            probe = direction if probe == reverse else reverse
 
         self.hw.stop()
-        if not self.hw.shelf_active() and not self._abort.is_set():
-            self.emit({"type": "fault",
-                       "message": "Shelf not aligned: could not settle on sensor"})
-
+        drift += self._drain_shelf_edges()
         # Alignment is not travel. Drop the edges it produced so the next move
         # does not count them as shelves.
         self.hw.reset_pulses()
+        if self._abort.is_set():
+            return False
+        if drift > SETTLE_MAX_EDGES:
+            # We are probably sitting on SOME flag, but too far from where the
+            # move ended for it to be the right one. Being on a flag is not the
+            # same as being on the correct flag, and reporting the target here is
+            # precisely how the display drifted away from the machine.
+            return False
+        # One last honest look, at rest.
+        return self._parked_on_flag(active_fn)
+
+    def _parked_on_flag(self, active_fn) -> bool:
+        """
+        True only if the sensor is triggered AND stays triggered while stopped.
+
+        Both halves matter. Cutting power starts a coast, so a single reading can
+        catch the flag mid-flight through the window; requiring it to still be
+        there after the machine has settled distinguishes "parked on the sensor"
+        from "passing the sensor".
+        """
+        self.hw.stop()
+        # Wait out the coast FIRST, then judge. Watching for the sensor to hold
+        # "active" for a short spell is not proof of rest: a slow carousel
+        # crossing the window holds it triggered for exactly as long, which is
+        # how an arrival got claimed for a machine that then drifted two thirds
+        # of a shelf further on. So give the mechanism the full COAST_MAX to stop
+        # moving, and only then read the sensor.
+        #
+        # Rest is detected from the sensor alone, without a position encoder: the
+        # level is sampled repeatedly, and the machine is treated as stopped once
+        # it has been unchanging for REST_STABLE. Crucially, a *changing* level
+        # proves motion, so any flag crossing the window boundary resets the
+        # clock rather than being mistaken for a park.
+        deadline = time.monotonic() + COAST_MAX
+        last = active_fn()
+        steady_since = time.monotonic()
+        while time.monotonic() < deadline:
+            if self._abort.is_set():
+                return False
+            time.sleep(0.02)
+            now = active_fn()
+            if now != last:
+                last = now
+                steady_since = time.monotonic()
+                continue
+            if time.monotonic() - steady_since >= REST_STABLE:
+                break
+        # Whatever the level is now, it has been stable long enough to trust.
+        return bool(active_fn())
 
     def shutdown(self) -> None:
         self._alive = False
@@ -709,12 +898,29 @@ class Carousel:
             self.status = "idle"
             self.emit({"type": "fault", "message": "Homing timed out: index sensor not found"})
             return
-        # Homing stops on the index edge, which leaves the shelf flag on the
-        # boundary of the shelf window rather than inside it. Every move now
-        # assumes it starts parked in that window, so align before declaring
-        # home — otherwise the very first move after homing takes the degraded
-        # blanking path instead of waiting for a real departure edge.
-        self._settle_on_sensor(home_direction)
+        # `take_index_pulse` returns on the EDGE, and the soft stop then coasts,
+        # so the carousel has already run past the home flag by the time it
+        # halts. Home must rest ON that flag, so align against the INDEX sensor —
+        # aligning against the shelf sensor (as this used to) parks on some
+        # neighbouring shelf window and leaves home itself overshot.
+        if not self._settle_on_sensor(home_direction, self.hw.index_active, "Home"):
+            if self._abort.is_set():
+                self.status = "idle"
+                return
+            self.homed = False
+            self.status = "idle"
+            self.emit({"type": "fault",
+                       "message": "Home sensor not triggered after homing; "
+                                  "position unknown. Please home the carousel again."})
+            self.emit(self.snapshot())
+            return
+
+        # Sitting on the home flag should also mean sitting in the shelf window.
+        # If the two sensors are offset slightly, nudge onto the shelf flag as
+        # well so the first move starts from the normal parked-on-sensor state.
+        if not self.hw.shelf_active():
+            self._settle_on_sensor(home_direction)
+
         self.current_shelf = 0
         self.homed = True
         self.status = "idle"
@@ -872,8 +1078,22 @@ class Carousel:
         self._decelerate(direction, speed, max_seconds=STOP_RAMP_SECONDS)
         # Counting says we arrived; the sensor says where we actually are. Park
         # the shelf inside the window so "in position" stays verifiable.
-        self._settle_on_sensor(direction)
+        aligned = self._settle_on_sensor(direction)
         self.status = "idle"
+
+        if not aligned:
+            # The sensor is NOT on the flag, so the true position is unknown.
+            # Claiming an arrival here is what let the browser count up through
+            # shelves while the carousel was really stuck oscillating on one, so
+            # drop the homed reference and make the user re-home instead of
+            # trusting a number nothing can back up.
+            self.homed = False
+            self.emit({"type": "fault",
+                       "message": "Shelf sensor not triggered after move; "
+                                  "position unknown. Please home the carousel."})
+            self.emit(self.snapshot())
+            return
+
         if self.homed:
             self.current_shelf = target
         self.emit({"type": "arrived", "shelf": self.current_shelf})

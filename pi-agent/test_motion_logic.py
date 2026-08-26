@@ -25,8 +25,10 @@ class FakeHW:
         self._index_pulses = 0
         self._shelf_tick = threading.Event()
         self._index_tick = threading.Event()
-        # The whole point: the sensor is covered while parked.
-        self._on_flag = start_on_flag
+        # The whole point: the sensor is covered while parked. Position 0.0 sits
+        # inside both windows, so "on the flag" is now expressed as a position
+        # rather than a latched boolean.
+        self._pos = 0.0 if start_on_flag else shelves / 2.0
         # Parked at 0.0 means the shelf window is already active, so seed the
         # edge detector True or startup fabricates a pulse that never happened.
         self._shelf_was_active = True
@@ -46,26 +48,29 @@ class FakeHW:
                 if self._dir != 0 and self._speed > 0:
                     self.motor_on_time += dt
                     self._pos += self._dir * dt * (self._speed / 0.4)
-                    # Moving even a little drives us off the parked flag.
-                    if abs(self._pos) > 0.25:
-                        self._on_flag = False
                 # Shelf edges are derived from the window LEVEL, matching both
                 # gpiozero's when_activated and SimHardware. A zero-width
                 # tripwire is never active at rest, so it cannot model a
                 # carousel parked inside the sensor window.
                 active = self._shelf_window_active()
-                if active and not self._shelf_was_active:
+                if active != self._shelf_was_active:
                     self._shelf_pulses += 1
                     self._shelf_tick.set()
                     if int(round(self._pos)) % self.shelves == 0:
                         self._index_pulses += 1
                         self._index_tick.set()
-                        self._on_flag = True
                 self._shelf_was_active = active
             time.sleep(0.002)
 
     def _shelf_window_active(self):
         return abs(self._pos - round(self._pos)) <= pa.SIM_SENSOR_HALF_WIDTH
+
+    # The home flag is a real window at every full revolution, exactly like the
+    # shelf flags. It used to be a latched boolean cleared by `abs(pos) > 0.25`,
+    # which only described position 0 and so reported "off the home flag"
+    # everywhere else — homing could never align onto it.
+    def _index_window_active(self):
+        return self._shelf_window_active() and int(round(self._pos)) % self.shelves == 0
 
     def forward(self, speed):
         with self._lock:
@@ -114,7 +119,7 @@ class FakeHW:
 
     def index_active(self):
         with self._lock:
-            return self._on_flag
+            return self._index_window_active()
 
     def index_clear(self, timeout):
         deadline = time.monotonic() + timeout
