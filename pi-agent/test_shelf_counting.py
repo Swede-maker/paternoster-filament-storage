@@ -35,6 +35,8 @@ class FakeHW:
         self._index_pulses = 0
         self._shelf_tick = threading.Event()
         self._index_tick = threading.Event()
+        # Parked at 0.0 is inside the window, so seed the edge detector active.
+        self._shelf_was_active = True
         self._running = True
         self._t = threading.Thread(target=self._loop, daemon=True)
         self._t.start()
@@ -47,16 +49,25 @@ class FakeHW:
             last = now
             with self._lock:
                 if self._dir != 0 and self._speed > 0:
-                    before = self.pos
                     # Same scaling the other harness uses: duty 0.4 => 1 shelf/s.
                     self.pos += self._dir * dt * (self._speed / 0.4)
-                    if int(before) != int(self.pos):
-                        self._shelf_pulses += 1
-                        self._shelf_tick.set()
-                        if int(round(self.pos)) % self.shelves == 0:
-                            self._index_pulses += 1
-                            self._index_tick.set()
+                # Level first, then edge — mirroring gpiozero and SimHardware, so
+                # the parked carousel really does sit inside the sensor window.
+                # Both edges count: an inductive sensor is a level, and the flag
+                # LEAVING the window changes that level just as much as it
+                # arriving. A single-edge model let the reported bug pass.
+                active = self._shelf_window_active()
+                if active != self._shelf_was_active:
+                    self._shelf_pulses += 1
+                    self._shelf_tick.set()
+                    if int(round(self.pos)) % self.shelves == 0:
+                        self._index_pulses += 1
+                        self._index_tick.set()
+                self._shelf_was_active = active
             time.sleep(0.002)
+
+    def _shelf_window_active(self):
+        return abs(self.pos - round(self.pos)) <= pa.SIM_SENSOR_HALF_WIDTH
 
     def forward(self, speed):
         with self._lock:
@@ -103,6 +114,18 @@ class FakeHW:
         return False
 
     def index_clear(self, timeout):
+        return True
+
+    def shelf_active(self):
+        with self._lock:
+            return self._shelf_window_active()
+
+    def shelf_clear(self, timeout):
+        deadline = time.monotonic() + timeout
+        while self.shelf_active():
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.005)
         return True
 
     def cleanup(self):

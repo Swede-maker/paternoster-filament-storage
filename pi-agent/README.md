@@ -91,10 +91,15 @@ signal line to keep inductive noise from causing phantom shelf pulses.
 - **Homing**: the motor turns until the **index** sensor triggers (shelf 1), then
   stops. Position is now known = shelf 0. If it can't find the index within
   `HOME_TIMEOUT`, it reports a `fault`.
-- **Goto shelf N**: the agent picks the shorter direction around the loop and
-  counts **shelf**-sensor pulses until it reaches N, emitting a `pos` event at
-  each pulse and an `arrived` event when it stops. A missing pulse within
-  `PULSE_TIMEOUT` reports a `fault` (jam / sensor failure) and stops the motor.
+- **Goto shelf N**: the agent picks the shorter direction around the loop, waits
+  for the currently parked shelf to leave the sensor window, then counts shelf
+  **arrivals** until it reaches N, emitting a `pos` event per shelf and an
+  `arrived` event when it stops. A missing pulse within `PULSE_TIMEOUT` reports a
+  `fault` (jam / sensor failure) and stops the motor.
+- **Parking**: a move ends with the target shelf's flag still *inside* the shelf
+  sensor window, so "in position" can be verified at any time rather than
+  inferred. If the soft stop coasted out of the window, the carousel creeps back
+  until the sensor triggers again.
 
 Speed and soft start are set from the **app's sliders** at runtime, not by editing
 the script — `HOMING_SPEED` and `MOVE_SPEED` are only the values used before the
@@ -223,10 +228,17 @@ where an *edge* was meant:
    was still sitting on the home flag, so the first shelf pulse was reset to 0
    (reporting `0,1,2` for a 3-shelf move instead of `1,2,3`).
 
-The fixes: sensors are now edge counters (`when_activated`), homing drives *off*
-the flag before looking for a real edge, and a `PULSE_BLANKING` window discards
-the phantom pulse produced when the carousel restarts from a position parked a
-hair past an edge (especially when reversing direction).
+The fixes: sensors are now edge counters (`when_activated`), and homing drives
+*off* the flag before looking for a real edge.
+
+The carousel deliberately parks **inside** the shelf sensor window (see
+*"A move stops after ~30mm"* below), so a move starts with that sensor active.
+Rather than guessing a blanking time, the move waits for the parked flag to
+physically leave the window before counting — a real geometric event instead of a
+tuned constant. `PULSE_BLANKING` remains only as the fallback for the rare case
+where a move begins with the window already empty (an aborted move, or a fault
+that left the carousel mid-travel). Crucially the motor is running throughout
+both paths: they filter *counting*, never power.
 
 Two deliberate consequences:
 
@@ -357,6 +369,64 @@ it fails 15 times, reproducing the reported symptom — a 1-shelf request moving
 ```bash
 python3 test_shelf_counting.py   # one-shelf request must move one shelf
 ```
+
+### "A move stops after ~30mm, as soon as the sensor stops being triggered"
+
+The carousel now parks with the target shelf's flag still **inside** the sensor
+window, so "in position" is a fact that can be re-checked rather than dead
+reckoning. That inverts an assumption the old code made, and two things follow.
+
+**A move now BEGINS with the sensor already active.** The parked flag has to be
+driven out of the window before counting starts. Otherwise the level dropping as
+it leaves — or the smallest bounce on that boundary — is counted as the target
+shelf arriving, and the move ends about 30mm in. `shelf_clear()` waits for that
+real departure at `MIN_DUTY` **before** the soft start; the motor runs the whole
+time, so this gates counting, never power. The order matters, because `_drive`
+blocks for up to 1.2s — long enough to carry the carousel past a whole shelf
+before the wait would even begin.
+
+**A move must END inside the window.** A soft stop always coasts, so counting
+alone cannot say where the shelf physically stopped. `_settle_on_sensor()` checks
+the sensor afterwards and, if the flag drifted out, crawls **back the way it
+came** at `CREEP_DUTY` until it is found again. Either way the flag is then eased
+a little deeper (`CENTER_NUDGE_SECONDS`) so it rests nearer the middle of the
+window than its boundary — parking on the edge is what makes a shelf read as "not
+in position" after a nudge, and what makes the next move's departure ambiguous.
+The nudge creeps in short slices and stops the moment the flag would leave, so it
+can never push the shelf out the far side.
+
+Homing runs the same alignment, because it stops on the *index* edge, which
+leaves the shelf flag on the boundary rather than inside the window.
+
+Tuning: `SHELF_CLEAR_TIMEOUT`, `CREEP_DUTY`, `CREEP_TIMEOUT`,
+`CENTER_NUDGE_SECONDS`. If the shelf consistently rests slightly off-centre,
+adjust `CENTER_NUDGE_SECONDS` first.
+
+### "A 3-shelf move only travels 2 shelves"
+
+An inductive sensor is a **level**, not a tripwire, so each shelf passing raises
+**two** edges: one as the flag enters the window and one as it leaves. Counting
+raw edges counted every shelf twice. A shelf is now counted only on **arrival**;
+the matching departure edge is consumed and discarded.
+
+Classifying an edge purely by reading the level is racy — at speed the flag can
+cross the whole window before the level is read — so arrival/departure parity is
+tracked and the level is trusted only while it still reads "inside".
+
+This is also what lets the carousel stop *on* the sensor: the stop is triggered
+by the target shelf arriving at the window rather than leaving it.
+
+```bash
+python3 test_sensor_parking.py   # parks ON the sensor, recovers from overshoot
+python3 test_shelf_counting.py   # N shelves requested == N shelves travelled
+```
+
+Both harnesses model the sensor as a window of real width
+(`SIM_SENSOR_HALF_WIDTH`) that pulses on **both** edges. That fidelity matters: a
+zero-width tripwire is never active at rest, so it cannot represent a carousel
+parked on its sensor, and a single-edge model hid the double-counting bug above
+completely — the parking test passed against the broken code until both edges
+were modelled.
 
 ### "The browser shows shelf 3, but jumps to 2 after a refresh"
 
