@@ -84,6 +84,8 @@ interface Relay {
    * offline → checking → offline retry cycle.
    */
   lastError: string | null
+  /** Reason sent in the last `link` frame, so a changed reason still broadcasts. */
+  lastBroadcastReason: string | undefined
   closing: boolean
 }
 
@@ -131,15 +133,29 @@ function broadcast(relay: Relay, frame: RelayFrame) {
   }
 }
 
+/**
+ * Shown when the socket dies without an errno we can translate — e.g. the
+ * handshake reached something that answered but wasn't a WebSocket server. Never
+ * leave `offline` reasonless: a blank explanation reads as "the app is broken"
+ * when the real cause is almost always that the agent isn't running.
+ */
+const GENERIC_OFFLINE_REASON =
+  "Could not open a WebSocket to the agent. On the Pi, check `systemctl status paternoster-agent` and `ss -ltnp | grep 8765`."
+
 function setLink(relay: Relay, link: RelayLink) {
-  if (relay.link === link) return
+  const reason = link === "offline" ? relay.lastError ?? GENERIC_OFFLINE_REASON : undefined
+  // Re-broadcast when the *reason* changes too, even if the status hasn't: the
+  // first failure often lands before the errno is captured, and without this the
+  // better message that follows would be swallowed.
+  if (relay.link === link && relay.lastBroadcastReason === reason) return
   relay.link = link
+  relay.lastBroadcastReason = reason
   // Only an offline status carries a reason; clear it once we're connected.
   if (link === "online") relay.lastError = null
   broadcast(relay, {
     kind: "link",
     status: link,
-    ...(link === "offline" && relay.lastError ? { reason: relay.lastError } : {}),
+    ...(reason ? { reason } : {}),
   })
 }
 
@@ -274,6 +290,7 @@ function getOrCreate(ip: string, port: number, shelves: number): Relay {
       pingSentAt: null,
       lastState: null,
       lastError: null,
+      lastBroadcastReason: undefined,
       closing: false,
     }
     registry.set(key, relay)
