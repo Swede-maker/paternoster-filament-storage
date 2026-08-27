@@ -3,7 +3,7 @@
 import { ArrowUp, ArrowDown, Home, Loader2, OctagonX, Play } from "lucide-react"
 import { useStore } from "@/lib/store"
 import { activeNode } from "@/lib/selectors"
-import { DEFAULT_RAMP_PCT, HOMING_DUTY_RATIO, homingDutyFor, moveDutyFor } from "@/lib/filament"
+import { DEFAULT_RAMP_PCT, HOMING_DUTY_RATIO, homingDutyFor, moveDutyFor, approachDutyFor } from "@/lib/filament"
 import { Button } from "./ui/button"
 import { cn } from "@/lib/utils"
 
@@ -34,6 +34,9 @@ export function ManualControl() {
   // shows the duty homing will actually use — including while it is tracking the
   // move duty, rather than sitting at a placeholder.
   const homingDuty = homingDutyFor(node)
+  // Same helper the Pi is configured from, so the slider shows the duty the
+  // final approach will actually use — including the default crawl.
+  const approachDuty = approachDutyFor(node)
 
   const statusLabel = (() => {
     switch (status) {
@@ -323,6 +326,60 @@ export function ManualControl() {
                   Follow Motor PWM
                 </button>{" "}
                 instead.
+              </>
+            )}
+          </p>
+
+          {/* Slow approach duty for the FINAL shelf. The carousel eases down to
+              this speed just before the target so the shelf flag is caught gently
+              instead of overshot. Separate from Motor PWM (the cruise between
+              shelves): a heavy carousel wants a brisk cruise but a slow arrival. */}
+          <div className="mt-4 flex items-center justify-between">
+            <p className="text-xs uppercase tracking-wider text-muted-foreground">Approach speed</p>
+            <span className="font-mono text-xs text-foreground">
+              {node.approachDuty === undefined
+                ? `Auto · ${Math.round(approachDuty * 100)}%`
+                : `${Math.round(approachDuty * 100)}%`}
+            </span>
+          </div>
+          <input
+            type="range"
+            aria-label="Slow approach PWM duty for the final shelf (percent)"
+            min={5}
+            max={100}
+            step={1}
+            value={Math.round(approachDuty * 100)}
+            disabled={busy}
+            onChange={(e) =>
+              dispatch({
+                type: "SET_NODE_APPROACH_PWM",
+                nodeId: node.id,
+                approachDuty: Number(e.target.value) / 100,
+              })
+            }
+            className="mt-2 w-full accent-[var(--color-primary)] disabled:opacity-40"
+          />
+          <div className="flex justify-between text-[10px] uppercase tracking-wide text-muted-foreground">
+            <span>Gentle</span>
+            <span>Fast</span>
+          </div>
+          <p className="mt-1 text-[10px] leading-relaxed text-muted-foreground">
+            {node.approachDuty === undefined ? (
+              <>Default gentle crawl. Drag to set the speed the carousel slows to before the target shelf.</>
+            ) : (
+              <>
+                Set manually.{" "}
+                <button
+                  type="button"
+                  disabled={busy}
+                  onClick={() =>
+                    dispatch({ type: "SET_NODE_APPROACH_PWM", nodeId: node.id, approachDuty: undefined })
+                  }
+                  className="underline underline-offset-2 transition-colors hover:text-foreground disabled:opacity-40"
+                >
+                  Reset to default
+                </button>{" "}
+                crawl.
               </>
             )}
           </p>

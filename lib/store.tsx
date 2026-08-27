@@ -503,6 +503,7 @@ type Action =
   | { type: "SET_NODE_PWM"; nodeId: string; pwmDuty: number }
   // `undefined` = clear the override, letting homing track the move duty again.
   | { type: "SET_NODE_HOMING_PWM"; nodeId: string; homingDuty: number | undefined }
+  | { type: "SET_NODE_APPROACH_PWM"; nodeId: string; approachDuty: number | undefined }
   // Jobs
   | { type: "START_JOB"; job: ActiveJob }
   /** Queue several jobs to run back-to-back (first runs now, rest wait). */
@@ -1235,6 +1236,18 @@ function coreReducer(state: AppState, action: Action): AppState {
       }
       const homingDuty = Math.max(0.05, Math.min(1, Math.round(action.homingDuty * 100) / 100))
       return withNode(state, action.nodeId, (n) => ({ ...n, homingDuty }))
+    }
+
+    case "SET_NODE_APPROACH_PWM": {
+      const node = getNode(state, action.nodeId)
+      if (!node || node.type === "shelf") return state
+      // `undefined` clears the override and returns the approach to the default
+      // crawl, matching the homing-duty control's escape hatch.
+      if (action.approachDuty === undefined) {
+        return withNode(state, action.nodeId, (n) => ({ ...n, approachDuty: undefined }))
+      }
+      const approachDuty = Math.max(0.05, Math.min(1, Math.round(action.approachDuty * 100) / 100))
+      return withNode(state, action.nodeId, (n) => ({ ...n, approachDuty }))
     }
 
     // ----- hardware bridge events (from a real Pi agent) -----
