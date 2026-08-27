@@ -175,6 +175,30 @@ export function homingDutyFor(node: { pwmDuty?: number; homingDuty?: number }): 
   return Math.round(Math.max(MIN_PWM_DUTY, Math.min(1, duty)) * 100) / 100
 }
 
+/**
+ * Default slow-approach duty for the final/target shelf.
+ *
+ * This is the speed the carousel crawls at as it arrives, so the target flag is
+ * caught gently instead of overshot. 0.25 matches the agent's MIN_DUTY — the
+ * slowest duty that still reliably turns the motor.
+ */
+export const DEFAULT_APPROACH_DUTY = 0.25
+
+/**
+ * The duty the final approach onto the target shelf runs at.
+ *
+ * An explicit `approachDuty` wins; otherwise it falls back to the default crawl.
+ * It is capped at the move duty — approaching FASTER than the cruise would be
+ * pointless and would defeat the gentle-arrival purpose — and floored at
+ * MIN_PWM_DUTY so the slider can go as slow as the motor allows.
+ */
+export function approachDutyFor(node: { pwmDuty?: number; approachDuty?: number }): number {
+  const explicit = node.approachDuty
+  const duty = typeof explicit === "number" && explicit > 0 ? explicit : DEFAULT_APPROACH_DUTY
+  const capped = Math.min(duty, moveDutyFor(node))
+  return Math.round(Math.max(MIN_PWM_DUTY, Math.min(1, capped)) * 100) / 100
+}
+
 /** Default soft START ramp intensity (%) for a new carousel. */
 export const DEFAULT_RAMP_PCT = 40
 /** How much the ends of a move can be slowed at full ramp (2.5x base delay). */

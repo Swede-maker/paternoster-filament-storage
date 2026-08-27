@@ -80,6 +80,15 @@ RAMP_STEP_SECONDS = 0.02  # PWM update interval while ramping
 # a whole shelf beyond the target. Softness after the target is worth far less
 # than stopping where the user asked, so the stop ramp gets its own short budget.
 STOP_RAMP_SECONDS = 0.25
+# Fraction of the last measured shelf-to-shelf interval that the smooth
+# deceleration on the final approach is allowed to occupy. The decel ramp runs
+# BEFORE the target flag is detected, across the pitch that already exists
+# between the penultimate shelf and the target, so it never adds overshoot — but
+# it MUST finish before the flag arrives or the carousel would still be fast at
+# the stop. Sizing it to a fraction of the observed pitch guarantees that: the
+# final leg starts at cruise and then slows, so it always lasts longer than the
+# cruise-speed pitch this fraction is taken from.
+DECEL_LEG_FRACTION = 0.6
 PULSE_TIMEOUT = 8.0   # seconds to wait for the next shelf pulse before faulting
 HOME_TIMEOUT = 30.0   # seconds to find the index sensor before faulting
 # How often a long sensor wait re-checks for an emergency stop. Small enough to
@@ -809,6 +818,11 @@ class Carousel:
         self.move_speed = MOVE_SPEED
         self.homing_speed = HOMING_SPEED
         self.ramp_pct = 40
+        # Duty for the final shelf — the "slow" arrival speed the operator can now
+        # tune from the app. MIN_DUTY is the gentlest duty that still reliably
+        # turns the motor, so it is the right default; the slider can go lower for
+        # a heavier carousel that coasts, at the risk of stalling if set too low.
+        self.approach_speed = MIN_DUTY
 
         self._cmd: Optional[tuple] = None
         self._abort = threading.Event()
@@ -832,7 +846,8 @@ class Carousel:
         if shelves > 0:
             self.shelves = shelves
 
-    def set_motion(self, move_speed=None, homing_speed=None, ramp_pct=None) -> None:
+    def set_motion(self, move_speed=None, homing_speed=None, ramp_pct=None,
+                   approach_speed=None) -> None:
         """
         Apply speed / soft-start settings from the app's sliders.
 
@@ -852,9 +867,14 @@ class Carousel:
             self.homing_speed = max(SLIDER_MIN_DUTY, min(1.0, float(homing_speed)))
         if ramp_pct is not None:
             self.ramp_pct = max(0, min(100, int(ramp_pct)))
+        if approach_speed is not None:
+            # Same low floor as the move/homing sliders: the operator, not a
+            # hardcoded stall guess, decides how slow the final crawl runs.
+            self.approach_speed = max(SLIDER_MIN_DUTY, min(1.0, float(approach_speed)))
         print(
             f"[agent] motion set: move={self.move_speed:.2f} "
-            f"home={self.homing_speed:.2f} ramp={self.ramp_pct}%",
+            f"home={self.homing_speed:.2f} ramp={self.ramp_pct}% "
+            f"approach={self.approach_speed:.2f}",
             flush=True,
         )
 
@@ -1410,13 +1430,16 @@ class Carousel:
         # gently the motor SPEEDS UP; letting it also dictate the arrival speed
         # meant a mid-slider ramp setting silently traded away arrival accuracy.
         #
-        # MIN_DUTY is the slowest duty that still TURNS the motor, so it is exactly
-        # the right arrival speed: as gentle as the hardware allows, never below
-        # the stall threshold. It is deliberately not derived from `speed` —
-        # writing it as `min(MIN_DUTY, speed)` produced a sub-stall approach at low
-        # slider settings (speed 0.01 -> 0.01) and the carousel simply stopped
-        # short of the target.
-        approach = MIN_DUTY
+        # The operator-tunable arrival duty (the "slow speed" slider). It defaults
+        # to MIN_DUTY — the slowest duty that still reliably TURNS the motor, as
+        # gentle as the hardware allows — but can be raised for a quicker approach
+        # or lowered for a heavy carousel that coasts.
+        #
+        # It is deliberately NOT derived from `speed`: writing it as
+        # `min(MIN_DUTY, speed)` produced a sub-stall approach at low slider
+        # settings (speed 0.01 -> 0.01) and the carousel simply stopped short of
+        # the target. `self.approach_speed` is clamped in `set_motion` instead.
+        approach = self.approach_speed
 
         # A ONE-SHELF HOP IS ENTIRELY A FINAL APPROACH, so it runs at the arrival
         # duty from the start — there is no intermediate shelf at which to slow
@@ -1540,6 +1563,14 @@ class Carousel:
         # Set once the arrival duty has been applied, so the soft start above can
         # never accelerate back out of it.
         on_final_approach = False
+
+        # SMOOTH DECELERATION STATE for the final approach leg. `decel_started` is
+        # None until the penultimate shelf is counted; from then the loop eases the
+        # duty down from `decel_from` (the cruise it was travelling at) to
+        # `approach` over `decel_seconds`, instead of dropping to it in one step.
+        decel_started = None
+        decel_from = cruise
+        decel_seconds = 0.0
         # From the state sampled at step 0, not re-read here: by now the flag may
         # already have moved back into the window.
         seen_inactive = not parked_on_flag
@@ -1586,6 +1617,30 @@ class Carousel:
                 frac = (time.monotonic() - ramp_started) / ramp_seconds
                 target_duty = cruise if frac >= 1.0 else ramp_floor + (cruise - ramp_floor) * frac
                 if target_duty > speed:
+                    self._energise(direction, target_duty)
+                    speed = target_duty
+
+            # SMOOTH STOP, the mirror of the soft start above and the answer to
+            # "it brakes too aggressively near the target". Once the penultimate
+            # shelf is counted (`decel_started` set below) this eases the duty from
+            # the cruise it was running at down to the gentle arrival duty over the
+            # space of the final leg, instead of the old single-step drop that made
+            # the carousel lurch.
+            #
+            # It is a pure ramp DOWN — `target_duty < speed` — so it never fights
+            # the soft start, and it is time-based over `decel_seconds`, which was
+            # sized from the measured pitch so the arrival duty is reached before
+            # the target flag triggers. The stop itself is still instant on that
+            # trigger; only the run-up to it is softened, which is why this adds no
+            # overshoot.
+            if on_final_approach and decel_started is not None and speed > approach:
+                if decel_seconds <= 0:
+                    target_duty = approach
+                else:
+                    frac = (time.monotonic() - decel_started) / decel_seconds
+                    target_duty = approach if frac >= 1.0 else (
+                        decel_from - (decel_from - approach) * frac)
+                if target_duty < speed:
                     self._energise(direction, target_duty)
                     speed = target_duty
 
@@ -1673,8 +1728,13 @@ class Carousel:
                 continue
 
             if triggered:
+                now = time.monotonic()
+                # Time to cross the pitch just travelled — the interval since the
+                # previous shelf (or the move start for the first count). Used to
+                # size the deceleration so it fits inside the final leg.
+                pitch_time = now - last_trigger
                 counted += 1
-                last_trigger = time.monotonic()
+                last_trigger = now
 
                 if counted >= steps:
                     # THIS IS THE TARGET. Cut power immediately, before any
@@ -1685,18 +1745,30 @@ class Carousel:
                     break
 
                 if counted == steps - 1:
+                    # THE NEXT TRIGGER IS THE TARGET. Begin easing down to the
+                    # arrival duty across this final leg, instead of dropping to it
+                    # in one step (the old aggressive brake).
                     on_final_approach = True
 
-                if counted == steps - 1 and approach != speed:
-                    # The next trigger is the target, so the arrival duty is due.
-                    # Applied whenever it DIFFERS from the current duty, not only
-                    # when it is lower: a long soft start may still be below the
-                    # approach duty at this point, and the old `approach < speed`
-                    # test silently skipped the changeover in that case, leaving
-                    # the final shelf to be taken at whatever partial ramp duty
-                    # happened to be set.
-                    self._energise(direction, approach)
-                    speed = approach
+                    if approach < speed:
+                        # Ramp down. Duration is the operator's ramp-gentleness
+                        # (the same slider that shapes the soft start), but capped
+                        # to a fraction of the pitch just measured so the arrival
+                        # duty is always reached before the target flag arrives.
+                        decel_from = speed
+                        decel_started = now
+                        decel_seconds = min(self._ramp_seconds(),
+                                            DECEL_LEG_FRACTION * pitch_time)
+                        if decel_seconds <= 0:
+                            # No ramp requested (ramp_pct = 0): keep the original
+                            # immediate drop so behaviour is unchanged at 0%.
+                            self._energise(direction, approach)
+                            speed = approach
+                    elif approach != speed:
+                        # A long soft start may still be BELOW the approach duty
+                        # here; nudge it up in one step, there is nothing to ease.
+                        self._energise(direction, approach)
+                        speed = approach
 
                 self.current_shelf = (self.current_shelf + step) % self.shelves
                 self.emit({"type": "pos", "shelf": self.current_shelf})
@@ -1863,6 +1935,7 @@ async def serve(args) -> None:
                         move_speed=msg.get("moveSpeed"),
                         homing_speed=msg.get("homingSpeed"),
                         ramp_pct=msg.get("rampPct"),
+                        approach_speed=msg.get("approachSpeed"),
                     )
                 elif t == "hello":
                     await ws.send(json.dumps({"type": "hello", "name": args.name, "shelves": carousel.shelves, "simulated": sim_reason is not None, "simReason": sim_reason}))

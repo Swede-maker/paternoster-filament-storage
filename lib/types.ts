@@ -462,6 +462,16 @@ export interface StorageNode {
    * later position is measured from it.
    */
   homingDuty?: number
+  /**
+   * PWM duty for the slow APPROACH onto the target shelf, 0.05–1 (5–100%).
+   * Undefined = the default crawl (`approachDutyFor` falls back to 0.25).
+   *
+   * This is the "slow speed" the carousel eases down to just before the final
+   * shelf so the target flag is caught gently instead of overshot. Separate from
+   * `pwmDuty` (the cruise speed between shelves): a heavy carousel needs a brisk
+   * cruise but a very slow arrival, and one control cannot serve both.
+   */
+  approachDuty?: number
   storage: StorageConfig
   /** shelf -> slot -> spoolId | null */
   slots: (string | null)[][]

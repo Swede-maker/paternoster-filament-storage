@@ -57,6 +57,8 @@ export interface ConfigCommand {
   homingSpeed?: number
   /** Soft start/stop ramp intensity, 0–100%. 0 = no easing. */
   rampPct?: number
+  /** PWM duty (0..1) for the slow approach onto the final/target shelf. */
+  approachSpeed?: number
 }
 
 export type NodeCommand = HelloCommand | HomeCommand | GotoCommand | StopCommand | ConfigCommand

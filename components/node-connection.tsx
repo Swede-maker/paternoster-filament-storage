@@ -4,7 +4,7 @@ import { useEffect, useRef } from "react"
 import { useStore } from "@/lib/store"
 import type { StorageNode } from "@/lib/types"
 import { parseEvent, type NodeCommand } from "@/lib/node-protocol"
-import { moveDutyFor, homingDutyFor, DEFAULT_RAMP_PCT } from "@/lib/filament"
+import { moveDutyFor, homingDutyFor, approachDutyFor, DEFAULT_RAMP_PCT } from "@/lib/filament"
 
 /**
  * Owns the live connection to hardware nodes' Pi agents — via the app server.
@@ -328,6 +328,7 @@ export function NodeConnection() {
         n.storage.shelves,
         moveDutyFor(n),
         homingDutyFor(n),
+        approachDutyFor(n),
         n.rampPct ?? DEFAULT_RAMP_PCT,
       ].join(":"),
     )
@@ -354,6 +355,7 @@ export function NodeConnection() {
               shelves: node.storage.shelves,
               moveSpeed: moveDutyFor(node),
               homingSpeed: homingDutyFor(node),
+              approachSpeed: approachDutyFor(node),
               rampPct: node.rampPct ?? DEFAULT_RAMP_PCT,
             },
           }),

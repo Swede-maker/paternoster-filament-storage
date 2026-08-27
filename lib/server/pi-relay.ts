@@ -95,7 +95,7 @@ interface Relay {
    * default speed until the operator happened to touch a slider again. Replaying
    * this on every open keeps the hardware matching the UI.
    */
-  motion: { moveSpeed?: number; homingSpeed?: number; rampPct?: number }
+  motion: { moveSpeed?: number; homingSpeed?: number; rampPct?: number; approachSpeed?: number }
   closing: boolean
 }
 
@@ -443,6 +443,7 @@ export function sendCommand(ip: string, port: number, cmd: NodeCommand): boolean
     if (cmd.moveSpeed !== undefined) relay.motion.moveSpeed = cmd.moveSpeed
     if (cmd.homingSpeed !== undefined) relay.motion.homingSpeed = cmd.homingSpeed
     if (cmd.rampPct !== undefined) relay.motion.rampPct = cmd.rampPct
+    if (cmd.approachSpeed !== undefined) relay.motion.approachSpeed = cmd.approachSpeed
     if (cmd.shelves > 0) relay.shelves = cmd.shelves
   }
 

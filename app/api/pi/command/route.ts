@@ -20,7 +20,13 @@ function parseCommand(body: unknown): NodeCommand | null {
       return { type: "goto", shelf }
     }
     case "config": {
-      const b = body as { shelves?: unknown; moveSpeed?: unknown; homingSpeed?: unknown; rampPct?: unknown }
+      const b = body as {
+        shelves?: unknown
+        moveSpeed?: unknown
+        homingSpeed?: unknown
+        rampPct?: unknown
+        approachSpeed?: unknown
+      }
       if (typeof b.shelves !== "number" || !Number.isInteger(b.shelves) || b.shelves <= 0) return null
       // Rebuilding the command field-by-field is what dropped the slider values:
       // anything not copied here never reaches the Pi. Motion fields are
@@ -29,8 +35,10 @@ function parseCommand(body: unknown): NodeCommand | null {
       const duty = (v: unknown) => (typeof v === "number" && Number.isFinite(v) && v > 0 && v <= 1 ? v : undefined)
       const moveSpeed = duty(b.moveSpeed)
       const homingSpeed = duty(b.homingSpeed)
+      const approachSpeed = duty(b.approachSpeed)
       if (moveSpeed !== undefined) cmd.moveSpeed = moveSpeed
       if (homingSpeed !== undefined) cmd.homingSpeed = homingSpeed
+      if (approachSpeed !== undefined) cmd.approachSpeed = approachSpeed
       if (typeof b.rampPct === "number" && Number.isFinite(b.rampPct) && b.rampPct >= 0 && b.rampPct <= 100) {
         cmd.rampPct = Math.round(b.rampPct)
       }
