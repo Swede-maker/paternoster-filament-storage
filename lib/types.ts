@@ -234,7 +234,6 @@ export type MachineStatus =
   | "awaiting-move-confirm" // safety confirm before any motion
   | "awaiting-pick-confirm" // stopped at a shelf, waiting for "confirm pick"
   | "awaiting-store-confirm" // stopped at a shelf, waiting to place a spool
-  | "calibrating" // running the carousel speed auto-calibration routine
   | "stopped" // emergency-stopped: frozen in place until resumed or homed
 
 export type RotationDirection = "up" | "down"
@@ -437,26 +436,21 @@ export interface StorageNode {
   /** Agent-reported cause of simulation, e.g. the gpiozero pin-factory error. */
   agentSimReason?: string
   /**
-   * Calibrated carousel travel time between adjacent shelves, in seconds. This
-   * is the real-world speed found by auto-calibration (target ~3.5 s) and also
-   * adjustable with the manual speed slider. Drives how fast the carousel
-   * rotates everywhere in the app. Defaults to 3.5 when absent.
-   */
-  secPerShelf?: number
-  /**
-   * Soft start/stop ramp intensity, 0–100%. 0 = constant speed (no easing);
-   * higher values ease the carousel in at the start of a rotation and out at
-   * the end, for gentler acceleration/deceleration. Auto-calibration computes a
-   * sensible value from the found speed; the user can fine-tune it. Defaults to
-   * a mid value when absent.
+   * Soft START ramp intensity, 0–100%. 0 = no easing; higher values ease the
+   * carousel in at the start of a rotation. It deliberately does NOT soften the
+   * stop: arrival cuts power the instant the shelf sensor triggers, because any
+   * ramp there keeps driving past the flag that was just detected.
    */
   rampPct?: number
   /**
-   * Whether the carousel speed has been calibrated. A brand-new paternoster
-   * starts uncalibrated and must be calibrated BEFORE it is allowed to home.
-   * Shelf (manual) nodes are always considered calibrated (no motor).
+   * PWM duty for moves, 0.05–1 (5–100%). This IS the carousel speed and is sent
+   * to the motor as-is.
+   *
+   * There is deliberately no seconds-per-shelf setting any more. Position is
+   * established by homing plus shelf-sensor counting, never from elapsed time,
+   * so a second control expressing "speed" as a duration only fought this one.
    */
-  calibrated?: boolean
+  pwmDuty?: number
   storage: StorageConfig
   /** shelf -> slot -> spoolId | null */
   slots: (string | null)[][]

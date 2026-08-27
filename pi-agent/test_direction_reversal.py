@@ -703,6 +703,165 @@ def main():
     # ======================================================================
     print()
     print("=" * 68)
+    print("10. TRIGGER = STOP, AND ACCELERATE WITHOUT WAITING FOR A SENSOR")
+    print("=" * 68)
+    print("Reported: (a) the carousel waits for the sensor to go from triggered to")
+    print("untriggered before stopping, so it drives past the shelf; (b) it waits")
+    print("for a trigger before it speeds up, instead of soft-starting right away.")
+    print()
+
+    class ScriptedHW:
+        """
+        Pulse-driven fake. Edges and level reads are dictated by the test rather
+        than emerging from simulated physics, so the counting logic is measured
+        directly instead of through timing luck.
+        """
+        def __init__(self, level, pulses=999):
+            self._level = level          # what shelf_active() reports
+            self._left = pulses
+            self.consumed = 0
+            self.duties = []             # (t, duty) for every energise
+            self.stopped_at = None       # pulses consumed when power was cut
+            self.stop_level = None       # sensor level at the instant of the stop
+            self.travel_direction = None
+            self.flag_exit_direction = None
+            self._t0 = time.monotonic()
+
+        def _go(self, duty):
+            self.duties.append((time.monotonic() - self._t0, duty))
+
+        def forward(self, duty):
+            self._go(duty)
+
+        def backward(self, duty):
+            self._go(duty)
+
+        def stop(self):
+            if self.stopped_at is None:
+                self.stopped_at = self.consumed
+                self.stop_level = self._level
+            self.duties.append((time.monotonic() - self._t0, 0.0))
+
+        def cut(self):
+            self.stop()
+
+        def take_shelf_pulse(self, timeout):
+            if self._left <= 0:
+                return False
+            self._left -= 1
+            self.consumed += 1
+            return True
+
+        def take_index_pulse(self, timeout):
+            return False
+
+        def shelf_active(self):
+            return self._level
+
+        def index_active(self):
+            return False
+
+        def shelf_clear(self, timeout):
+            # Mirrors the real helper: blocks while the window stays occupied.
+            deadline = time.monotonic() + timeout
+            while self._level:
+                if time.monotonic() >= deadline:
+                    return False
+                time.sleep(0.005)
+            return True
+
+        def index_clear(self, timeout):
+            return True
+
+        def set_shelf_settle(self, seconds):
+            pass
+
+        def reset_pulses(self):
+            pass
+
+        def cleanup(self):
+            pass
+
+    # --- (a) a 2-shelf move must stop on the 2nd trigger, not the 3rd ---------
+    #
+    # `shelf_active()` reports False, which is the realistic fast-crossing case:
+    # at speed the flag can cross the whole window before the level is read. The
+    # old alternation treated that as "this edge was a departure" and threw a
+    # genuine ARRIVAL away, so the move needed a 3rd trigger and ran a full shelf
+    # past the target.
+    hw = ScriptedHW(level=False)
+    car = pa.Carousel(hw, shelves=9, emit=lambda e: None)
+    car.homed = True
+    car.current_shelf = 0
+    car.set_motion(move_speed=0.45, homing_speed=0.30, ramp_pct=0)
+    car._do_goto(2)
+    check("a 2-shelf move stops on the 2nd trigger (no overshoot)",
+          hw.stopped_at == 2,
+          "power was cut after %s triggers; 3 means a whole shelf of overshoot"
+          % hw.stopped_at)
+
+    # --- and the stop must land while the flag is still ON the sensor ---------
+    hw = ScriptedHW(level=True)
+    car = pa.Carousel(hw, shelves=9, emit=lambda e: None)
+    car.homed = True
+    car.current_shelf = 0
+    car.set_motion(move_speed=0.45, homing_speed=0.30, ramp_pct=0)
+    car._do_goto(1)
+    check("power is cut while the sensor is still TRIGGERED",
+          hw.stop_level is True,
+          "the stop happened after the sensor had already cleared")
+
+    # --- (b) acceleration must not be gated on a sensor trigger --------------
+    #
+    # The sensor stays TRIGGERED for the whole test and never clears, exactly as
+    # when starting parked on a flag. The old code called shelf_clear() before
+    # its soft start, so it sat at the break-away duty until that timed out and
+    # then faulted. Speed must instead rise on its own.
+    hw = ScriptedHW(level=True)
+    car = pa.Carousel(hw, shelves=9, emit=lambda e: None)
+    car.homed = True
+    car.current_shelf = 0
+    car.set_motion(move_speed=0.45, homing_speed=0.30, ramp_pct=60)
+    t = threading.Thread(target=car._do_goto, args=(3,), daemon=True)
+    t.start()
+    time.sleep(1.2)
+    duties = [d for _, d in hw.duties if d > 0]
+    check("the motor is energised immediately, before any trigger",
+          len(duties) > 0 and duties[0] > 0,
+          "the motor was never energised")
+    check("it accelerates without waiting for a sensor trigger",
+          len(duties) > 1 and max(duties) > duties[0] + 0.01,
+          "duty never rose above its opening value %.3f (gated on a trigger)"
+          % (duties[0] if duties else 0.0))
+    check("the soft start is gradual, not a single jump to full duty",
+          len(duties) >= 3,
+          "only %d duty steps: that is a hard start, not a ramp" % len(duties))
+    check("the opening duty never exceeds the requested speed",
+          all(d <= 0.45 + 1e-6 for d in duties),
+          "opened at a duty above the operator's setting")
+    car.request_stop()
+    t.join(timeout=5)
+
+    # --- (c) stopping ON the trigger removes the reverse hunt entirely --------
+    #
+    # The "weird reverse crawl" was a CONSEQUENCE of stopping late: the old soft
+    # stop carried the flag back out of the window, so alignment had to hunt
+    # backwards for a flag it had just left. Cutting power on the rising edge
+    # leaves the flag inside the window, so alignment has nothing to correct.
+    hw = ScriptedHW(level=True, pulses=0)   # on the flag; nothing coasted past
+    car = pa.Carousel(hw, shelves=9, emit=lambda e: None)
+    aligned = car._settle_on_sensor("up")
+    moved = [d for _, d in hw.duties if d > 0]
+    check("stopping on the trigger leaves the carousel already aligned",
+          aligned,
+          "alignment failed even though the flag was on the sensor")
+    check("no reverse crawl runs when the stop landed on the flag",
+          not moved,
+          "the motor was driven again after the stop: %r" % (moved,))
+
+    # ======================================================================
+    print()
+    print("=" * 68)
     failed = [n for n, ok in _results if not ok]
     if failed:
         print("%d CHECK(S) FAILED:" % len(failed))

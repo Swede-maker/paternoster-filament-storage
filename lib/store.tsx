@@ -32,15 +32,7 @@ import type {
   StorageConfig,
   StorageNode,
 } from "./types"
-import {
-  printerSlotCount,
-  secPerShelfToStepMs,
-  rampStepMs,
-  autoRampPct,
-  newId,
-  DEFAULT_SEC_PER_SHELF,
-  DEFAULT_RAMP_PCT,
-} from "./filament"
+import { printerSlotCount, rampStepMs, newId, DEFAULT_RAMP_PCT } from "./filament"
 import { shelfLabel, printerSlotLabel } from "./selectors"
 import { shortestRotation } from "./balance"
 import { getSystemVersion, loadSystemState, saveSystemState } from "@/app/actions/system-state"
@@ -98,7 +90,7 @@ function toPersisted(state: AppState): PersistedState {
     // poll clobber freshly-committed slot changes mid-operation.
     //
     // `homed` is likewise per-session runtime state — a homing pass is a LOCAL
-    // calibration action, not something to command on other clients. We always
+    // action, not something to command on other clients. We always
     // persist it as `homed: true` so that a client that is momentarily un-homed
     // (mid-home) never broadcasts `homed:false` to peers and makes THEM home
     // too. Combined with migrate() trusting the persisted value, a remote client
@@ -271,8 +263,16 @@ function mergeCatalog(local: PersistedState, remote: PersistedState, baseline: P
   }
 }
 
-/** Homing duration (ms). Per-shelf rotation time is per-node (calibrated speed). */
+/** Homing duration (ms) in simulation. */
 const HOME_MS = 1300
+/**
+ * Per-shelf animation step (ms) for SIMULATED nodes only.
+ *
+ * Cosmetic. Real hardware speed is the PWM duty, and real position comes from
+ * homing plus shelf-sensor pulses, so no elapsed-time value is used to decide
+ * where a physical carousel is.
+ */
+const SIM_STEP_MS = 420
 
 // ---------------------------------------------------------------------------
 // Initial / default state
@@ -362,12 +362,7 @@ function makeNode(opts: {
     // Simulated nodes are always "online"; hardware nodes start "offline"
     // until the WebSocket connection to the Pi agent is established.
     link: driver === "hardware" ? "offline" : "online",
-    // Start at the target speed; a brand-new paternoster must be speed-calibrated
-    // before it is allowed to home. Shelf storage has no motor, so it is always
-    // considered calibrated.
-    secPerShelf: DEFAULT_SEC_PER_SHELF,
     rampPct: DEFAULT_RAMP_PCT,
-    calibrated: manual,
     storage: opts.storage,
     // A library is an unbounded single row of spools, so it ignores the
     // shelves/slots config and starts as one empty row that grows on demand.
@@ -503,13 +498,9 @@ type Action =
   | { type: "MOVE_TICK"; nodeId: string }
   | { type: "ARRIVED"; nodeId: string }
   | { type: "CONFIRM_MOVE"; nodeId: string }
-  // Carousel speed: calibration routine + manual slider
-  | { type: "CALIBRATE_START"; nodeId: string }
-  | { type: "CALIBRATE_ADVANCE"; nodeId: string }
-  | { type: "CALIBRATE_DONE"; nodeId: string; secPerShelf: number }
-  | { type: "CALIBRATE_CANCEL"; nodeId: string }
-  | { type: "SET_NODE_SPEED"; nodeId: string; secPerShelf: number }
+
   | { type: "SET_NODE_RAMP"; nodeId: string; rampPct: number }
+  | { type: "SET_NODE_PWM"; nodeId: string; pwmDuty: number }
   // Jobs
   | { type: "START_JOB"; job: ActiveJob }
   /** Queue several jobs to run back-to-back (first runs now, rest wait). */
@@ -1210,67 +1201,25 @@ function coreReducer(state: AppState, action: Action): AppState {
       return withNode(state, action.nodeId, (n) => ({ ...n, machine: { ...n.machine, status: "moving" } }))
     }
 
-    // ----- carousel speed calibration (per node) -----
-    case "CALIBRATE_START": {
-      const node = getNode(state, action.nodeId)
-      // Only real (paternoster) carousels calibrate, and never mid-job/mid-motion.
-      if (!node || node.type === "shelf") return state
-      if (node.machine.status !== "idle" && node.machine.status !== "calibrating") return state
-      return withNode(state, action.nodeId, (n) => ({
-        ...n,
-        machine: { ...n.machine, status: "calibrating", targetShelf: null, direction: null },
-      }))
-    }
-
-    case "CALIBRATE_ADVANCE": {
-      // Visibly index the carousel one shelf as calibration measures each pass.
-      const node = getNode(state, action.nodeId)
-      if (!node || node.machine.status !== "calibrating") return state
-      const { shelves } = node.storage
-      return withNode(state, action.nodeId, (n) => ({
-        ...n,
-        machine: { ...n.machine, currentShelf: (n.machine.currentShelf + 1) % shelves },
-      }))
-    }
-
-    case "CALIBRATE_DONE": {
-      const node = getNode(state, action.nodeId)
-      if (!node) return state
-      // Store the found speed and mark calibrated. Leave `homed` untouched: a
-      // first-time calibration leaves the unit un-homed so the auto-home effect
-      // then homes it (calibration runs BEFORE homing on first setup).
-      const sec = Math.max(0.5, action.secPerShelf)
-      return withNode(state, action.nodeId, (n) => ({
-        ...n,
-        secPerShelf: sec,
-        // Auto-calibration also derives a soft start/stop ramp from the found
-        // speed (faster carousels get gentler easing). The user can still adjust.
-        rampPct: autoRampPct(sec),
-        calibrated: true,
-        machine: { ...n.machine, status: "idle", targetShelf: null, direction: null },
-      }))
-    }
-
-    case "CALIBRATE_CANCEL": {
-      const node = getNode(state, action.nodeId)
-      if (!node) return state
-      return withNode(state, action.nodeId, (n) => ({
-        ...n,
-        machine: { ...n.machine, status: "idle", targetShelf: null, direction: null },
-      }))
-    }
-
-    case "SET_NODE_SPEED": {
-      const node = getNode(state, action.nodeId)
-      if (!node || node.type === "shelf") return state
-      return withNode(state, action.nodeId, (n) => ({ ...n, secPerShelf: Math.max(0.5, action.secPerShelf) }))
-    }
+    // Speed calibration is gone. It existed only to measure seconds-per-shelf,
+    // and it gated homing behind a "must calibrate first" step. Motor speed is
+    // now set directly by the PWM duty, and position comes from homing plus
+    // shelf-sensor counting, so there is no elapsed-time figure left to measure.
 
     case "SET_NODE_RAMP": {
       const node = getNode(state, action.nodeId)
       if (!node || node.type === "shelf") return state
       const rampPct = Math.max(0, Math.min(100, Math.round(action.rampPct)))
       return withNode(state, action.nodeId, (n) => ({ ...n, rampPct }))
+    }
+
+    case "SET_NODE_PWM": {
+      const node = getNode(state, action.nodeId)
+      if (!node || node.type === "shelf") return state
+      // Allow right down to 5% so a heavy carousel can be slowed until it stops
+      // coasting past the shelf flag. This duty IS the carousel speed.
+      const pwmDuty = Math.max(0.05, Math.min(1, Math.round(action.pwmDuty * 100) / 100))
+      return withNode(state, action.nodeId, (n) => ({ ...n, pwmDuty }))
     }
 
     // ----- hardware bridge events (from a real Pi agent) -----
@@ -1679,8 +1628,6 @@ function migrate(parsed: any): AppState {
         // A library is an unbounded single row; guarantee it always has at least
         // one row so adding/rendering spools never hits an undefined slot array.
         slots: type === "library" ? (Array.isArray(n.slots) && n.slots.length > 0 ? n.slots : [[]]) : n.slots,
-        // Manual units have no motor, so they're always calibrated.
-        calibrated: manual ? true : n.calibrated,
         port: typeof n.port === "number" ? n.port : DEFAULT_AGENT_PORT,
         // Hardware nodes start offline until reconnected; simulated stay online.
         link: driver === "hardware" ? "offline" : "online",
@@ -1757,6 +1704,9 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const [ready, setReady] = useReducer(() => true, false)
   const [loadError, setLoadError] = useState<string | null>(null)
   const timers = useRef<Record<string, ReturnType<typeof setTimeout>>>({})
+  // Nodes already auto-homed this session, so a later fault that clears `homed`
+  // cannot make the carousel start homing again by itself.
+  const autoHomedRef = useRef<Set<string>>(new Set())
 
   // Sync bookkeeping. `dbVersion` is the last version we've seen from the
   // server; `lastSavedSig` is the persisted-subset signature we last wrote, so
@@ -1968,8 +1918,15 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       if (n.type === "shelf" || n.type === "library") continue
       if (n.machine.homed || n.machine.status !== "idle") continue
       if (n.driver === "hardware" && n.link !== "online") continue
-      // A paternoster must be speed-calibrated before it may home.
-      if (!n.calibrated) continue
+      // ONCE per node per session. `homed` also goes false when a move ends
+      // without the shelf sensor confirming position, and re-firing here turned
+      // that fault into the carousel setting off on a full homing sweep on its
+      // own — surprise motion on a machine with moving shelves, and impossible
+      // to interpret from the outside ("it just starts homing itself").
+      // Power-up homing is still automatic; recovering from a fault is now the
+      // operator's call, via the Home button.
+      if (autoHomedRef.current.has(n.id)) continue
+      autoHomedRef.current.add(n.id)
       dispatch({ type: "HOME_START", nodeId: n.id })
     }
   }, [ready, state.configured, state.nodes])
@@ -1980,16 +1937,18 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const motionSig = state.nodes
     .map(
       (n) =>
-        `${n.id}:${n.driver}:${n.machine.status}:${n.machine.currentShelf}:${n.machine.moveFrom ?? ""}:${n.machine.targetShelf ?? ""}:${n.secPerShelf}:${n.rampPct ?? ""}`,
+        `${n.id}:${n.driver}:${n.machine.status}:${n.machine.currentShelf}:${n.machine.moveFrom ?? ""}:${n.machine.targetShelf ?? ""}:${n.rampPct ?? ""}`,
     )
     .join("|")
   useEffect(() => {
     const active = new Set<string>()
     for (const n of state.nodes) {
       if (n.driver === "hardware") continue
-      // Per-node step time reflects the calibrated/slider speed so faster/slower
-      // is actually visible as the carousel rotates.
-      const baseMs = secPerShelfToStepMs(n.secPerShelf)
+      // Simulation-only animation pace: a fixed, comfortable step time. It is
+      // purely cosmetic — nothing about real positioning depends on it, since
+      // hardware nodes are driven by their Pi agent and locate themselves from
+      // the shelf sensor rather than from elapsed time.
+      const baseMs = SIM_STEP_MS
       if (n.machine.status === "homing") {
         active.add(`home:${n.id}`)
         if (!timers.current[`home:${n.id}`]) {

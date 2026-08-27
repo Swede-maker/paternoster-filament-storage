@@ -1211,64 +1211,40 @@ class Carousel:
         # a big coast past the target. Do the whole hop at the approach duty.
         cruise = approach if steps <= 1 else speed
 
-        # The carousel parks INSIDE the sensor window, so a move normally starts
-        # with the sensor already active. The parked flag must be driven OUT of
-        # the window before counting begins, otherwise the level dropping as it
-        # leaves — or the smallest bounce on that boundary — is counted as the
-        # target shelf arriving and the move ends after ~30mm.
+        # ------------------------------------------------------------------
+        # SOFT START, IMMEDIATELY.
         #
-        # This happens at MIN_DUTY, BEFORE the soft start, and the order matters:
-        # `_drive` blocks for the whole ramp (up to 1.2s), which is long enough
-        # to carry the carousel past an entire shelf. Waiting for the window
-        # afterwards would then discard pulses for shelves already travelled and
-        # overshoot by nearly a full shelf. Detecting the departure at crawl
-        # speed keeps it unambiguous.
-        # Never faster than the duty asked for. This is the last place a
-        # hardcoded MIN_DUTY silently overrode the operator: every move opened
-        # with a 25% kick, so a 12% PWM setting still started at 25% and the
-        # slider's whole lower half did nothing.
-        motor_start = time.monotonic()
-        self._energise(direction, min(MIN_DUTY, speed))
-
-        if self.hw.shelf_active():
-            if not self.hw.shelf_clear(SHELF_CLEAR_TIMEOUT):
-                self.hw.stop()
-                self.status = "idle"
-                self.emit({"type": "fault",
-                           "message": "Shelf sensor never cleared; check sensor wiring or jam"})
-                return
-            self.hw.reset_pulses()  # drop the edge produced by leaving the flag
-        else:
-            # Window already empty: the last move braked AFTER detecting the flag
-            # and coasted clear of it (or an abort/fault left us mid-travel).
-            # There is no departure edge to wait for.
-            if reversing:
-                # Turning back the way we came, so the flag we are parked just
-                # past is about to slide INTO the window again. It is the shelf we
-                # are already on, not the next one, so consume that whole
-                # crossing — in, then out — before counting starts.
-                #
-                # A fixed blanking delay cannot do this job: how long the re-entry
-                # takes depends on how far the previous stop overshot, which is
-                # exactly what we do not know. Watching for the crossing itself
-                # works no matter how far past the window we stopped, and is why
-                # counting now survives a change of direction.
-                if self.hw.take_shelf_pulse(REVERSE_REENTRY_TIMEOUT):
-                    self.hw.shelf_clear(SHELF_CLEAR_TIMEOUT)
-            else:
-                # Same direction as last time: the flag is behind us and receding,
-                # so the next edge is a genuine new shelf. Only guard against a
-                # bounce right on the boundary we just left.
-                elapsed = time.monotonic() - motor_start
-                if elapsed < PULSE_BLANKING:
-                    time.sleep(PULSE_BLANKING - elapsed)
-            self.hw.reset_pulses()
-
-        # Now the soft start proper, continuing up from the crawl duty the motor
-        # is already running at. Short moves get a capped ramp so the requested
-        # duty is actually reached while there is still travel left to feel it.
+        # Ramping up to cruise is the FIRST thing a move does. Nothing may block
+        # in front of it, and in particular no sensor state gates it.
+        #
+        # This used to creep at MIN_DUTY and wait for the parked flag to LEAVE
+        # the sensor window before it would accelerate, so acceleration was gated
+        # on a sensor trigger: a move opened with an indefinite crawl and — when
+        # reversing — an extra deliberate in-and-out crossing of the flag, rather
+        # than simply setting off and speeding up.
+        #
+        # Deleting those pre-ramp waits is safe because shelf pulses are COUNTED,
+        # not sampled: `_shelf_pulses` accumulates and `take_shelf_pulse`
+        # decrements it, so a shelf passing during the ramp is still counted, not
+        # missed. The old ordering was only ever needed back when the raw sensor
+        # LEVEL was read to classify edges.
+        # ------------------------------------------------------------------
+        # What the first pulse MEANS depends on whether the flag is in the window
+        # right now, so sample that before anything moves.
+        parked_on_flag = self.hw.shelf_active()
+        self.hw.reset_pulses()
         self._drive(direction, cruise, max_seconds=STOP_RAMP_SECONDS if steps <= 1 else None)
         speed = cruise
+
+        # A pulse fires on window ENTRY only, so the flag we are parked on cannot
+        # produce one by leaving: there is no departure edge to consume, and the
+        # next entry edge is a genuinely new shelf.
+        #
+        # One exception: reversing while parked OUTSIDE the window. We stopped
+        # just past a flag, so turning round drives that same flag back in, and
+        # that entry belongs to the shelf we are already on. Discard it — as a
+        # counter on the pulse stream, never as a blocking wait before the ramp.
+        skip_pulses = 1 if (reversing and not parked_on_flag) else 0
 
         # A slow speed or a long soft start means the first shelf legitimately
         # takes longer to arrive. Scaling the jam timeout keeps a slow-but-
@@ -1287,10 +1263,6 @@ class Carousel:
         pulse_timeout = PULSE_TIMEOUT * (MOVE_SPEED / max(0.01, speed)) + self._ramp_seconds()
 
         counted = 0
-        # True once a shelf has been counted and we are waiting for that shelf's
-        # departure edge. The move starts with the parked flag already driven out
-        # of the window, so the next edge is a genuine arrival.
-        pending_departure = False
         while counted < steps:
             if self._abort.is_set():
                 self.hw.stop()
@@ -1309,21 +1281,25 @@ class Carousel:
                     return
                 self.emit({"type": "fault", "message": "Jam? No shelf pulse within timeout"})
                 return
-            # An inductive sensor is a LEVEL, so each shelf passing can produce
-            # TWO edges: one as the flag enters the window and one as it leaves.
-            # Counting raw edges counted every shelf twice and ended a 3-shelf
-            # move after about 2 shelves. A shelf counts only on ARRIVAL; the
-            # matching departure edge is consumed and discarded.
+            # TRIGGER = ARRIVAL. Every pulse here is a window-ENTRY edge, because
+            # that is the only thing that raises one: `when_activated` on real
+            # hardware, and an inactive->active transition in simulation. A
+            # departure raises no pulse at all.
             #
-            # Reading the level to classify the edge is racy on its own: at speed
-            # the flag can cross the whole window before we get to look. So the
-            # level is only trusted while it still says "inside", and otherwise
-            # we fall back to alternating arrival/departure, which is what a
-            # level sensor always does.
-            if pending_departure and not self.hw.shelf_active():
-                pending_departure = False
+            # So a pulse is counted directly, with no attempt to classify it.
+            #
+            # This used to run an arrival/departure alternation that consumed
+            # every second pulse, and consumed it whenever `shelf_active()` read
+            # false. At speed the flag can cross the whole window before that read
+            # happens, so genuine ARRIVALS were being thrown away as phantom
+            # departures. The move then needed one extra trigger per discarded
+            # edge and drove straight past the target — the overshoot being
+            # reported. The alternation was a leftover from when raw level
+            # transitions were counted; with entry-only pulses plus the bounce
+            # filter it is not just redundant but actively wrong.
+            if skip_pulses > 0:
+                skip_pulses -= 1
                 continue
-            pending_departure = True
             counted += 1
             if counted >= steps:
                 # ARRIVED. Cut power THIS INSTANT, on the rising edge, while the
