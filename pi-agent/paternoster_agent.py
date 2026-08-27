@@ -44,7 +44,15 @@ from typing import Callable, Optional
 PIN_MOTOR_RPWM = 12  # -> RPWM (PWM, drives one direction)
 PIN_MOTOR_LPWM = 13  # -> LPWM (PWM, drives the other direction)
 PIN_MOTOR_EN = 22    # -> R_EN + L_EN tied together (HIGH = bridge enabled)
-PIN_SHELF_SENSOR = 23  # inductive sensor: one pulse per shelf
+# Inductive sensor. This is a LEVEL, not a pulse: it stays active for as long as
+# a shelf's metal flag is in front of it, and a parked carousel is ALWAYS sitting
+# with a flag in the window. So the sensor reads active before a move even starts,
+# and that standing signal is not a shelf that has been passed.
+#
+# Shelves are therefore counted as TRANSITIONS — the flag leaves the window, the
+# next flag enters it — never as "one pulse per shelf". Treating the level as a
+# pulse is what made a move of N shelves finish after N-1.
+PIN_SHELF_SENSOR = 23
 PIN_INDEX_SENSOR = 24  # inductive sensor: active only at shelf 1 (home)
 
 # Motion tuning. These are DEFAULTS ONLY — the app overrides them at runtime via
@@ -1484,24 +1492,17 @@ class Carousel:
         # charge, and it is exactly the "sails past the metal" symptom.
         self.hw.reset_pulses()
 
-        # ON REAL HARDWARE THE RE-ENTRY IS A GENUINE INTERRUPT, so the dwell in
-        # the loop below cannot catch it on its own: `when_activated` fires, the
-        # pulse is queued, and a queued pulse is trusted unconditionally (it has
-        # to be — that path exists to catch flags too fast for the poll).
+        # NO TIMING LOCKOUT ARMED AT THE START, deliberately.
         #
-        # So the suppression also has to happen where the edge is captured.
-        # Arming the bounce lockout at the instant the motor starts makes the
-        # driver treat a re-entry of the flag we are leaving exactly like the
-        # post-count bounce it already filters. `reset_pulses` above had just
-        # cleared that lockout, which is why the first edge of every move was
-        # accepted no matter how soon it arrived.
+        # The parked flag used to be dealt with here, by arming the hardware bounce
+        # lockout so its re-entry looked like a post-count bounce. That was a
+        # timing guess layered on top of the real problem, and it could suppress a
+        # GENUINE first shelf whenever that shelf arrived inside the lockout.
         #
-        # getattr: older backends and test doubles have no such method, and a
-        # bare call raised AttributeError before the motor ever started.
-        if parked_on_flag:
-            arm = getattr(self.hw, "arm_shelf_lockout", None)
-            if callable(arm):
-                arm()
+        # It is no longer needed. The counting loop now requires the sensor window
+        # to have been seen EMPTY before it will count anything, so the flag the
+        # carousel is parked on is rejected on physical evidence rather than on a
+        # clock — whether it is reported by the poll or by the interrupt.
 
         # Non-blocking ramp state, stepped inside the loop.
         ramp_floor = min(MIN_DUTY, cruise)
@@ -1618,17 +1619,48 @@ class Carousel:
             pulsed = self.hw.take_shelf_pulse(0.0)
             active = self.hw.shelf_active()
 
-            if pulsed:
+            # ONE RULE FOR BOTH OBSERVERS: a shelf is an EMPTY->OCCUPIED
+            # transition of the sensor window, and the window must have been seen
+            # empty since the last count before anything can be counted again.
+            #
+            # `seen_inactive` is that memory, and it starts FALSE when the move
+            # begins parked on a flag — which is the normal case, because a parked
+            # carousel always has a flag in front of the sensor. So the standing
+            # signal the move starts with can never be counted: the flag has to
+            # leave the window (clearing the gap) and the NEXT flag has to enter it.
+            #
+            # THE INTERRUPT IS GATED THE SAME WAY, and that is the fix. A queued
+            # pulse used to be trusted unconditionally, bypassing this memory
+            # entirely, so any rising edge counted regardless of whether the window
+            # had ever been empty — the parked flag's own re-entry included. That
+            # is how a move of N shelves reached its count after N-1 shelves of
+            # real travel.
+            #
+            # Gating it costs nothing that the interrupt was there for. Its purpose
+            # is a flag whose whole crossing falls between two 1 ms polls; in that
+            # case the window HAS been empty beforehand, `seen_inactive` is true,
+            # and the pulse still counts. Only edges with no preceding gap are
+            # rejected, and those are never new shelves.
+            if pulsed and seen_inactive:
+                # A CAPTURED rising edge that followed a real gap. Checked first
+                # and without confirming the level, because the flag may already
+                # have crossed completely between two polls — that is the one case
+                # the interrupt exists for, and the live level cannot see it.
                 triggered = True
                 seen_inactive = False
             elif not active:
+                # Window empty: the gap between flags. This is the only thing that
+                # re-arms counting.
                 seen_inactive = True
                 triggered = False
             elif seen_inactive:
+                # Window occupied again after a real gap, seen by the poll.
                 triggered = True
                 seen_inactive = False
             else:
-                # Still sitting in the same flag we already counted.
+                # Still the same flag in the window — the one we are parked on at
+                # the start of a move, or the one just counted. Any pulse queued in
+                # this state had no preceding gap, so it is a re-entry, not a shelf.
                 triggered = False
 
             if triggered and ignore_parked_flag:
