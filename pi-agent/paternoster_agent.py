@@ -1198,180 +1198,178 @@ class Carousel:
             direction, steps = "up", up_steps
         else:
             direction, steps = "down", down_steps
-
-        # THE RULE: if this move runs the opposite way to the travel that last
-        # carried the flag OUT of the sensor, that flag is about to slide back
-        # through the window. It is the shelf we are already standing on, so its
-        # trigger is skipped rather than counted.
-        #
-        # Measured at the falling edge rather than taken from the previous move,
-        # because the two disagree: a heavy carousel coasts THROUGH the flag and
-        # rests past it, while a well-braked one is backed out the near side by the
-        # alignment crawl. Same move direction, opposite resting sides. Comparing
-        # against the actual departure is correct for both.
-        #
-        # If the sensor is still active right now this does not apply at all — the
-        # flag never left, so there is no re-entry to skip. That is handled by the
-        # `shelf_active()` branch below, which just drives the flag out and counts
-        # from there.
-        reversing = (self.hw.flag_exit_direction is not None
-                     and direction != self.hw.flag_exit_direction)
-
-        # Drop stale counts, then energise the motor ONCE. It now runs
-        # continuously for the whole move: the loop below only *counts* shelves
-        # going past, and nothing in it consults a sensor level to decide
-        # whether the motor should be powered.
-        self.hw.reset_pulses()
         step = -1 if direction == "up" else +1
-        # Soft start at the CURRENT slider speed. Reading the MOVE_SPEED constant
-        # here was why the speed slider did nothing to the hardware.
+
         speed = self.move_speed
 
-        # Gentle duty for the last shelf of travel, so the carousel is already
-        # crawling when it reaches the target instead of slamming into a stop.
-        # Eased toward `floor`, never away from it. Using MIN_DUTY as the floor
-        # broke down once the operator's PWM slider could go below it: `speed -
-        # MIN_DUTY` went NEGATIVE and the "gentle" approach came out FASTER than
-        # the requested speed, so dialling the slider down sped the carousel up
-        # into the target. Clamping the floor to `speed` keeps easing monotonic.
+        # Gentle duty for the final shelf so the carousel is already crawling when
+        # it reaches the target. Kept because it is the one thing that shortens the
+        # mechanical coast after power is cut — without it the machine sails past
+        # the flag no matter how fast the software reacts. Eased toward `floor`,
+        # never away from it, so turning the slider down can never speed it up.
         approach = speed
         if self.ramp_pct > 0:
             floor = min(MIN_DUTY, speed)
             approach = speed - (speed - floor) * (self.ramp_pct / 100.0)
-
-        # A single-shelf hop IS its own final shelf: there is no room to cruise
-        # fast and then slow down, and running one shelf at full speed guaranteed
-        # a big coast past the target. Do the whole hop at the approach duty.
+        # A one-shelf hop is its own final shelf: no room to cruise then slow.
         cruise = approach if steps <= 1 else speed
 
-        # ------------------------------------------------------------------
-        # SOFT START, IMMEDIATELY.
+        # ==================================================================
+        # 0. SAMPLE THE PARKED STATE — before anything moves.
+        # ==================================================================
+        # Two instantaneous reads, taken while the carousel is still stationary.
+        # This is NOT a wait and it does not gate the motor: nothing here blocks,
+        # and the machine sets off immediately afterwards regardless of what the
+        # sensor says.
         #
-        # Ramping up to cruise is the FIRST thing a move does. Nothing may block
-        # in front of it, and in particular no sensor state gates it.
-        #
-        # This used to creep at MIN_DUTY and wait for the parked flag to LEAVE
-        # the sensor window before it would accelerate, so acceleration was gated
-        # on a sensor trigger: a move opened with an indefinite crawl and — when
-        # reversing — an extra deliberate in-and-out crossing of the flag, rather
-        # than simply setting off and speeding up.
-        #
-        # Deleting those pre-ramp waits is safe because shelf pulses are COUNTED,
-        # not sampled: `_shelf_pulses` accumulates and `take_shelf_pulse`
-        # decrements it, so a shelf passing during the ramp is still counted, not
-        # missed. The old ordering was only ever needed back when the raw sensor
-        # LEVEL was read to classify edges.
-        # ------------------------------------------------------------------
-        # What the first pulse MEANS depends on whether the flag is in the window
-        # right now, so sample that before anything moves.
+        # It has to happen before the motor starts. Read a moment later and the
+        # flag has already been dragged back into the window, so the carousel
+        # looks parked ON a flag when it was actually parked just past one — and
+        # the re-entry then gets counted as the target, stopping the move dead on
+        # the spot it began.
         parked_on_flag = self.hw.shelf_active()
+
+        # WHICH trigger is the target.
+        #
+        # A stop leaves the carousel coasted just PAST the flag, outside the
+        # window. Turning round drives that same flag straight back in, so the
+        # first trigger of a reversing move is the shelf we are ALREADY on, not a
+        # new one.
+        #
+        # `flag_exit_direction` is measured by the hardware at the flag's falling
+        # edge — the travel that actually carried it out of the window. That is a
+        # sensor observation, not a prediction: a heavy carousel coasts through
+        # and rests past the flag, a well-braked one gets backed out the near
+        # side, and only the real departure tells the two apart.
+        #
+        # If the flag is still in the window it never left, so there is no
+        # re-entry to discard.
+        ignore_parked_flag = (not parked_on_flag
+                              and self.hw.flag_exit_direction is not None
+                              and direction != self.hw.flag_exit_direction)
+
+        # ==================================================================
+        # 1. START THE MOTOR.
+        # ==================================================================
         self.hw.reset_pulses()
-        self._drive(direction, cruise, max_seconds=STOP_RAMP_SECONDS if steps <= 1 else None)
+        self._drive(direction, cruise)
         speed = cruise
 
-        # A pulse fires on window ENTRY only, so the flag we are parked on cannot
-        # produce one by leaving: there is no departure edge to consume, and the
-        # next entry edge is a genuinely new shelf.
+        # ==================================================================
+        # 2. WATCH THE SENSOR. 3. STOP THE INSTANT THE TARGET TRIGGERS IT.
+        # ==================================================================
+        # The whole move is this one loop. It watches the shelf sensor, counts a
+        # shelf on each trigger, and the moment the count reaches the target it
+        # cuts power. Nothing predicts where the carousel is: there is no
+        # dead reckoning, no elapsed-time position, no calculated stopping point.
+        # The sensor decides, and the only clock is the runaway guard below.
         #
-        # One exception: reversing while parked OUTSIDE the window. We stopped
-        # just past a flag, so turning round drives that same flag back in, and
-        # that entry belongs to the shelf we are already on. Discard it — as a
-        # counter on the pulse stream, never as a blocking wait before the ramp.
-        skip_pulses = 1 if (reversing and not parked_on_flag) else 0
-
-        # A slow speed or a long soft start means the first shelf legitimately
-        # takes longer to arrive. Scaling the jam timeout keeps a slow-but-
-        # healthy move from being misreported as a jam.
-        #
-        # This is purely a JAM watchdog — an upper bound on how long to wait for
-        # the next pulse. Position itself never comes from elapsed time; it comes
-        # from counting shelf-sensor pulses. So this may be generous, and being
-        # generous is the safe direction: too short invents jams that aren't there.
-        #
-        # The divisor is NOT clamped to MIN_DUTY. It used to be, which capped the
-        # timeout at 25% duty while the real travel time kept growing as the
-        # operator dialled the PWM lower — so a deliberately mega-slow move
-        # marched towards a bogus "Jam?" fault. Scaling on the true duty keeps the
-        # ratio constant at any speed.
-        pulse_timeout = PULSE_TIMEOUT * (MOVE_SPEED / max(0.01, speed)) + self._ramp_seconds()
-
+        # `seen_inactive` starts from the sensor's real state so that the flag the
+        # carousel is parked on cannot be miscounted as an arrival. It gates only
+        # the COUNTING, never the motor — the machine sets off regardless of what
+        # the sensor reads.
+        POLL = 0.001
         counted = 0
-        while counted < steps:
+        # From the state sampled at step 0, not re-read here: by now the flag may
+        # already have moved back into the window.
+        seen_inactive = not parked_on_flag
+
+        # ------------------------------------------------------------------
+        # RUNAWAY STOP — the only guard, and the only use of a clock here.
+        #
+        # It does NOT decide position and does NOT decide when to stop on target;
+        # the sensor does both, above. It catches exactly one failure: the sensor
+        # reporting NOTHING AT ALL — wire off, flag missing, jammed carousel,
+        # seized motor. Without it the loop has no exit and the motor runs at full
+        # duty until someone kills it at the wall.
+        #
+        # Every trigger resets it, so it can only fire on true silence, never on a
+        # slow-but-healthy move. Scaled by duty because a lower PWM legitimately
+        # takes longer to reach the next shelf.
+        # ------------------------------------------------------------------
+        silence_limit = PULSE_TIMEOUT * (MOVE_SPEED / max(0.01, cruise)) + self._ramp_seconds()
+        last_trigger = time.monotonic()
+
+        while True:
             if self._abort.is_set():
                 self.hw.stop()
                 self.status = "idle"
                 return
-            # The ONLY sensor-related stop left is this jam guard, and it fires
-            # on elapsed TIME with no pulse at all — never on a sensor simply
-            # reading inactive. A covered or uncovered sensor cannot cut power.
-            if not self._await(self.hw.take_shelf_pulse, pulse_timeout):
+
+            # "TRIGGERED" is reported by two independent observers, and either one
+            # counts:
+            #
+            #   - a rising edge CAPTURED by the sensor callback (`when_activated`
+            #     on real hardware). This is an interrupt: it physically cannot
+            #     miss an edge.
+            #   - the LIVE level, read right here.
+            #
+            # Both are the same event, and neither is sufficient alone. A poll can
+            # miss a flag that crosses the window between two reads — at speed
+            # that is exactly how the carousel used to sail past the target. A
+            # callback can be delayed by a busy CPU. Taking either as "triggered"
+            # means no single miss can carry the machine past the shelf.
+            pulsed = self.hw.take_shelf_pulse(0.0)
+            active = self.hw.shelf_active()
+
+            if pulsed:
+                triggered = True
+                seen_inactive = False
+            elif not active:
+                seen_inactive = True
+                triggered = False
+            elif seen_inactive:
+                triggered = True
+                seen_inactive = False
+            else:
+                # Still sitting in the same flag we already counted.
+                triggered = False
+
+            if triggered and ignore_parked_flag:
+                # The flag we set off from, sliding back into the window. Not a
+                # shelf gained. Reset the runaway guard, since the sensor is
+                # plainly alive and reporting.
+                ignore_parked_flag = False
+                last_trigger = time.monotonic()
+                time.sleep(POLL)
+                continue
+
+            if triggered:
+                counted += 1
+                last_trigger = time.monotonic()
+
+                if counted >= steps:
+                    # THIS IS THE TARGET. Cut power immediately, before any
+                    # bookkeeping, while the flag is still in the window.
+                    self.hw.stop()
+                    self.current_shelf = target
+                    self.emit({"type": "pos", "shelf": self.current_shelf})
+                    break
+
+                if counted == steps - 1 and approach < speed:
+                    self._energise(direction, approach)
+                    speed = approach
+
+                self.current_shelf = (self.current_shelf + step) % self.shelves
+                self.emit({"type": "pos", "shelf": self.current_shelf})
+
+            # Checked on EVERY pass, deliberately outside the if/elif above.
+            # As an `elif` it was unreachable in the one case it exists for: a
+            # dead sensor reads inactive forever, so the first branch always won
+            # and the guard never ran.
+            if time.monotonic() - last_trigger > silence_limit:
+                # Total sensor silence. Kill the motor.
                 self.hw.stop()
                 self.status = "idle"
-                # An abort is an operator decision, not a jam. Reporting a fault
-                # here would spam a scary "Jam?" message every time someone hit
-                # emergency stop mid-move.
+                # An abort is an operator decision, not a jam — don't cry wolf.
                 if self._abort.is_set():
                     return
-                self.emit({"type": "fault", "message": "Jam? No shelf pulse within timeout"})
+                self.emit({"type": "fault",
+                           "message": "Jam? No shelf pulse within timeout"})
+                self.emit(self.snapshot())
                 return
-            # TRIGGER = ARRIVAL. Every pulse here is a window-ENTRY edge, because
-            # that is the only thing that raises one: `when_activated` on real
-            # hardware, and an inactive->active transition in simulation. A
-            # departure raises no pulse at all.
-            #
-            # So a pulse is counted directly, with no attempt to classify it.
-            #
-            # This used to run an arrival/departure alternation that consumed
-            # every second pulse, and consumed it whenever `shelf_active()` read
-            # false. At speed the flag can cross the whole window before that read
-            # happens, so genuine ARRIVALS were being thrown away as phantom
-            # departures. The move then needed one extra trigger per discarded
-            # edge and drove straight past the target — the overshoot being
-            # reported. The alternation was a leftover from when raw level
-            # transitions were counted; with entry-only pulses plus the bounce
-            # filter it is not just redundant but actively wrong.
-            if skip_pulses > 0:
-                skip_pulses -= 1
-                continue
-            counted += 1
-            if counted >= steps:
-                # ARRIVED. Cut power THIS INSTANT, on the rising edge, while the
-                # flag is still inside the sensor window.
-                #
-                # This must be the first thing that happens — before the position
-                # bookkeeping below, before anything that can sleep. Previously a
-                # soft-stop ramp ran here instead, which kept the motor energised
-                # for another STOP_RAMP_SECONDS and carried the flag straight back
-                # out of the window: the sensor went HIGH, then LOW, and only then
-                # did the machine halt, a whole shelf-edge late. The alignment
-                # crawl then had to hunt backwards for the flag it had just left,
-                # which is the back-and-forth bouncing, and when the hunt ran out
-                # of budget it dropped `homed` and demanded a re-home.
-                #
-                # Braking distance is a mechanical property, not something to
-                # schedule: whatever the carousel coasts, it coasts, and the
-                # alignment crawl exists to take up that slack. Adding a ramp on
-                # top only guarantees the overshoot. HIGH -> STOP.
-                self.hw.stop()
-            # Soft stop, part 1: with one shelf left to travel, drop to a slower
-            # approach duty so the carousel is already crawling when it reaches
-            # the target, instead of running at full speed into a hard stop.
-            # Interpolated by ramp intensity: 0% keeps full speed to the end.
-            elif counted == steps - 1 and steps > 1 and approach < speed:
-                self._energise(direction, approach)
-                speed = approach
-            self.current_shelf = (self.current_shelf + step) % self.shelves
-            # Drift correction from a counted index EDGE, never a level read.
-            # Reading the level here was the same mistake in a third place: just
-            # after homing the carousel is still physically sitting on the home
-            # flag, so the level was still active and the very first shelf pulse
-            # got "corrected" back to 0 — reporting 0,1,2 for a 3-shelf move.
-            # An edge only appears when the home flag genuinely passes by again.
-            # It also stays off un-homed, where a stuck-active sensor would
-            # otherwise pin the position to 0 forever.
-            if self.homed and self.hw.take_index_pulse(0.0):
-                self.current_shelf = 0
-            self.emit({"type": "pos", "shelf": self.current_shelf})
+
+            time.sleep(POLL)
 
         # Power was already cut inside the loop, on the target's rising edge.
         # Nothing may drive the motor between that edge and alignment.
