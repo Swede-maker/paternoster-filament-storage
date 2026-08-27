@@ -29,6 +29,7 @@ Test on a laptop (no GPIO hardware needed) with the built-in simulator:
 import argparse
 import asyncio
 import json
+import math
 import threading
 import time
 from typing import Callable, Optional
@@ -126,40 +127,41 @@ def shelf_settle_for(duty: float) -> float:
 # is physically impossible for it to be the next shelf.
 SHELF_TRAVEL_AT_MOVE_SPEED = 0.5
 
-# Fraction of a shelf pitch of chain slack the departure guard tolerates.
+# Fraction of a shelf pitch that two accepted shelf counts must be separated by.
 #
-# The chain can only rock back by its own backlash, which is a fixed mechanical
-# property well under one shelf spacing. Anything that re-enters the window after
-# less than this much travel cannot be the next shelf, because the next shelf is a
-# WHOLE pitch away. Kept below 0.5 so the guard can never reach halfway to a
-# genuine shelf: if a machine ever has more slack than this the cure is to tension
-# the chain, not to widen the guard, and widening it past 0.5 would start
-# swallowing real shelves.
+# The chain can only rock by its own backlash, a fixed mechanical property well
+# under one shelf spacing. An edge that appears after less travel than this cannot
+# be a new shelf, because the next shelf is a WHOLE pitch away. Kept below 0.5 so
+# the rule can never reach halfway to a genuine shelf: if a machine ever has more
+# slack than this the cure is to tension the chain, not to widen the window, and
+# widening it past 0.5 would start swallowing real shelves.
 DEPARTURE_SLACK_FRACTION = 0.45
 
 
-def departure_guard_for(duty: float) -> float:
+def min_shelf_gap_for(duty: float) -> float:
     """
-    How soon after the motor starts an edge is too early to be a new shelf.
+    The shortest time in which the carousel could genuinely reach the NEXT shelf.
 
-    A move that begins parked on a flag has to lose that flag first, and the
-    chain's slack means the flag does not simply leave: energising the motor lets
-    it drop backwards out of the window, then the chain takes up and pulls it
-    forwards back IN. That re-entry is a genuine rising edge, indistinguishable
-    from a shelf by level alone -- it was being counted, so every multi-step move
-    finished one shelf short while the count claimed it had arrived.
+    Anything sooner is mechanical -- chain slack, a lurch, a flag rocking back
+    across the sensor -- and must not be counted. Used ONLY to reject the
+    physically impossible, never to decide where the carousel is; the sensor
+    always does that.
 
-    The one thing that separates the two is DISTANCE TRAVELLED. The returning flag
-    has only covered the slack; the next shelf is a whole pitch away. With a single
-    sensor there is no odometer, so distance is inferred from time at the known
-    duty -- and only to REJECT the impossible, never to decide where the carousel
-    is. Scaled by duty because travel time per pitch is inversely proportional to
-    it, so the guard stays a fixed fraction of the SPACING at every speed.
+    Scaled by duty because travel time per pitch is inversely proportional to it,
+    so the window stays the same fraction of the real shelf SPACING at every
+    speed. That is what makes one constant correct at 45% duty and at 5% alike.
 
-    An earlier version of this scaled a fixed blanking time by duty instead. That
-    failed at high duty: a harder start rocks the chain further back, so the empty
-    gap GREW with duty while a 1/duty window shrank. Anchoring to the pitch makes
-    both sides scale together.
+    Two things a single sensor cannot distinguish by level alone, both of which
+    produce a real rising edge and both of which were being counted as shelves:
+
+      - THE START OF A MOVE. The carousel is parked on a flag, so energising the
+        motor takes up slack: the flag drops back out of the window and is then
+        pulled forwards into it again.
+      - THE ARRIVAL CHANGEOVER. At one shelf short of target the duty drops to
+        the arrival value, and that sudden torque change lets the chain lurch,
+        which can carry the shelf just counted back across the sensor.
+
+    Distance travelled is the one thing that separates those from a real shelf.
     """
     pitch = SHELF_TRAVEL_AT_MOVE_SPEED * (MOVE_SPEED / max(0.01, duty))
     return min(SHELF_SETTLE_MAX, DEPARTURE_SLACK_FRACTION * pitch)
@@ -556,6 +558,25 @@ class RealHardware:
     def shelf_active(self) -> bool:
         return self._shelf_level()
 
+    def in_shelf_lockout(self) -> bool:
+        """
+        True while metal in the window still belongs to the shelf just counted.
+
+        The interrupt path applies this lockout in `_on_shelf`, but the counting
+        loop ALSO detects shelves by polling `shelf_active()`, and that path had
+        no lockout at all. So a flag rocking back into the window was rejected as
+        a bounce on one path and accepted as a new shelf on the other -- which is
+        how the lurch at the arrival changeover got counted and every multi-shelf
+        move finished one shelf early. Exposing the same state lets the poll path
+        honour the same decision instead of contradicting it.
+        """
+        with self._lock:
+            last = self._last_counted
+            lockout = self._shelf_settle
+            if last is None or lockout <= 0:
+                return False
+            return (time.monotonic() - last) < lockout
+
     def cleanup(self) -> None:
         try:
             self.motor.stop()
@@ -737,6 +758,15 @@ class SimHardware:
     def shelf_active(self) -> bool:
         with self._lock:
             return self._shelf_window_active()
+
+    def in_shelf_lockout(self) -> bool:
+        """Mirror of the real driver's lockout, so both agree on what a bounce is."""
+        with self._lock:
+            last = self._last_counted
+            lockout = self._shelf_settle
+            if last is None or lockout <= 0:
+                return False
+            return (time.monotonic() - last) < lockout
 
     def cleanup(self) -> None:
         self._running = False
@@ -1341,6 +1371,19 @@ class Carousel:
             direction, steps = "down", down_steps
         step = -1 if direction == "up" else +1
 
+        # THE ALREADY-ACTIVE SENSOR AT THE START OF A MOVE.
+        #
+        # The carousel is parked ON a shelf, so the sensor is active before the
+        # motor even turns — and it must be. If the counting loop treats that
+        # standing signal as a shelf it has passed, a move of N shelves finishes
+        # after only N-1 shelves of travel: ask for 2 and it moves 1, ask for 3
+        # and it moves 2. That is the reported fault exactly.
+        #
+        # The correction belongs in the counting loop, which discards the standing
+        # signal (`seen_inactive = not parked_on_flag`), NOT in `steps`. Adding a
+        # shelf here as well double-corrects and overshoots by one — measured:
+        # 2->5 travelled 4 shelves.
+
         speed = self.move_speed
 
         # Gentle duty for the FINAL shelf, so the carousel is already crawling by
@@ -1500,23 +1543,6 @@ class Carousel:
         # already have moved back into the window.
         seen_inactive = not parked_on_flag
 
-        # Departure-guard state.
-        #
-        # Armed only when the move starts ON a flag, because that is the only
-        # case where a flag has to leave the window before any real shelf can
-        # arrive. Starting clear of a flag means the first edge is genuine (or is
-        # the reversal case that `ignore_parked_flag` already covers), so the
-        # guard must stay down or it would eat a real shelf.
-        awaiting_departure = parked_on_flag
-
-        # Scaled off `cruise`, not the instantaneous ramp duty: derived from a
-        # duty that is still climbing the guard would open several times longer
-        # than intended. Using the target duty makes it the SHORTEST, safest
-        # window — under a ramp the carousel is slower than this assumes, so a
-        # genuine shelf takes even longer to arrive than the guard allows for.
-        departure_guard = departure_guard_for(cruise)
-        motor_started = time.monotonic()
-
         # ------------------------------------------------------------------
         # RUNAWAY STOP — the only guard, and the only use of a clock here.
         #
@@ -1605,29 +1631,6 @@ class Carousel:
                 # Still sitting in the same flag we already counted.
                 triggered = False
 
-            # THE DEPARTURE FLAG COMING BACK. Discarded on distance, not on level.
-            #
-            # Only ever applies to the FIRST edge of a move that began parked on
-            # a flag, and only while that edge is too early to be a real shelf.
-            # After the guard expires, or once one edge has been dealt with, this
-            # is inert for the rest of the move — it can suppress at most one
-            # edge, so a mistake here costs a shelf once and cannot compound.
-            #
-            # Single-shelf moves masked this bug completely: the phantom edge WAS
-            # the target, and stopping one shelf early from a parked start lands
-            # on the right shelf. Only moves of two or more revealed it, which is
-            # exactly what was reported — 1→2 correct, 2→5 arriving at 4.
-            if (triggered and awaiting_departure
-                    and (time.monotonic() - motor_started) < departure_guard):
-                awaiting_departure = False
-                last_trigger = time.monotonic()
-                time.sleep(POLL)
-                continue
-
-            if triggered:
-                # Any edge from here on is a real shelf, so stand the guard down.
-                awaiting_departure = False
-
             if triggered and ignore_parked_flag:
                 # The flag we set off from, sliding back into the window. Not a
                 # shelf gained. Reset the runaway guard, since the sensor is
@@ -1653,13 +1656,13 @@ class Carousel:
                     on_final_approach = True
 
                 if counted == steps - 1 and approach != speed:
-                    # The next trigger is the target, so drop to the arrival duty
-                    # now. Applied whenever it DIFFERS from the current duty, not
-                    # only when it is lower: a long soft start may still be below
-                    # the approach duty at this point, and the old `approach <
-                    # speed` test silently skipped the changeover in that case,
-                    # leaving the final shelf to be taken at whatever partial ramp
-                    # duty happened to be set.
+                    # The next trigger is the target, so the arrival duty is due.
+                    # Applied whenever it DIFFERS from the current duty, not only
+                    # when it is lower: a long soft start may still be below the
+                    # approach duty at this point, and the old `approach < speed`
+                    # test silently skipped the changeover in that case, leaving
+                    # the final shelf to be taken at whatever partial ramp duty
+                    # happened to be set.
                     self._energise(direction, approach)
                     speed = approach
 
