@@ -361,16 +361,25 @@ def main():
     # ======================================================================
     print()
     print("=" * 68)
-    print("5. NPN SENSOR POLARITY (active-LOW)")
+    print("5. SENSOR POLARITY: WIRING vs MEANING")
     print("=" * 68)
-    print("An NPN sensor sinks its output to GND when a shelf is present, so")
-    print("the pin must be pulled UP and LOW must read as 'shelf detected'.")
+    print("Two independent settings, and conflating them is why 'just flip the")
+    print("sensor' goes wrong:")
+    print()
+    print("  SENSOR_TYPE   - ELECTRICAL. NPN sinks to GND when triggered, so the")
+    print("                  pin is pulled UP. Changing this to invert the logic")
+    print("                  would float an NPN line, and a real PNP sensor needs")
+    print("                  a level shifter or it puts 12/24V into a 3.3V GPIO.")
+    print("  SENSOR_INVERT - LOGICAL. Whether 'signal present' means a shelf is")
+    print("                  there, or means the opposite. Safe to flip freely.")
     print()
 
-    check("configured for NPN", pa.SENSOR_TYPE.upper() == "NPN",
+    check("configured for NPN (pull-up, active-LOW electrically)",
+          pa.SENSOR_TYPE.upper() == "NPN",
           "SENSOR_TYPE=%r" % pa.SENSOR_TYPE)
-    check("NPN selects a pull-up (so LOW = active)",
-          pa.SENSOR_TYPE.upper() == "NPN")
+    check("inversion is a separate, purely logical flag",
+          isinstance(pa.SENSOR_INVERT, bool),
+          "SENSOR_INVERT=%r" % pa.SENSOR_INVERT)
 
     # ======================================================================
     print()

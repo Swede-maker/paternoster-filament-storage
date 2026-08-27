@@ -225,6 +225,23 @@ SIM_SENSOR_HALF_WIDTH = 0.18
 #                                  3.3 V GPIO and destroy the Pi.
 SENSOR_TYPE = "NPN"
 
+# Invert what the sensor signal MEANS, without touching how it is wired.
+#
+# True  -> a shelf is present when the sensor reads INACTIVE (signal absent).
+# False -> a shelf is present when the sensor reads ACTIVE (signal present).
+#
+# Set this, not SENSOR_TYPE, to fix "it counts in the gaps instead of on the
+# shelves". SENSOR_TYPE controls the pull resistor, which is an ELECTRICAL
+# property: changing it to flip the logic would leave an NPN line floating, and
+# a real PNP sensor needs a level shifter first or it puts 12/24 V into a 3.3 V
+# GPIO. This flag is pure logic and is always safe to change.
+#
+# Use True for a normally-closed sensor, or when the flags are cut as NOTCHES in
+# an otherwise continuous ring rather than as tabs — in both cases the signal is
+# present everywhere EXCEPT at a shelf, so every edge and level below has to be
+# read the other way round.
+SENSOR_INVERT = True
+
 # Which way the motor turns for "up" (decreasing shelf index). Flip if your
 # carousel runs backwards relative to the app's direction labels.
 HOMING_DIRECTION = "down"
@@ -290,8 +307,19 @@ class RealHardware:
         self._last_counted: Optional[float] = None
         self._shelf_settle = 0.0
         self._suppressed_bounces = 0
-        self.shelf.when_activated = self._on_shelf
-        self.index.when_activated = self._on_index
+        # WHICH EDGE MEANS "METAL ARRIVED" depends on SENSOR_INVERT.
+        #
+        # gpiozero names these after the electrical level, not after the shelf. On
+        # an inverted sensor the signal is present in the GAPS, so metal arriving
+        # DEACTIVATES the input and `when_deactivated` is the arrival edge. Leaving
+        # these unswapped is what makes the carousel count in the gaps and stop
+        # between shelves — the count would be off by exactly half a pitch.
+        if SENSOR_INVERT:
+            self.shelf.when_deactivated = self._on_shelf
+            self.index.when_deactivated = self._on_index
+        else:
+            self.shelf.when_activated = self._on_shelf
+            self.index.when_activated = self._on_index
 
         # Which way the motor is turning right now, and which way it was turning
         # at the moment the shelf flag LEFT the sensor window.
@@ -306,7 +334,13 @@ class RealHardware:
         # time. The falling edge is what actually happened.
         self.travel_direction: Optional[str] = None
         self.flag_exit_direction: Optional[str] = None
-        self.shelf.when_deactivated = self._on_shelf_exit
+        # The exit edge is the opposite one, mirrored the same way — otherwise it
+        # would be bound to the same edge as the arrival above and every arrival
+        # would immediately register as a departure.
+        if SENSOR_INVERT:
+            self.shelf.when_activated = self._on_shelf_exit
+        else:
+            self.shelf.when_deactivated = self._on_shelf_exit
 
     def set_shelf_settle(self, seconds: float) -> None:
         """Lockout applied AFTER a counted shelf, to swallow that shelf's bounce."""
@@ -423,14 +457,28 @@ class RealHardware:
         the carousel keeps driving off the flag while we watch.
         """
         deadline = time.monotonic() + timeout
-        while self.index.is_active:
+        while self._index_level():
             if time.monotonic() >= deadline:
                 return False
             time.sleep(0.005)
         return True
 
+    # Every level read in this class goes through these two helpers, so the
+    # inversion is applied in exactly one place per sensor and cannot drift
+    # between the "is metal there now" checks and the "wait until it is gone"
+    # loops. Reading `.is_active` directly anywhere below would bypass it.
+    def _shelf_level(self) -> bool:
+        """True when a shelf flag is in front of the sensor."""
+        raw = bool(self.shelf.is_active)
+        return (not raw) if SENSOR_INVERT else raw
+
+    def _index_level(self) -> bool:
+        """True when the home flag is in front of the sensor."""
+        raw = bool(self.index.is_active)
+        return (not raw) if SENSOR_INVERT else raw
+
     def index_active(self) -> bool:
-        return bool(self.index.is_active)
+        return self._index_level()
 
     def shelf_clear(self, timeout: float) -> bool:
         """
@@ -442,14 +490,14 @@ class RealHardware:
         decide when COUNTING may begin, never whether the motor is energised.
         """
         deadline = time.monotonic() + timeout
-        while self.shelf.is_active:
+        while self._shelf_level():
             if time.monotonic() >= deadline:
                 return False
             time.sleep(0.005)
         return True
 
     def shelf_active(self) -> bool:
-        return bool(self.shelf.is_active)
+        return self._shelf_level()
 
     def cleanup(self) -> None:
         try:

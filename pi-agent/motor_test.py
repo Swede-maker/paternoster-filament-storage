@@ -37,6 +37,7 @@ from paternoster_agent import (
     PIN_MOTOR_RPWM,
     PIN_SHELF_SENSOR,
     SENSOR_TYPE,
+    SENSOR_INVERT,
 )
 
 BURST = 1.2  # seconds of motor run per direction — long enough to see, short enough to be safe
@@ -113,7 +114,11 @@ def step2_claim_pins():
     from gpiozero import DigitalInputDevice, DigitalOutputDevice, Motor
 
     print(f"  motor RPWM={PIN_MOTOR_RPWM}  LPWM={PIN_MOTOR_LPWM}  EN={PIN_MOTOR_EN}")
-    print(f"  sensors shelf={PIN_SHELF_SENSOR}  index={PIN_INDEX_SENSOR}  type={SENSOR_TYPE}", flush=True)
+    print(
+        f"  sensors shelf={PIN_SHELF_SENSOR}  index={PIN_INDEX_SENSOR}"
+        f"  type={SENSOR_TYPE}  invert={SENSOR_INVERT}",
+        flush=True,
+    )
 
     # Track whatever we manage to claim, so a failure half-way through can release
     # the rest. Without this, a partial claim leaves pins held by this process and
@@ -152,15 +157,24 @@ def step3_sensors(shelf, index):
     print("  Rotate the carousel slowly by hand so shelves pass the sensors.")
     print("  (Ctrl-C to skip ahead.)\n", flush=True)
 
+    # Read through the same inversion the agent applies, so "ACTIVE" here always
+    # means METAL IN FRONT OF THE SENSOR. Reading the raw pin instead would report
+    # the exact opposite of what the agent counts on an inverted sensor, which
+    # makes this diagnostic worse than useless — it would confirm healthy pulses
+    # while the agent stopped in all the wrong places.
+    def lvl(dev):
+        raw = bool(dev.is_active)
+        return (not raw) if SENSOR_INVERT else raw
+
     shelf_seen = index_seen = 0
-    last_s = shelf.is_active
-    last_i = index.is_active
+    last_s = lvl(shelf)
+    last_i = lvl(index)
     print(f"  idle state: shelf={'ACTIVE' if last_s else 'idle'}  index={'ACTIVE' if last_i else 'idle'}", flush=True)
 
     end = time.time() + 20
     try:
         while time.time() < end:
-            s, i = shelf.is_active, index.is_active
+            s, i = lvl(shelf), lvl(index)
             if s != last_s:
                 if s:
                     shelf_seen += 1
@@ -176,6 +190,12 @@ def step3_sensors(shelf, index):
         print("  (skipped)", flush=True)
 
     print(f"\n  shelf pulses: {shelf_seen}    index pulses: {index_seen}", flush=True)
+    print(
+        "  (counted where metal ARRIVES, with SENSOR_INVERT="
+        f"{SENSOR_INVERT}. If the pulses land in the GAPS between shelves"
+        " instead of on them, flip SENSOR_INVERT in paternoster_agent.py.)",
+        flush=True,
+    )
     if shelf_seen == 0 and index_seen == 0:
         print("\n  ! Neither sensor ever changed. Homing CANNOT work in this state —")
         print("    it will always fail with 'index sensor not found'.")
