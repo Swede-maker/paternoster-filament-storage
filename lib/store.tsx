@@ -501,6 +501,8 @@ type Action =
 
   | { type: "SET_NODE_RAMP"; nodeId: string; rampPct: number }
   | { type: "SET_NODE_PWM"; nodeId: string; pwmDuty: number }
+  // `undefined` = clear the override, letting homing track the move duty again.
+  | { type: "SET_NODE_HOMING_PWM"; nodeId: string; homingDuty: number | undefined }
   // Jobs
   | { type: "START_JOB"; job: ActiveJob }
   /** Queue several jobs to run back-to-back (first runs now, rest wait). */
@@ -1220,6 +1222,19 @@ function coreReducer(state: AppState, action: Action): AppState {
       // coasting past the shelf flag. This duty IS the carousel speed.
       const pwmDuty = Math.max(0.05, Math.min(1, Math.round(action.pwmDuty * 100) / 100))
       return withNode(state, action.nodeId, (n) => ({ ...n, pwmDuty }))
+    }
+
+    case "SET_NODE_HOMING_PWM": {
+      const node = getNode(state, action.nodeId)
+      if (!node || node.type === "shelf") return state
+      // `undefined` clears the override and returns homing to tracking the move
+      // duty. Without a way back, an operator who nudged this slider once would
+      // be locked out of the automatic coupling for good.
+      if (action.homingDuty === undefined) {
+        return withNode(state, action.nodeId, (n) => ({ ...n, homingDuty: undefined }))
+      }
+      const homingDuty = Math.max(0.05, Math.min(1, Math.round(action.homingDuty * 100) / 100))
+      return withNode(state, action.nodeId, (n) => ({ ...n, homingDuty }))
     }
 
     // ----- hardware bridge events (from a real Pi agent) -----

@@ -451,6 +451,17 @@ export interface StorageNode {
    * so a second control expressing "speed" as a duration only fought this one.
    */
   pwmDuty?: number
+  /**
+   * PWM duty for HOMING, 0.05–1 (5–100%). Undefined = track the move duty
+   * (`homingDutyFor` derives a gentler fraction of it).
+   *
+   * Separate from `pwmDuty` because the two searches are not the same problem.
+   * A move counts shelf flags it already knows the spacing of; homing hunts for
+   * a single index flag from an unknown start, so it is the move most likely to
+   * coast past its target — and the one whose overshoot is worst, since every
+   * later position is measured from it.
+   */
+  homingDuty?: number
   storage: StorageConfig
   /** shelf -> slot -> spoolId | null */
   slots: (string | null)[][]

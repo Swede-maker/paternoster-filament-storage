@@ -151,14 +151,28 @@ export function moveDutyFor(node: { pwmDuty?: number }): number {
   return Math.round(Math.max(MIN_PWM_DUTY, Math.min(1, duty)) * 100) / 100
 }
 
+/** Homing duty as a fraction of the move duty, when not set explicitly. */
+export const HOMING_DUTY_RATIO = 0.65
+
 /**
- * Homing runs at a fraction of the move duty so the index flag is not overshot.
- * It tracks the move duty, so dialling the carousel down also slows homing —
- * otherwise homing would keep flying past the flag at the old speed.
+ * The duty homing runs at.
+ *
+ * An explicit `homingDuty` wins. Otherwise it falls back to a fraction of the
+ * move duty, so dialling the carousel down also slows homing — without that
+ * coupling, homing would keep flying past the index flag at the old speed.
+ *
+ * The override exists because the ratio is only a guess at the relationship
+ * between two different searches: a move counts shelf flags whose spacing is
+ * known, while homing hunts a single index flag from an unknown start. On a
+ * heavy carousel the fraction that suits moves is still too fast to catch the
+ * index flag, and homing overshoot is the worst kind — every subsequent
+ * position is measured from it.
  */
-export function homingDutyFor(node: { pwmDuty?: number }): number {
-  const duty = moveDutyFor(node) * 0.65
-  return Math.round(Math.max(MIN_PWM_DUTY, duty) * 100) / 100
+export function homingDutyFor(node: { pwmDuty?: number; homingDuty?: number }): number {
+  const explicit = node.homingDuty
+  const duty =
+    typeof explicit === "number" && explicit > 0 ? explicit : moveDutyFor(node) * HOMING_DUTY_RATIO
+  return Math.round(Math.max(MIN_PWM_DUTY, Math.min(1, duty)) * 100) / 100
 }
 
 /** Default soft START ramp intensity (%) for a new carousel. */
