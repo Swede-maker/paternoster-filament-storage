@@ -112,6 +112,101 @@ Your printers and spools reappear automatically because the same database file i
 
 ---
 
+## 4a. Building on the Pi without locking it up
+
+`next build` is by far the heaviest thing this project ever does. Measured on a
+2-core Linux box, a cold build of this app peaks at about **1.5 GB**, while the
+*running* app needs only ~120 MB. The build, not the app, is what a small Pi
+cannot handle — which is why a 2 GB Pi can happily serve this app for months and
+still refuse to build it.
+
+**Set expectations first: there is no config flag that fixes this.** Next.js 16
+builds with Turbopack, which is written in Rust, so its peak memory sits outside
+the V8 JavaScript heap. That means the usual advice does not apply here:
+
+| Attempt                                | Cold-build peak | Verdict            |
+| -------------------------------------- | --------------- | ------------------ |
+| `pnpm build` (baseline)                | ~1534 MB        | —                  |
+| `experimental.cpus: 1`                 | ~1528 MB        | ~6 MB, noise       |
+| `NODE_OPTIONS=--max-old-space-size=512`| ~1509 MB        | ~25 MB, noise      |
+| Both together (`pnpm build:pi`)        | ~1508 MB        | ~26 MB, noise      |
+
+Under a hard 1.2 GB ceiling the build dies with `std::bad_alloc` — a *native*
+allocation failure, not `JavaScript heap out of memory`. That is the tell that
+Node heap flags cannot help. `pnpm build:pi` still exists and is still worth using
+(`LOW_MEM=1`, one compiler worker), but treat it as a small margin, not a fix.
+
+So on a memory-limited Pi, use one of the two things that genuinely work:
+
+**1. Add swap.** Slow on an SD card, but it only has to survive one build, and it
+turns a hard failure into a slow success:
+
+```bash
+sudo dphys-swapfile swapoff
+sudo sed -i 's/^#\?CONF_SWAPSIZE=.*/CONF_SWAPSIZE=4096/' /etc/dphys-swapfile
+sudo dphys-swapfile setup && sudo dphys-swapfile swapon
+```
+
+**2. Build on a PC and copy `.next` over** — see 4b below. This is the reliable
+answer for a 2 GB or smaller Pi, and it is fast. Worth knowing: the *useful* build
+output is tiny (~4 MB of `.next/static` + `.next/server`); the rest of `.next` is
+throwaway compiler cache.
+
+Two more things that free real memory on the Pi itself:
+
+- **Close the desktop.** Building over SSH on Raspberry Pi OS Lite, or with the
+  GUI stopped (`sudo systemctl isolate multi-user.target`), frees several hundred
+  MB — often the difference on a 2 GB Pi.
+- **Stop the app first.** A running `pnpm start` holds ~120 MB, and the carousel
+  agent holds more. Stop the service, build, then start it again.
+
+A build killed for memory dies with a bare `Killed` or `signal SIGKILL`: that is
+the kernel's OOM killer, not a bug in the code.
+
+> Avoid `output: "standalone"` for this project, tempting as the smaller bundle
+> looks. It copies `node_modules` into the build, and the bundled `better-sqlite3`
+> binaries are x64-only — an ARM Pi would fail at runtime on the database.
+
+---
+
+## 4b. Building on a PC and copying to the Pi
+
+If the Pi still cannot manage it, or you just want the build to take seconds
+instead of minutes, build elsewhere. This is the fastest option and always works.
+
+Building on a PC and copying over is perfectly valid — `.next` is portable
+JavaScript. **Two rules matter:**
+
+**1. Never copy `node_modules` from the PC.** `better-sqlite3` and `sharp` are
+compiled native binaries tied to the CPU architecture; an x86 PC build cannot run
+on the Pi's ARM chip. Copy the source and `.next`, then install on the Pi:
+
+```bash
+# on the PC
+pnpm install && pnpm build
+
+# copy source + build to the Pi, excluding node_modules
+rsync -av --exclude node_modules --exclude paternoster.db ./ raspberry@192.168.0.52:~/pax/
+
+# then, on the Pi
+cd ~/pax && pnpm install   # builds the ARM SQLite module; does NOT rebuild .next
+pnpm start
+```
+
+`pnpm install` on the Pi only compiles the native modules — it does not redo the
+expensive Next.js build, so it stays light.
+
+**2. Don't switch this project to `output: "standalone"`.** It looks like the right
+tool for copying a build around, but it bundles `node_modules` **from the build
+machine**, so it would ship the PC's x86 SQLite binary to the Pi and fail at
+startup. Plain `pnpm start` with `pnpm install` run on the Pi is correct here.
+
+> After copying, confirm the new code is actually live. If a fix seems to have no
+> effect, you are almost certainly running a stale `.next` — rebuild on the PC and
+> re-copy.
+
+---
+
 ## 5. Keeping it running in the background (optional)
 
 `pnpm start` stops when you close the terminal. To keep it running, use a process manager
