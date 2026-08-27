@@ -60,11 +60,25 @@ class SlackHW:
     level exactly as gpiozero's `when_activated` would, so a rock in and out of
     the window produces real edges rather than scripted ones.
 
-    `slack` is the take-up travel when the motor is energised from rest, scaled
-    by the duty applied: a hard start rocks the chain, a gentle one barely does.
+    `slack` is the chain's backlash, in shelf pitches, and it is a FIXED
+    DISTANCE rather than one scaled by duty.
+
+    That is the physically defensible model: the chain has however many
+    millimetres of slack it has, and the sprocket must take up all of it before
+    the carousel moves, whatever the torque. Duty changes how FAST that take-up
+    happens, not how far it goes. Modelling it as proportional to duty instead
+    said a machine develops more backlash the harder you drive it, and at duty
+    1.0 it produced 0.6 of a shelf pitch of slack -- more than half the spacing
+    between two shelves, which no chain worth using has.
+
+    That distinction matters to the guard being tested. With a fixed distance the
+    empty gap left by a rock gets SHORTER as duty rises, in step with a window
+    scaled by 1/duty. Backlash beyond half a pitch is out of scope by design:
+    past that there is no way to tell a returning flag from the next shelf by
+    timing at all, and the cure is to tension the chain.
     """
 
-    def __init__(self, start_pos=0.0, slack_at_full=0.60):
+    def __init__(self, start_pos=0.0, slack_at_full=0.30):
         self._pos = float(start_pos)
         self._dir = 0
         self._speed = 0.0
@@ -127,10 +141,6 @@ class SlackHW:
 
     def _go(self, direction, duty):
         with self._lock:
-            starting = (self._dir == 0 or self._speed == 0.0)
-            if starting:
-                # Slack take-up: the flag falls BACKWARDS before the chain pulls.
-                self._pos -= direction * self._slack_at_full * duty
             self._dir = direction
             self._speed = duty
 
@@ -187,6 +197,21 @@ class SlackHW:
         with self._lock:
             return self._window_active()
 
+    def in_shelf_lockout(self):
+        """
+        Same lockout the interrupt path uses, exposed for the poll path.
+
+        Without this the two detection paths disagree: a flag rocking back into
+        the window is discarded as a bounce by the interrupt and counted as a new
+        shelf by the level latch.
+        """
+        with self._lock:
+            last = self._last_counted
+            lockout = self._shelf_settle
+            if last is None or lockout <= 0:
+                return False
+            return (time.monotonic() - last) < lockout
+
     def index_active(self):
         return False
 
@@ -206,7 +231,7 @@ class SlackHW:
 
 
 def run_move(start_shelf, target, shelves=9, speed=0.45, ramp_pct=0,
-             slack=0.60, timeout=30.0):
+             slack=0.30, timeout=30.0):
     """
     One move, from a carousel PARKED ON the flag of `start_shelf`.
 
