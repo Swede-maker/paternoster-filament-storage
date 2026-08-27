@@ -90,7 +90,13 @@ class CoastingHW:
                     self._last_sign = sign
 
                 active = self._window(self.pos)
-                if active != self._was_active:
+                # Entry edge only, matching the real driver: the shelf pulse queue
+                # is fed from `when_activated`, while `when_deactivated` goes to a
+                # separate exit handler. Pulsing on both edges counted the flag's
+                # DEPARTURE as a fresh shelf, which stopped the carousel a third
+                # of a pitch past the target — far beyond the mechanical coast, so
+                # the harness was manufacturing the very overshoot it measured.
+                if active and not self._was_active:
                     self._shelf_pulses += 1
                     self._tick.set()
                     if int(round(self.pos)) % self.shelves == 0:
@@ -231,28 +237,47 @@ def main():
 
     print()
     print("=" * 70)
-    print(" 2/3  when it CANNOT stop in the window, say so instead of guessing")
+    print(" 2/3  a carousel that coasts wider than the window still knows where")
+    print("      it is — it reports the overshoot instead of hunting")
     print("=" * 70)
-    # decel 0.35 => creep coast ~0.56 shelves, far wider than the 0.18 window.
-    # No control strategy can park inside it, so the honest outcome is a fault
-    # telling the user to home — never a fabricated arrival.
+    # decel 0.35 => creep coast ~0.56 shelves, far wider than the 0.18 window, so
+    # this machine physically cannot come to rest on the metal.
+    #
+    # This section used to require a fault, a "please home" message and dropping
+    # the homed reference, on the reasoning that position was UNKNOWN. That
+    # followed from deciding position by RESIDENCY: if the sensor was not sitting
+    # on metal at rest, nothing knew where the carousel was.
+    #
+    # Position now comes from the counted sensor trigger — the moment the metal
+    # arrived, which is when power was cut. A wide coast does not erase that
+    # observation: the shelf is known, the carousel has simply slid past it. So the
+    # honest outcome is a normal arrival at the correct shelf, with `onSensor`
+    # false to report that the machine coasted clear of the sheet (the fix for
+    # which is mechanical — lower the move duty — not more driving).
+    #
+    # Faulting here would be actively wrong: it would demand a re-home from a
+    # machine that had just counted its shelves correctly.
     hw = CoastingHW(decel=0.35)
     coast = v_creep ** 2 / (2 * 0.35)
     c, events = _run(hw, lambda c: c.request_goto(1), timeout=60)
     kinds = _kinds(events)
-    faults = [e for e in events if e.get("type") == "fault"]
-    msg = faults[0].get("message", "") if faults else ""
-    check("arrived" not in kinds,
-          "no arrival claimed when position is unknown",
-          "[events=%s coast=%.2f]" % (kinds, coast))
-    check(bool(faults) and "home" in msg.lower(),
-          "fault tells the user to home the carousel",
-          "[%r]" % msg)
-    check(c.homed is False,
-          "homed reference dropped so the shelf number is not trusted",
+    arrivals = [e for e in events if e.get("type") == "arrived"]
+    check("arrived" in kinds and c.current_shelf == 1,
+          "arrival reported at the counted shelf despite the wide coast",
+          "[events=%s shelf=%s coast=%.2f]" % (kinds, c.current_shelf, coast))
+    # `onSensor` records the sensor at the instant power was cut, which is the
+    # decision that ended the move — so it is True here even though this machine
+    # then coasts clear of the sheet. It is deliberately NOT a report of the final
+    # resting place: reading the level after the coast would describe where the
+    # carousel drifted to, not what the move acted on.
+    check(bool(arrivals) and arrivals[0].get("onSensor") is True,
+          "arrival records that metal was present when power was cut",
+          "[onSensor=%s]" % (arrivals[0].get("onSensor") if arrivals else None))
+    check(c.homed is True,
+          "homed reference kept — the trigger count is still valid",
           "[homed=%s]" % c.homed)
-    check(hw.reversals <= 6,
-          "gives up instead of oscillating forever",
+    check(hw.reversals == 0,
+          "never drives after the stop, even when off the metal",
           "[reversals=%d]" % hw.reversals)
     hw.cleanup()
 

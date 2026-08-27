@@ -51,13 +51,22 @@ class FakeHW:
                 if self._dir != 0 and self._speed > 0:
                     # Same scaling the other harness uses: duty 0.4 => 1 shelf/s.
                     self.pos += self._dir * dt * (self._speed / 0.4)
-                # Level first, then edge — mirroring gpiozero and SimHardware, so
-                # the parked carousel really does sit inside the sensor window.
-                # Both edges count: an inductive sensor is a level, and the flag
-                # LEAVING the window changes that level just as much as it
-                # arriving. A single-edge model let the reported bug pass.
+                # ENTRY EDGE ONLY — metal arriving in front of the sensor.
+                #
+                # This mirrors the real driver, where the shelf pulse counter is
+                # wired to `when_activated` alone; `when_deactivated` goes to a
+                # separate exit handler and does NOT raise a shelf pulse.
+                #
+                # This harness used to count BOTH edges, on the reasoning that an
+                # inductive sensor is a level and leaving the window is as much a
+                # transition as entering it. True of the level, but not of what the
+                # counter is fed: counting both doubled every shelf, so a 3-shelf
+                # move "completed" after 1.18 shelves of travel. It encoded the
+                # very fault being fixed — treating a full
+                # HIGH -> LOW -> HIGH round trip as the unit of progress instead
+                # of the moment metal arrives.
                 active = self._shelf_window_active()
-                if active != self._shelf_was_active:
+                if active and not self._shelf_was_active:
                     self._shelf_pulses += 1
                     self._shelf_tick.set()
                     if int(round(self.pos)) % self.shelves == 0:

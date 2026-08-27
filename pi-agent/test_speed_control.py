@@ -37,6 +37,7 @@ class RecordingHW:
         self._tick = threading.Event()
         self._moving = False
         self._pulse_every = pulse_every
+        self._duty = 1.0
         # The carousel parks INSIDE the sensor window, so a move starts with the
         # sensor active and clears once the flag is driven out. This fake has no
         # position model, so the departure is modelled as "active until the motor
@@ -57,6 +58,7 @@ class RecordingHW:
             self.events.append((kind, round(float(speed), 4)))
             self.duties.append(round(float(speed), 4))
             self._moving = True
+            self._duty = max(float(speed), 1e-6)
 
     def stop(self):
         with self._lock:
@@ -67,20 +69,33 @@ class RecordingHW:
             # without needing to crawl.
             self._shelf_active = True
 
-    # --- sensors: pulses arrive while powered, independent of duty ---
+    # --- sensors: pulse spacing scales with duty, as on real hardware ---
     def _spin(self):
+        # Shelves arrive FASTER when the motor runs harder. `_pulse_every` is the
+        # spacing at full duty, divided by the current duty.
+        #
+        # This used to pulse at a fixed rate "independent of duty", which quietly
+        # broke the duty-tracking assertions it was meant to support: shelves
+        # arrived just as quickly at 0.25 as at 1.00, so a four-shelf move was over
+        # in ~0.5 s and the soft start never had time to climb off the breakaway
+        # duty. Peak duty therefore read MIN_DUTY at every slider setting and the
+        # harness reported that speed control was dead, when checking the same
+        # moves against the real physics model (SimHardware) showed peak duty
+        # tracking the slider exactly at 0.30/0.45/0.70/1.00.
         nxt = time.monotonic() + self._pulse_every
         while self._alive:
             now = time.monotonic()
             with self._lock:
                 moving = self._moving
+                duty = self._duty
+            interval = self._pulse_every / max(duty, 0.05)
             if moving and now >= nxt:
                 with self._lock:
                     self._pulses += 1
                 self._tick.set()
-                nxt = now + self._pulse_every
+                nxt = now + interval
             elif not moving:
-                nxt = now + self._pulse_every
+                nxt = now + interval
             time.sleep(0.005)
 
     def reset_pulses(self):

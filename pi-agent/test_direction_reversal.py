@@ -755,9 +755,14 @@ def main():
         than emerging from simulated physics, so the counting logic is measured
         directly instead of through timing luck.
         """
-        def __init__(self, level, pulses=999):
+        def __init__(self, level, pulses=999, spacing=0.25):
             self._level = level          # what shelf_active() reports
             self._left = pulses
+            # Minimum gap between consecutive shelf pulses, so a move takes a
+            # realistic amount of wall-clock time instead of completing in the
+            # first few poll iterations.
+            self._spacing = spacing
+            self._last_pulse = 0.0
             self.consumed = 0
             self.duties = []             # (t, duty) for every energise
             self.stopped_at = None       # pulses consumed when power was cut
@@ -787,6 +792,20 @@ def main():
         def take_shelf_pulse(self, timeout):
             if self._left <= 0:
                 return False
+            # Shelves cannot arrive faster than they physically can.
+            #
+            # This used to return True on EVERY call, so a 1 ms poll loop consumed
+            # a shelf per millisecond and a three-shelf move was over in about
+            # 2 ms. Any behaviour that unfolds over real time was then invisible:
+            # the 0.72 s soft start had climbed just 0.0003 of a duty step before
+            # the move ended, which reads identically to a ramp that never runs at
+            # all. `_spacing` keeps the fake scripted — pulses still come from the
+            # test, not from simulated physics — while making their TIMING
+            # plausible.
+            now = time.monotonic()
+            if now - self._last_pulse < self._spacing:
+                return False
+            self._last_pulse = now
             self._left -= 1
             self.consumed += 1
             return True

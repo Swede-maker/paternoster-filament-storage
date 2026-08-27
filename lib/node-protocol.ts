@@ -100,6 +100,18 @@ export interface PosEvent {
 export interface ArrivedEvent {
   type: "arrived"
   shelf: number
+  /**
+   * Diagnostic only: whether the shelf sensor saw metal at the instant motor
+   * power was cut — the trigger that ended the move.
+   *
+   * This describes the stop DECISION, not the final resting place. A carousel
+   * that coasts further than the sensor window can drift off the metal
+   * afterwards while this still reads true, which is expected. Position comes
+   * from the counted trigger, so this never invalidates the shelf number and the
+   * agent never drives the motor to "correct" it. Persistent overshoot is
+   * mechanical — lower the move speed.
+   */
+  onSensor?: boolean
 }
 
 /** Homing finished; `shelf` is the index the machine settled on (usually 0). */
