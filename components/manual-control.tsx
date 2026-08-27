@@ -3,7 +3,7 @@
 import { ArrowUp, ArrowDown, Home, Loader2, OctagonX, Play } from "lucide-react"
 import { useStore } from "@/lib/store"
 import { activeNode } from "@/lib/selectors"
-import { DEFAULT_RAMP_PCT, moveDutyFor } from "@/lib/filament"
+import { DEFAULT_RAMP_PCT, HOMING_DUTY_RATIO, homingDutyFor, moveDutyFor } from "@/lib/filament"
 import { Button } from "./ui/button"
 import { cn } from "@/lib/utils"
 
@@ -30,6 +30,10 @@ export function ManualControl() {
   // Speed controls only apply to a motorized carousel, not manual shelf storage.
   const isCarousel = node.type !== "shelf"
   const rampPct = node.rampPct ?? DEFAULT_RAMP_PCT
+  // Resolved through the same helper the Pi is configured from, so the slider
+  // shows the duty homing will actually use — including while it is tracking the
+  // move duty, rather than sitting at a placeholder.
+  const homingDuty = homingDutyFor(node)
 
   const statusLabel = (() => {
     switch (status) {
@@ -266,6 +270,61 @@ export function ManualControl() {
           <p className="mt-1 text-[10px] leading-relaxed text-muted-foreground">
             Sets the motor speed directly. Lower it until the carousel stops overshooting the shelf
             sensor.
+          </p>
+
+          {/* Homing duty, separate from the move duty above. Homing hunts a
+              single index flag from an unknown start, so it is the move most
+              likely to sail past its target — and the costliest to get wrong,
+              because every later shelf position is measured from where homing
+              decided "zero" is. Left untouched it tracks the move duty. */}
+          <div className="mt-4 flex items-center justify-between">
+            <p className="text-xs uppercase tracking-wider text-muted-foreground">Homing PWM</p>
+            <span className="font-mono text-xs text-foreground">
+              {node.homingDuty === undefined
+                ? `Auto · ${Math.round(homingDuty * 100)}%`
+                : `${Math.round(homingDuty * 100)}%`}
+            </span>
+          </div>
+          <input
+            type="range"
+            aria-label="Homing motor PWM duty (percent)"
+            min={5}
+            max={100}
+            step={1}
+            value={Math.round(homingDuty * 100)}
+            disabled={busy}
+            onChange={(e) =>
+              dispatch({
+                type: "SET_NODE_HOMING_PWM",
+                nodeId: node.id,
+                homingDuty: Number(e.target.value) / 100,
+              })
+            }
+            className="mt-2 w-full accent-[var(--color-primary)] disabled:opacity-40"
+          />
+          <div className="flex justify-between text-[10px] uppercase tracking-wide text-muted-foreground">
+            <span>5%</span>
+            <span>100%</span>
+          </div>
+          <p className="mt-1 text-[10px] leading-relaxed text-muted-foreground">
+            {node.homingDuty === undefined ? (
+              <>Following Motor PWM at {Math.round(HOMING_DUTY_RATIO * 100)}%. Drag to set it yourself.</>
+            ) : (
+              <>
+                Set manually.{" "}
+                <button
+                  type="button"
+                  disabled={busy}
+                  onClick={() =>
+                    dispatch({ type: "SET_NODE_HOMING_PWM", nodeId: node.id, homingDuty: undefined })
+                  }
+                  className="underline underline-offset-2 transition-colors hover:text-foreground disabled:opacity-40"
+                >
+                  Follow Motor PWM
+                </button>{" "}
+                instead.
+              </>
+            )}
           </p>
         </div>
       )}

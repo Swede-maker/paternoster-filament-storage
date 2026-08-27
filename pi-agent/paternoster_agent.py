@@ -119,6 +119,50 @@ def shelf_settle_for(duty: float) -> float:
     """
     lockout = SHELF_SETTLE_AT_MOVE_SPEED * (MOVE_SPEED / max(0.01, duty))
     return min(SHELF_SETTLE_MAX, lockout)
+
+
+# Travel time for ONE shelf pitch at MOVE_SPEED. Not used to decide position --
+# the sensor always does that -- only to say how EARLY an edge has to be before it
+# is physically impossible for it to be the next shelf.
+SHELF_TRAVEL_AT_MOVE_SPEED = 0.5
+
+# Fraction of a shelf pitch of chain slack the departure guard tolerates.
+#
+# The chain can only rock back by its own backlash, which is a fixed mechanical
+# property well under one shelf spacing. Anything that re-enters the window after
+# less than this much travel cannot be the next shelf, because the next shelf is a
+# WHOLE pitch away. Kept below 0.5 so the guard can never reach halfway to a
+# genuine shelf: if a machine ever has more slack than this the cure is to tension
+# the chain, not to widen the guard, and widening it past 0.5 would start
+# swallowing real shelves.
+DEPARTURE_SLACK_FRACTION = 0.45
+
+
+def departure_guard_for(duty: float) -> float:
+    """
+    How soon after the motor starts an edge is too early to be a new shelf.
+
+    A move that begins parked on a flag has to lose that flag first, and the
+    chain's slack means the flag does not simply leave: energising the motor lets
+    it drop backwards out of the window, then the chain takes up and pulls it
+    forwards back IN. That re-entry is a genuine rising edge, indistinguishable
+    from a shelf by level alone -- it was being counted, so every multi-step move
+    finished one shelf short while the count claimed it had arrived.
+
+    The one thing that separates the two is DISTANCE TRAVELLED. The returning flag
+    has only covered the slack; the next shelf is a whole pitch away. With a single
+    sensor there is no odometer, so distance is inferred from time at the known
+    duty -- and only to REJECT the impossible, never to decide where the carousel
+    is. Scaled by duty because travel time per pitch is inversely proportional to
+    it, so the guard stays a fixed fraction of the SPACING at every speed.
+
+    An earlier version of this scaled a fixed blanking time by duty instead. That
+    failed at high duty: a harder start rocks the chain further back, so the empty
+    gap GREW with duty while a 1/duty window shrank. Anchoring to the pitch makes
+    both sides scale together.
+    """
+    pitch = SHELF_TRAVEL_AT_MOVE_SPEED * (MOVE_SPEED / max(0.01, duty))
+    return min(SHELF_SETTLE_MAX, DEPARTURE_SLACK_FRACTION * pitch)
 # Max time to drive off the index flag when homing starts while already on it.
 # The motor runs throughout; this only bounds how long we watch for it to clear.
 INDEX_CLEAR_TIMEOUT = 10.0
@@ -346,6 +390,19 @@ class RealHardware:
         """Lockout applied AFTER a counted shelf, to swallow that shelf's bounce."""
         with self._lock:
             self._shelf_settle = max(0.0, seconds)
+
+    def arm_shelf_lockout(self) -> None:
+        """
+        Start the bounce lockout NOW, without counting a shelf.
+
+        Used when a move starts parked on a flag. That flag is about to be
+        dragged out of the window and can rock back into it as the chain takes
+        up; arming the lockout makes the hardware treat such a return as the
+        bounce it is. Without this the first edge of every move was accepted
+        unconditionally, because `reset_pulses` had just cleared the lockout.
+        """
+        with self._lock:
+            self._last_counted = time.monotonic()
 
     def _on_shelf_exit(self) -> None:
         if self.travel_direction is not None:
@@ -1164,6 +1221,29 @@ class Carousel:
             if wait_fn(min(ABORT_POLL_SECONDS, remaining)):
                 return True
 
+    def _await_stepping(self, wait_fn, timeout: float, on_tick) -> bool:
+        """
+        Like `_await`, but runs `on_tick` between slices so the caller can keep a
+        soft start moving WHILE the sensor is being watched.
+
+        Homing used to call the blocking `_drive` and only afterwards start
+        looking for the index flag. The interrupt still captured the edge, so the
+        pulse was never lost — but the motor went on accelerating for the whole
+        remainder of the ramp before anyone read it, and at a long ramp that is
+        over a shelf of extra travel past the flag. Since homing defines where
+        "zero" is, that overshoot is inherited by every later position.
+        """
+        deadline = time.monotonic() + timeout
+        while True:
+            if self._abort.is_set():
+                return False
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            on_tick()
+            if wait_fn(min(ABORT_POLL_SECONDS, remaining)):
+                return True
+
     def _do_home(self) -> None:
         self.status = "homing"
         self.emit(self.snapshot())
@@ -1173,8 +1253,24 @@ class Carousel:
         self.hw.reset_pulses()
         # Soft-started at the CURRENT homing speed, not the module default, so
         # the sliders affect homing too.
+        #
+        # The ramp is stepped from the sensor-watching loops below rather than by
+        # the blocking `_drive`, so the motor is never accelerating with nobody
+        # reading the index sensor. See `_await_stepping`.
         home_direction = "up" if HOMING_DIRECTION == "down" else "down"
-        self._drive(home_direction, self.homing_speed)
+        home_target = self.homing_speed
+        home_ramp = self._ramp_seconds()
+        # Never start ABOVE the requested duty: at a homing setting below
+        # MIN_DUTY, a hardcoded floor would drive faster than asked for.
+        home_floor = min(MIN_DUTY, home_target)
+        self._energise(home_direction, home_floor if home_ramp > 0 else home_target)
+        home_t0 = time.monotonic()
+
+        def _home_ramp_step() -> None:
+            if home_ramp <= 0:
+                return
+            frac = min(1.0, (time.monotonic() - home_t0) / home_ramp)
+            self._energise(home_direction, home_floor + (home_target - home_floor) * frac)
 
         # Classic "already sitting on the switch" problem: if the carousel is
         # parked with a shelf inside the index window, the flag is active before
@@ -1184,10 +1280,10 @@ class Carousel:
         # the motor stays powered the whole time — and only then look for the
         # genuine inactive->active edge that actually means "home".
         if self.hw.index_active():
-            self._await(self.hw.index_clear, INDEX_CLEAR_TIMEOUT)
+            self._await_stepping(self.hw.index_clear, INDEX_CLEAR_TIMEOUT, _home_ramp_step)
             self.hw.reset_pulses()  # ignore the edge produced by leaving the flag
 
-        found = self._await(self.hw.take_index_pulse, HOME_TIMEOUT)
+        found = self._await_stepping(self.hw.take_index_pulse, HOME_TIMEOUT, _home_ramp_step)
         self.hw.stop()
         if self._abort.is_set():
             self.status = "idle"
@@ -1345,6 +1441,25 @@ class Carousel:
         # charge, and it is exactly the "sails past the metal" symptom.
         self.hw.reset_pulses()
 
+        # ON REAL HARDWARE THE RE-ENTRY IS A GENUINE INTERRUPT, so the dwell in
+        # the loop below cannot catch it on its own: `when_activated` fires, the
+        # pulse is queued, and a queued pulse is trusted unconditionally (it has
+        # to be — that path exists to catch flags too fast for the poll).
+        #
+        # So the suppression also has to happen where the edge is captured.
+        # Arming the bounce lockout at the instant the motor starts makes the
+        # driver treat a re-entry of the flag we are leaving exactly like the
+        # post-count bounce it already filters. `reset_pulses` above had just
+        # cleared that lockout, which is why the first edge of every move was
+        # accepted no matter how soon it arrived.
+        #
+        # getattr: older backends and test doubles have no such method, and a
+        # bare call raised AttributeError before the motor ever started.
+        if parked_on_flag:
+            arm = getattr(self.hw, "arm_shelf_lockout", None)
+            if callable(arm):
+                arm()
+
         # Non-blocking ramp state, stepped inside the loop.
         ramp_floor = min(MIN_DUTY, cruise)
         ramp_seconds = 0.0 if steps <= 1 else self._ramp_seconds()
@@ -1384,6 +1499,23 @@ class Carousel:
         # From the state sampled at step 0, not re-read here: by now the flag may
         # already have moved back into the window.
         seen_inactive = not parked_on_flag
+
+        # Departure-guard state.
+        #
+        # Armed only when the move starts ON a flag, because that is the only
+        # case where a flag has to leave the window before any real shelf can
+        # arrive. Starting clear of a flag means the first edge is genuine (or is
+        # the reversal case that `ignore_parked_flag` already covers), so the
+        # guard must stay down or it would eat a real shelf.
+        awaiting_departure = parked_on_flag
+
+        # Scaled off `cruise`, not the instantaneous ramp duty: derived from a
+        # duty that is still climbing the guard would open several times longer
+        # than intended. Using the target duty makes it the SHORTEST, safest
+        # window — under a ramp the carousel is slower than this assumes, so a
+        # genuine shelf takes even longer to arrive than the guard allows for.
+        departure_guard = departure_guard_for(cruise)
+        motor_started = time.monotonic()
 
         # ------------------------------------------------------------------
         # RUNAWAY STOP — the only guard, and the only use of a clock here.
@@ -1472,6 +1604,29 @@ class Carousel:
             else:
                 # Still sitting in the same flag we already counted.
                 triggered = False
+
+            # THE DEPARTURE FLAG COMING BACK. Discarded on distance, not on level.
+            #
+            # Only ever applies to the FIRST edge of a move that began parked on
+            # a flag, and only while that edge is too early to be a real shelf.
+            # After the guard expires, or once one edge has been dealt with, this
+            # is inert for the rest of the move — it can suppress at most one
+            # edge, so a mistake here costs a shelf once and cannot compound.
+            #
+            # Single-shelf moves masked this bug completely: the phantom edge WAS
+            # the target, and stopping one shelf early from a parked start lands
+            # on the right shelf. Only moves of two or more revealed it, which is
+            # exactly what was reported — 1→2 correct, 2→5 arriving at 4.
+            if (triggered and awaiting_departure
+                    and (time.monotonic() - motor_started) < departure_guard):
+                awaiting_departure = False
+                last_trigger = time.monotonic()
+                time.sleep(POLL)
+                continue
+
+            if triggered:
+                # Any edge from here on is a real shelf, so stand the guard down.
+                awaiting_departure = False
 
             if triggered and ignore_parked_flag:
                 # The flag we set off from, sliding back into the window. Not a
