@@ -80,6 +80,15 @@ class RoundTripHW:
         self._index_edges = 0
         self._prev_shelf = self._shelf_win()
         self._prev_index = self._index_win()
+        # The travel that carried the flag OUT of the window, recorded on the
+        # falling edge exactly as the real driver does in `when_deactivated`.
+        #
+        # Without this the agent has no way to distinguish a genuine new shelf
+        # from the flag it coasted past and is now driving straight back into —
+        # which is the whole ambiguity this harness was built to reproduce. It is
+        # a measurement of what actually happened, not a prediction.
+        self.flag_exit_direction = None
+        self.travel_direction = None
         self._running = True
         threading.Thread(target=self._tick, daemon=True).start()
 
@@ -111,12 +120,22 @@ class RoundTripHW:
                 s, i = self._shelf_win(), self._index_win()
                 if s != self._prev_shelf:
                     self._shelf_edges += 1
+                    if not s:
+                        # Falling edge: the flag just left the window. Remember
+                        # which way the carousel was travelling as it went, so a
+                        # later move can tell whether its first trigger is this
+                        # same flag coming back or a genuinely new shelf.
+                        self.flag_exit_direction = self.travel_direction
                     self._prev_shelf = s
                 if i != self._prev_index:
                     self._index_edges += 1
                     self._prev_index = i
 
     # ---- motor -----------------------------------------------------------
+    # `travel_direction` is NOT set here. The agent publishes it in `_energise`
+    # before energising, which is the same contract SimHardware relies on, so
+    # setting it again from a direction guess would only risk contradicting the
+    # authoritative value.
     def forward(self, duty):
         with self._lock:
             self._duty, self._dir = float(duty), +1

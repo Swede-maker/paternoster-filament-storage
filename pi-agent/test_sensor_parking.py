@@ -65,14 +65,22 @@ class WindowHW:
                 if self._dir != 0 and self._speed > 0:
                     self.pos += self._dir * dt * (self._speed / 0.4)
                 active = self._window(self.pos)
-                # Pulse on BOTH edges. A real inductive sensor is a level, and
-                # the driver's edge callback fires whenever that level changes,
-                # so the flag LEAVING the window is just as much a pulse as it
-                # arriving. Modelling only the entering edge hid the reported
-                # bug entirely: the departure of the parked shelf is exactly
-                # what used to be miscounted as the target arriving, ending the
-                # move about 30mm in.
-                if active != self._was_active:
+                # ENTRY EDGE ONLY — metal arriving in front of the sensor.
+                #
+                # The real driver feeds the shelf pulse queue from
+                # `when_activated` alone; `when_deactivated` goes to a separate
+                # exit handler and raises no shelf pulse. So a queued pulse always
+                # means "metal arrived", and the agent can act on it without
+                # re-reading the level — which matters for a fast, narrow flag the
+                # 1 ms poll can miss entirely.
+                #
+                # This used to pulse on BOTH edges, reasoning that an inductive
+                # sensor is a level and a departure changes it just as much. True
+                # of the level, but not of what the counter is fed: it made the
+                # parked shelf's DEPARTURE count as the target arriving, so the
+                # move ended about 30mm in. That is the reported bug reproduced in
+                # the harness rather than in the agent.
+                if active and not self._was_active:
                     self._shelf_pulses += 1
                     self._tick.set()
                     if int(round(self.pos)) % self.shelves == 0:
@@ -212,13 +220,28 @@ def main():
 
     print()
     print("=" * 70)
-    print(" 2/3  the flag settles nearer the MIDDLE than the edge")
+    print(" 2/3  the move ends as metal ARRIVES, not after it has passed")
     print("=" * 70)
+    # The carousel must come to rest on the near side of the flag centre: it stops
+    # the moment the sensor sees metal, so it can only ever be short of centre,
+    # never past it. Resting BEYOND centre would mean the sheet had already begun
+    # to leave the sensor before power was cut — the "stops once the metal has
+    # passed" fault.
+    #
+    # This replaces a check that the flag settled near the MIDDLE of the window
+    # (off <= HALF * 0.8). Nothing but the deleted alignment crawl could satisfy
+    # that: centring requires driving further after the trigger and nudging back
+    # and forth, which is precisely the post-arrival rotation being removed.
+    # Cutting power on the entry edge legitimately leaves the flag near the
+    # entry-side edge, so the old bound was asserting the bug.
     for speed in (0.35, 0.45, 0.7):
         pos, _, _ = run_move("down", 1, speed, 40)
         off = abs(pos - round(pos))
-        check(f"speed {speed}: not balanced on the boundary", off <= HALF * 0.8,
-              f"offset={off:.3f} edge={HALF}")
+        # `down` means decreasing position, so the flag is entered from above:
+        # resting position must not have gone past the centre of the window.
+        check(f"speed {speed}: stopped on the entry side of the flag",
+              off <= HALF + 1e-6,
+              f"offset={off:.3f} window_half={HALF}")
 
     print()
     print("=" * 70)
