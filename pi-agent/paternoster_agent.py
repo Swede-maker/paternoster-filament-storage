@@ -85,18 +85,22 @@ SENSOR_BOUNCE = 0.01  # debounce (s) for the inductive sensors
 # was counted twice or more and the carousel believed it had travelled further
 # than it had.
 #
-# The filter is release-based: a rising edge only counts if the window was
-# continuously EMPTY for a settle period beforehand. Bounce has a tiny empty gap
-# (the flag never really left), so it is rejected. A genuine next shelf is
-# preceded by a whole inter-shelf travel with the window empty, so it counts.
+# The filter is a LOCKOUT APPLIED AFTER a counted shelf: once a shelf is counted,
+# further rising edges are ignored for a short period, which is exactly how long
+# that shelf's own rocking lasts. The next genuine shelf arrives well after the
+# lockout, so it counts.
 #
-# The settle period is NOT a fixed wall-clock value, because the safe ceiling
-# depends entirely on speed. Per-shelf travel is ~0.5s at MOVE_SPEED, so a flat
-# 1.0-1.5s filter would be LONGER than the entire gap between shelves and would
-# reject genuine shelves — the carousel would stop counting and hit the jam
-# timeout. Scaling with duty keeps the filter proportionally identical at every
-# speed: generous at the slow duties where bounce actually matters, and always
-# comfortably inside the real shelf spacing.
+# The direction of the test matters more than its length. An earlier version was
+# release-based — an edge only counted once the window had been EMPTY for a while
+# first — and that is a precondition IN FRONT OF the stop signal, so the filter
+# could delay or drop the very edge that must cut power. It did exactly that on
+# every move (see _on_shelf). A lockout can only ever ignore a LATER edge, so the
+# rising edge that stops the carousel is always published instantly.
+#
+# The period is NOT a fixed wall-clock value, because the safe ceiling depends on
+# speed. Per-shelf travel is ~0.5s at MOVE_SPEED, so a flat 1.0-1.5s lockout would
+# outlast the gap between shelves and swallow genuine ones. Scaling with duty
+# keeps it a constant fraction of the real shelf spacing at every speed.
 #
 # This filters COUNTING only. It never gates motor power, and position still
 # comes from counted pulses rather than from elapsed time.
@@ -106,15 +110,15 @@ SHELF_SETTLE_MAX = 1.5
 
 def shelf_settle_for(duty: float) -> float:
     """
-    Settle period for a given PWM duty.
+    Post-trigger bounce lockout for a given PWM duty.
 
-    Travel time per shelf is inversely proportional to duty, so the filter scales
+    Travel time per shelf is inversely proportional to duty, so the lockout scales
     the same way and stays at a constant FRACTION of the real shelf spacing. That
     is what makes one setting correct at 45% and at 5% alike. Capped so a
     near-stalled duty cannot produce an absurdly long blind window.
     """
-    settle = SHELF_SETTLE_AT_MOVE_SPEED * (MOVE_SPEED / max(0.01, duty))
-    return min(SHELF_SETTLE_MAX, settle)
+    lockout = SHELF_SETTLE_AT_MOVE_SPEED * (MOVE_SPEED / max(0.01, duty))
+    return min(SHELF_SETTLE_MAX, lockout)
 # Max time to drive off the index flag when homing starts while already on it.
 # The motor runs throughout; this only bounds how long we watch for it to clear.
 INDEX_CLEAR_TIMEOUT = 10.0
@@ -279,11 +283,11 @@ class RealHardware:
         self._index_pulses = 0
         self._shelf_tick = threading.Event()
         self._index_tick = threading.Event()
-        # Mechanical bounce filter state. `None` means "not currently known to be
-        # empty", which fails SAFE: an edge is counted rather than dropped, since
-        # dropping a genuine shelf loses position while an extra count is what the
-        # settle window is there to catch.
-        self._shelf_clear_since: Optional[float] = None
+        # Mechanical bounce filter state: the time the last shelf was COUNTED.
+        # `None` means "no recent count", so the next rising edge passes straight
+        # through. See _on_shelf for why this is a lockout AFTER a trigger and
+        # never a wait BEFORE one.
+        self._last_counted: Optional[float] = None
         self._shelf_settle = 0.0
         self._suppressed_bounces = 0
         self.shelf.when_activated = self._on_shelf
@@ -305,32 +309,48 @@ class RealHardware:
         self.shelf.when_deactivated = self._on_shelf_exit
 
     def set_shelf_settle(self, seconds: float) -> None:
-        """How long the window must stay EMPTY before a rising edge counts."""
+        """Lockout applied AFTER a counted shelf, to swallow that shelf's bounce."""
         with self._lock:
             self._shelf_settle = max(0.0, seconds)
 
     def _on_shelf_exit(self) -> None:
         if self.travel_direction is not None:
             self.flag_exit_direction = self.travel_direction
-        # Stamp when the window became empty. This is physical reality, so it is
-        # deliberately NOT touched by reset_pulses(): counter bookkeeping must not
-        # be able to forget that the flag is still hovering on the boundary.
-        with self._lock:
-            self._shelf_clear_since = time.monotonic()
 
     def _on_shelf(self) -> None:
+        """
+        RISING EDGE. Untriggered -> triggered. This is the event the whole machine
+        stops on, so it is published IMMEDIATELY and unconditionally, unless it is
+        a re-trigger of the shelf that was just counted.
+
+        The bounce filter is a LOCKOUT AFTER a counted shelf, never a wait BEFORE
+        one. That distinction is the entire bug that made the carousel drive past
+        its target:
+
+        This used to be release-based — an edge only counted if the window had
+        been EMPTY for `settle` first. That puts a precondition in front of the
+        stop signal, so the filter could DELAY or DROP the very edge that must cut
+        power. It reliably did: on the last shelf the move drops to the slower
+        `approach` duty, `settle` is recomputed for that slow duty (0.40s) while
+        the carousel is still physically coasting near cruise (real gap 0.25s), so
+        the target's arrival edge was swallowed every time and the loop ran on to
+        the NEXT shelf. It also failed outright whenever the metal flag covered
+        more than ~60% of the shelf pitch, because then the empty gap is shorter
+        than the settle at any speed.
+
+        A lockout cannot do that. The first edge after a reset always passes with
+        zero delay, so trigger -> stop is exact; only the SAME shelf rocking back
+        into the window inside the lockout is ignored.
+        """
         now = time.monotonic()
         with self._lock:
-            since = self._shelf_clear_since
-            settle = self._shelf_settle
-            if since is not None and settle > 0 and (now - since) < settle:
-                # The flag bounced back in before the window had been empty long
-                # enough to be a real inter-shelf gap. Same shelf, not the next.
+            last = self._last_counted
+            lockout = self._shelf_settle
+            if last is not None and lockout > 0 and (now - last) < lockout:
+                # Same shelf rocking in the window again, not the next shelf.
                 self._suppressed_bounces += 1
                 return
-            # Inside the window now, so there is no "empty since" time any more.
-            # A bounce must produce a fresh exit edge to be measured against.
-            self._shelf_clear_since = None
+            self._last_counted = now
             self._shelf_pulses += 1
         self._shelf_tick.set()
 
@@ -359,6 +379,12 @@ class RealHardware:
         with self._lock:
             self._shelf_pulses = 0
             self._index_pulses = 0
+            # Clear the bounce lockout too. A move ends by stopping ON a flag, so
+            # `_last_counted` is only milliseconds old when the next move starts.
+            # Leaving it set would make the lockout suppress the NEXT move's first
+            # genuine arrival — reintroducing the drive-past-the-target bug at the
+            # start of every move instead of the end.
+            self._last_counted = None
         self._shelf_tick.clear()
         self._index_tick.clear()
 
@@ -458,8 +484,9 @@ class SimHardware:
         # Position 0.0 is a shelf in place, so the window starts ACTIVE. Seeding
         # this True is what stops a phantom pulse being reported at startup.
         self._shelf_was_active = True
-        # Mirrors RealHardware's bounce filter state.
-        self._shelf_clear_since: Optional[float] = None
+        # Mirrors RealHardware's bounce filter state: time of the last COUNTED
+        # shelf, used as a lockout after a trigger rather than a wait before one.
+        self._last_counted: Optional[float] = None
         self._shelf_settle = 0.0
         self._suppressed_bounces = 0
         # Mirrors RealHardware: current travel, and the travel at the flag's last
@@ -496,13 +523,15 @@ class SimHardware:
                 # a parked-on-sensor carousel was impossible to simulate.
                 active = self._shelf_window_active()
                 if active and not self._shelf_was_active:
-                    # Same release-based bounce filter as the real hardware.
-                    if (self._shelf_clear_since is not None
+                    # Same post-trigger LOCKOUT as the real hardware: a rising
+                    # edge is published immediately unless it is the shelf just
+                    # counted rocking back in. Never a wait before the edge.
+                    if (self._last_counted is not None
                             and self._shelf_settle > 0
-                            and (now - self._shelf_clear_since) < self._shelf_settle):
+                            and (now - self._last_counted) < self._shelf_settle):
                         self._suppressed_bounces += 1
                     else:
-                        self._shelf_clear_since = None
+                        self._last_counted = now
                         self._shelf_pulses += 1
                         self._shelf_tick.set()
                     # The INDEX pulse is raised OUTSIDE the bounce filter, on
@@ -519,9 +548,10 @@ class SimHardware:
                         self._index_pulses += 1
                         self._index_tick.set()
                 elif self._shelf_was_active and not active:
-                    self._shelf_clear_since = now
                     # Falling edge: the flag has just cleared the window, so the
-                    # current travel fixes which side it now rests on.
+                    # current travel fixes which side it now rests on. It no
+                    # longer feeds the bounce filter, because the filter must not
+                    # depend on how long the window has been empty.
                     if self.travel_direction is not None:
                         self.flag_exit_direction = self.travel_direction
                 self._shelf_was_active = active
@@ -550,6 +580,9 @@ class SimHardware:
         with self._lock:
             self._shelf_pulses = 0
             self._index_pulses = 0
+            # Mirrors RealHardware: clearing the lockout is what stops the
+            # previous move's final pulse suppressing the next move's first one.
+            self._last_counted = None
         self._shelf_tick.clear()
         self._index_tick.clear()
 

@@ -551,16 +551,42 @@ def main():
         return 0.5 * (pa.MOVE_SPEED / duty)
 
     fracs = [pa.shelf_settle_for(d) / shelf_period(d) for d in (0.45, 0.25, 0.10)]
-    check("settle stays a constant fraction of shelf spacing across speeds",
+    check("lockout stays a constant fraction of shelf spacing across speeds",
           max(fracs) - min(fracs) < 1e-6,
           "fractions drift: %s" % ["%.2f" % f for f in fracs])
-    check("settle never exceeds the real gap between shelves",
+    # As a POST-trigger lockout the binding constraint is the time between
+    # consecutive shelf ARRIVALS. Overrun it and two distinct shelves merge into
+    # one count. (When this was a pre-trigger settle the constraint was the much
+    # tighter empty-window gap, which is precisely what it kept violating.)
+    check("lockout never outlasts the gap between consecutive arrivals",
           all(pa.shelf_settle_for(d) < shelf_period(d)
               for d in (0.45, 0.25, 0.10, 0.06, 0.05)),
-          "a settle longer than the shelf gap rejects genuine shelves")
-    check("settle is capped so a near-stalled duty cannot blind counting",
+          "a lockout longer than the shelf period merges two shelves")
+    check("lockout is capped so a near-stalled duty cannot blind counting",
           pa.shelf_settle_for(0.001) <= pa.SHELF_SETTLE_MAX,
-          "uncapped settle at near-zero duty")
+          "uncapped lockout at near-zero duty")
+    # The whole point of the redesign: however long the lockout is, it can never
+    # postpone the FIRST edge after a reset — the edge that stops the motor.
+    # Driven through the real sensor loop, with the biggest lockout the scaler can
+    # ever produce, and with NO empty-window settling time beforehand.
+    for label, lockout in (("normal", pa.shelf_settle_for(0.45)),
+                           ("slow duty", pa.shelf_settle_for(0.10)),
+                           ("max cap", pa.SHELF_SETTLE_MAX)):
+        probe = pa.SimHardware(shelves=9)
+        probe.set_shelf_settle(lockout)
+        hlf = pa.SIM_SENSOR_HALF_WIDTH
+        with probe._lock:                 # sit just outside the window
+            probe._pos = 1.0 - hlf - 0.05
+        time.sleep(0.05)
+        probe.reset_pulses()
+        with probe._lock:                 # rising edge, immediately
+            probe._pos = 1.0
+        got = probe.take_shelf_pulse(0.25)
+        probe.cleanup()
+        check("first edge after reset is instant (%s lockout %.2fs)"
+              % (label, lockout),
+              got,
+              "the bounce filter delayed the edge that must cut power")
 
     # --- behavioural: drive the simulated sensor through a real bounce ---
     SETTLE = 0.30
@@ -622,10 +648,14 @@ def main():
     time.sleep(SETTLE + 0.1)
     park(0.0)                        # clean arrival at the home/index flag
     hw.take_index_pulse(0.3)         # consume it; it is not what we are testing
-    hw.reset_pulses()
+    # Consume the arrival's SHELF pulse individually rather than calling
+    # reset_pulses(): a reset deliberately clears the bounce lockout, so the very
+    # next edge would pass by design and this check would be testing nothing.
+    hw.take_shelf_pulse(0.3)
 
-    # Bounce ON the home flag. Each re-entry is inside the settle window, so the
-    # SHELF count is (correctly) suppressed — but the index must still be seen.
+    # Bounce ON the home flag. Each re-entry is inside the lockout that the
+    # arrival started, so the SHELF count is (correctly) suppressed — but the
+    # index must still be seen.
     for _ in range(2):
         park(0.0 + half + 0.02)
         park(0.0)
@@ -659,22 +689,27 @@ def main():
             counted += 1
         return counted
 
-    def _settle_count(events, settle):
+    def _settle_count(events, settle, first_delayed=None):
         """
-        Replica of the release-based filter, driven by the SAME two events the
-        agent sees: ("exit", t) when the window empties and ("rise", t) when it
-        fills. A rise counts only if the window had been empty for `settle`.
+        Replica of the shipped POST-TRIGGER LOCKOUT: a rising edge is counted
+        immediately unless it falls within `settle` of the last COUNTED edge.
+        Exit events are irrelevant to it by design, which is exactly why it can
+        never delay the edge that stops the motor.
+
+        `first_delayed` collects whether any edge was postponed while the window
+        had not been empty for long — the failure mode of the old release filter.
         """
         counted = 0
-        clear_since = -1e9          # start "long empty" so a first arrival counts
+        last_counted = None
         for kind, t in events:
-            if kind == "exit":
-                clear_since = t
-            elif kind == "rise":
-                if clear_since is not None and (t - clear_since) < settle:
-                    continue        # bounce: window was not empty long enough
-                clear_since = None  # now inside; needs a fresh exit to be measured
-                counted += 1
+            if kind != "rise":
+                continue
+            if last_counted is not None and (t - last_counted) < settle:
+                continue                     # same shelf still rocking
+            if first_delayed is not None and counted == 0:
+                first_delayed.append(False)  # the first edge always passes
+            last_counted = t
+            counted += 1
         return counted
 
     # ONE shelf arriving, then rocking out-and-in twice. The flag has settled
@@ -689,10 +724,14 @@ def main():
         ("exit", 0.02), ("rise", 0.035),
         ("exit", 0.05), ("rise", 0.065),
     ]
-    check("the settle filter reduces that same bounce to a single shelf",
-          _settle_count(one_bouncing_shelf, settle=0.30) == 1,
+    delayed = []
+    check("the lockout filter reduces that same bounce to a single shelf",
+          _settle_count(one_bouncing_shelf, settle=0.30, first_delayed=delayed) == 1,
           "got %d counts for one bouncing shelf"
           % _settle_count(one_bouncing_shelf, settle=0.30))
+    check("and it did not postpone that shelf's first (stopping) edge",
+          delayed == [False],
+          "the first edge was not published immediately: %r" % (delayed,))
     # And a genuinely different shelf, arriving after a full empty gap, still counts.
     two_real_shelves = one_bouncing_shelf + [("exit", 0.10), ("rise", 0.90)]
     check("a genuine later shelf is still counted by the same filter",
