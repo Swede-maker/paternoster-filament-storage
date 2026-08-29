@@ -1,13 +1,17 @@
 "use client"
 
 import { useEffect, useState } from "react"
-import { Barcode, Save, X } from "lucide-react"
+import { Barcode, Save, X, QrCode as QrIcon } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { useStore } from "@/lib/store"
 import { Field, Input, Label, Select } from "./ui/field"
 import { PresetCombobox } from "./preset-combobox"
 import { SpoolDisc } from "./spool"
 import { BarcodeScanner } from "./barcode-scanner"
+import { QrCode } from "./qr-code"
+import { QrPrintButton } from "./qr-print-button"
+import { newQrTagId, qrPayload } from "@/lib/tags"
+import type { QrLabelSpec } from "@/lib/qr"
 import {
   COLOR_PRESETS,
   allMaterials,
@@ -47,6 +51,27 @@ export interface SpoolDraft {
   quantity?: number
   /** Scanned barcode string, if the draft was populated/matched by a scan. */
   barcode?: string
+  /**
+   * Ids of RFID/QR tags to bind to the spool(s) created from this draft — one
+   * per spool when a quantity is set, so each physical spool gets its own unique
+   * printable QR. Minted when the user opts into QR during creation; the
+   * `UPSERT_SPOOL` reducer registers each binding once its spool exists.
+   */
+  tagIds?: string[]
+}
+
+/**
+ * Convert a draft into the fields of a single `Spool`, stripping form-only
+ * fields (`quantity`, `tagIds`) and assigning the Nth minted tag id. Use this
+ * everywhere a `SpoolDraft` becomes a `Spool` so batch spools each get their
+ * own tag and no draft-only field leaks onto the stored spool.
+ */
+export function draftToSpoolFields(draft: SpoolDraft, index = 0): Omit<SpoolDraft, "quantity" | "tagIds"> & {
+  tagId?: string
+} {
+  const { quantity: _q, tagIds, ...rest } = draft
+  const tagId = tagIds?.[index]
+  return tagId ? { ...rest, tagId } : rest
 }
 
 export function emptyDraft(defaultGrams = 1000, defaultDiameter = DEFAULT_DIAMETER): SpoolDraft {
@@ -157,6 +182,105 @@ function withMaterial(value: SpoolDraft, material: FilamentMaterial): Partial<Sp
   return patch
 }
 
+/**
+ * QR creation UI shown inside SpoolForm when `showTag` is on. Mints one unique
+ * QR per spool (tracking the quantity), previews them, and prints them at a
+ * chosen physical size. Bindings are registered on save by the store.
+ */
+function TagQrBlock({
+  value,
+  set,
+  count,
+}: {
+  value: SpoolDraft
+  set: (patch: Partial<SpoolDraft>) => void
+  count: number
+}) {
+  const ids = value.tagIds ?? []
+
+  // Once the user opts in, keep the number of codes in step with the quantity:
+  // add ids when it grows, trim when it shrinks. Skips the opted-out state.
+  useEffect(() => {
+    if (ids.length === 0 || ids.length === count) return
+    const next = ids.slice(0, count)
+    while (next.length < count) next.push(newQrTagId())
+    set({ tagIds: next })
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [count])
+
+  const baseCaption = `${value.brand ?? ""} ${value.material ?? ""}`.trim() || "Filament spool"
+  const labels: QrLabelSpec[] = ids.map((id, i) => ({
+    contents: qrPayload(id),
+    caption: baseCaption,
+    sub:
+      ids.length > 1
+        ? `${value.colorName ? value.colorName + " · " : ""}#${i + 1} of ${ids.length}`
+        : value.colorName || undefined,
+  }))
+
+  const remove = () => set({ tagIds: undefined })
+
+  return (
+    <div className="flex flex-col gap-2">
+      <Label>QR code{count > 1 ? "s" : ""}</Label>
+      {ids.length === 0 ? (
+        <button
+          type="button"
+          onClick={() => set({ tagIds: Array.from({ length: count }, () => newQrTagId()) })}
+          className="flex h-11 items-center justify-center gap-1.5 rounded-lg border border-dashed border-border px-3 text-sm font-medium text-muted-foreground transition-colors hover:border-primary hover:text-primary"
+        >
+          <QrIcon className="h-4 w-4" />
+          {count > 1 ? `Create ${count} QR codes to print` : "Create QR code to print"}
+        </button>
+      ) : (
+        <div className="rounded-xl border border-border bg-background/50 p-3">
+          <p className="mb-3 text-xs text-muted-foreground text-pretty">
+            {count > 1
+              ? `${count} unique QR codes will be bound — one per spool. Print them and stick one on each spool.`
+              : "A QR code will be bound to this spool when you save. Print it and stick it on the spool."}
+          </p>
+          {ids.length === 1 ? (
+            <div className="flex flex-wrap items-center gap-4">
+              <QrCode id={ids[0]} size={96} />
+              <div className="flex flex-1 flex-wrap items-center gap-2">
+                <QrPrintButton labels={labels} />
+                <RemoveTagsButton onClick={remove} />
+              </div>
+            </div>
+          ) : (
+            <>
+              <div className="grid grid-cols-3 gap-3 sm:grid-cols-4">
+                {ids.map((id, i) => (
+                  <div key={id} className="flex flex-col items-center gap-1">
+                    <QrCode id={id} size={72} />
+                    <span className="text-[11px] text-muted-foreground">#{i + 1}</span>
+                  </div>
+                ))}
+              </div>
+              <div className="mt-3 flex flex-wrap items-center gap-2">
+                <QrPrintButton labels={labels} />
+                <RemoveTagsButton onClick={remove} />
+              </div>
+            </>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
+
+function RemoveTagsButton({ onClick }: { onClick: () => void }) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className="flex h-9 items-center gap-1.5 rounded-lg border border-border px-3 text-sm font-medium text-muted-foreground transition-colors hover:bg-secondary"
+    >
+      <X className="h-4 w-4" /> Remove
+    </button>
+  )
+}
+
 /** Full editor for a spool's attributes. Controlled via value/onChange. */
 export function SpoolForm({
   value,
@@ -164,6 +288,7 @@ export function SpoolForm({
   showProfiles = false,
   showQuantity = false,
   showBarcode = false,
+  showTag = false,
 }: {
   value: SpoolDraft
   onChange: (d: SpoolDraft) => void
@@ -173,9 +298,18 @@ export function SpoolForm({
   showQuantity?: boolean
   /** Show the "Scan barcode" action and apply matched profiles (create flows). */
   showBarcode?: boolean
+  /**
+   * Show the "Create QR code" affordance so the user can mint + print a QR for
+   * this spool during creation (single-spool flows only). The binding is saved
+   * automatically when the spool is created.
+   */
+  showTag?: boolean
 }) {
   const { state, dispatch } = useStore()
   const set = (patch: Partial<SpoolDraft>) => onChange({ ...value, ...patch })
+
+  // One QR per physical spool: for batch flows the code count tracks quantity.
+  const tagCount = showQuantity ? Math.max(1, Math.round(value.quantity ?? 1)) : 1
 
   const materials = allMaterials(state.settings.customMaterials)
   const brands = allBrands(state.settings.customBrands)
@@ -213,7 +347,7 @@ export function SpoolForm({
 
   /** Save the current draft as a reusable profile. */
   function saveProfile() {
-    const name = value.colorName ? `${value.brand} ${value.material} · ${value.colorName}` : `${value.brand} ${value.material}`
+    const name = value.colorName ? `${value.brand} ${value.material} �� ${value.colorName}` : `${value.brand} ${value.material}`
     dispatch({
       type: "ADD_PROFILE",
       profile: {
@@ -341,6 +475,8 @@ export function SpoolForm({
           {scanNote && <p className="text-xs text-muted-foreground">{scanNote}</p>}
         </div>
       )}
+
+      {showTag && <TagQrBlock value={value} set={set} count={tagCount} />}
 
       <div className="grid grid-cols-2 gap-4">
         <Field label="Material / type">

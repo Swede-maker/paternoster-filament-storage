@@ -1,15 +1,19 @@
 "use client"
 
-import { ArrowUp, ArrowDown, Home, Loader2, OctagonX, Play } from "lucide-react"
+import { ArrowUp, ArrowDown, Home, Loader2, OctagonX, Play, SlidersHorizontal, ChevronDown } from "lucide-react"
 import { useStore } from "@/lib/store"
 import { activeNode } from "@/lib/selectors"
 import { DEFAULT_RAMP_PCT, HOMING_DUTY_RATIO, homingDutyFor, moveDutyFor, approachDutyFor } from "@/lib/filament"
 import { Button } from "./ui/button"
 import { cn } from "@/lib/utils"
+import { usePersistentBoolean } from "@/lib/use-persistent"
 
 export function ManualControl() {
   const { state, dispatch } = useStore()
   const node = activeNode(state)
+  // Speed sliders start expanded; collapsing them frees sidebar space. The
+  // choice is remembered per device.
+  const [speedsOpen, setSpeedsOpen] = usePersistentBoolean("pax:manual:speedsOpen", true)
   const { currentShelf, homed, status } = node.machine
   const idle = status === "idle" && !state.job
   // A hardware unit whose Pi agent isn't connected cannot be commanded at all:
@@ -203,6 +207,34 @@ export function ManualControl() {
 
       {isCarousel && (
         <div className="mt-4 rounded-xl border border-border bg-background/50 p-3">
+          {/* Collapsible header: hides the four motor-speed sliders when you
+              don't need to tune them, freeing sidebar space. */}
+          <button
+            type="button"
+            onClick={() => setSpeedsOpen((v) => !v)}
+            aria-expanded={speedsOpen}
+            className="flex w-full items-center justify-between gap-2 text-left"
+          >
+            <span className="flex items-center gap-2 text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+              <SlidersHorizontal className="h-3.5 w-3.5" />
+              Motor Speed Settings
+            </span>
+            <ChevronDown
+              className={cn(
+                "h-4 w-4 text-muted-foreground transition-transform",
+                speedsOpen ? "rotate-180" : "rotate-0",
+              )}
+            />
+          </button>
+
+          {!speedsOpen && (
+            <p className="mt-2 text-[10px] leading-relaxed text-muted-foreground">
+              Soft start, motor, homing &amp; approach speeds hidden. Tap to adjust.
+            </p>
+          )}
+
+          {speedsOpen && (
+          <>
           {/* The "Carousel Speed" (seconds-per-shelf) slider used to sit here. It
               is gone: speed is set directly by the PWM duty slider, which is the
               single source of truth for how fast the motor turns. Two controls for
@@ -383,6 +415,8 @@ export function ManualControl() {
               </>
             )}
           </p>
+          </>
+          )}
         </div>
       )}
 

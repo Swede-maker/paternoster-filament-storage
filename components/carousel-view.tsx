@@ -75,6 +75,19 @@ export function CarouselView({
 
   const canChangeShelf = node.machine.homed && node.machine.status === "idle" && !state.job
 
+  // Shelf-sensor lamp state. Prefer the REAL reading: a connected hardware node
+  // reports the physical inductive/NPN sensor level over the wire (the `sensor`
+  // event → machine.sensor), so when that is known we show exactly what the
+  // GPIO pin sees. Only when there is no live hardware reading (simulated node,
+  // or link down → sensor reset to null) do we fall back to inferring it from
+  // the eased position: metal is in the window when the carousel is homed and
+  // settled on a shelf, not mid-rotation or homing.
+  const settled = Math.abs(pos - currentShelf) < 0.06
+  const inferredSensing =
+    node.machine.homed && settled && node.machine.status !== "moving" && node.machine.status !== "homing"
+  const sensing =
+    node.driver === "hardware" && node.machine.sensor != null ? node.machine.sensor : inferredSensing
+
   const base = Math.round(pos)
   const offsets = [-2, -1, 0, 1, 2]
 
@@ -92,6 +105,17 @@ export function CarouselView({
         className="pointer-events-none absolute inset-x-6 top-1/2 z-20 -translate-y-1/2 rounded-2xl border-2 border-primary/70 shadow-[0_0_30px_rgba(80,150,255,0.15)]"
         style={{ height: ROW_HEIGHT - 12 }}
       />
+
+      {/* Shelf-sensor indicator, tucked just inside the top-left of the access
+          window (above the "Shelf N" label), matching the reference. Lights
+          amber when the inductive sensor is on a shelf; a hollow ring when
+          nothing is detected (mid-move / not homed). */}
+      <div
+        className="pointer-events-none absolute left-9 z-30"
+        style={{ top: `calc(50% - ${(ROW_HEIGHT - 12) / 2}px + 10px)` }}
+      >
+        <SensorLight on={sensing} />
+      </div>
 
       {/* Scrolling shelves */}
       <div className="absolute inset-0">
@@ -221,6 +245,26 @@ export function CarouselView({
         label="Next shelf"
       />
     </div>
+  )
+}
+
+/**
+ * Small status lamp for the single-shelf inductive sensor. Solid amber with a
+ * soft glow when detecting metal (`on`); a thin hollow ring otherwise.
+ */
+function SensorLight({ on }: { on: boolean }) {
+  return (
+    <span
+      role="img"
+      aria-label={on ? "Shelf sensor: shelf detected" : "Shelf sensor: no shelf detected"}
+      title={on ? "Sensor: shelf detected" : "Sensor: no shelf detected"}
+      className={cn(
+        "block h-7 w-7 rounded-full border-2 transition-all duration-200",
+        on
+          ? "border-warning bg-warning shadow-[0_0_14px_3px_var(--warning)]"
+          : "border-muted-foreground/50 bg-card/40",
+      )}
+    />
   )
 }
 

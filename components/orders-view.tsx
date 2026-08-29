@@ -1,16 +1,37 @@
 "use client"
 
 import { useState } from "react"
-import { Plus, X, Trash2, PackageOpen, ShoppingCart, ChevronDown } from "lucide-react"
+import { Plus, X, Trash2, PackageOpen, ShoppingCart, ChevronDown, ExternalLink, Store, Pencil } from "lucide-react"
 import { useStore } from "@/lib/store"
 import { useFlow } from "./flow-controller"
 import { newId, densityFor, formatGrams, DEFAULT_DIAMETER } from "@/lib/filament"
-import type { FilamentOrder, OrderItem } from "@/lib/types"
+import type { FilamentOrder, OrderItem, OrderStore } from "@/lib/types"
 import { SpoolDisc, discColor2 } from "./spool"
 import { Button } from "./ui/button"
-import { Input } from "./ui/field"
+import { Field, Input } from "./ui/field"
 import { SpoolForm, emptyDraft, type SpoolDraft } from "./spool-form"
 import { Dialog, DialogHeader, DialogBody, DialogFooter } from "./ui/dialog"
+
+/**
+ * Best-effort normalise a user-typed shop URL so quick-launch always opens a
+ * valid absolute link: add https:// when no scheme was given, and reject input
+ * we can't turn into a URL.
+ */
+function normalizeStoreUrl(raw: string): string | null {
+  const trimmed = raw.trim()
+  if (!trimmed) return null
+  const withScheme = /^https?:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`
+  try {
+    return new URL(withScheme).toString()
+  } catch {
+    return null
+  }
+}
+
+/** Open a saved store in a new tab (works from inside the v0 preview iframe too). */
+function openStore(url: string) {
+  window.open(url, "_blank", "noopener,noreferrer")
+}
 
 /** Convert a draft (create form) into an order line item. */
 function draftToItem(draft: SpoolDraft): OrderItem {
@@ -74,6 +95,8 @@ export function OrdersView() {
           Build a cart of filament you&apos;ve ordered, then receive it straight into storage when the box arrives.
         </p>
       </header>
+
+      <StoreLinks />
 
       <div className="mb-6 flex gap-2">
         <Input
@@ -222,6 +245,211 @@ function OrderCard({ order }: { order: FilamentOrder }) {
       )}
 
       <AddItemDialog orderId={order.id} open={addOpen} onClose={() => setAddOpen(false)} />
+    </li>
+  )
+}
+
+/**
+ * Quick-launch strip of saved shops. Each button opens the store's site in a new
+ * tab so you can reorder filament; a "Manage" button opens the editor for
+ * adding, renaming, relinking, or removing stores.
+ */
+function StoreLinks() {
+  const { state } = useStore()
+  const stores = state.settings.stores ?? []
+  const [manageOpen, setManageOpen] = useState(false)
+
+  return (
+    <section className="mb-6" aria-label="Saved stores">
+      <div className="mb-2 flex items-center justify-between">
+        <h2 className="flex items-center gap-1.5 text-sm font-medium text-muted-foreground">
+          <Store className="h-4 w-4" /> Stores
+        </h2>
+        <Button variant="ghost" size="sm" onClick={() => setManageOpen(true)}>
+          <Pencil className="h-3.5 w-3.5" /> Manage
+        </Button>
+      </div>
+
+      {stores.length === 0 ? (
+        <button
+          type="button"
+          onClick={() => setManageOpen(true)}
+          className="flex w-full items-center justify-center gap-2 rounded-xl border border-dashed border-border bg-background/40 px-4 py-4 text-sm text-muted-foreground transition-colors hover:border-primary/50 hover:text-foreground"
+        >
+          <Plus className="h-4 w-4" /> Add a shop you order filament from
+        </button>
+      ) : (
+        <div className="flex flex-wrap gap-2">
+          {stores.map((s) => (
+            <button
+              key={s.id}
+              type="button"
+              onClick={() => openStore(s.url)}
+              className="inline-flex items-center gap-1.5 rounded-lg border border-border bg-background/60 px-3 py-2 text-sm font-medium text-foreground transition-colors hover:border-primary/50 hover:bg-primary/5"
+              title={s.url}
+            >
+              <ExternalLink className="h-3.5 w-3.5 text-muted-foreground" />
+              {s.name}
+            </button>
+          ))}
+        </div>
+      )}
+
+      <ManageStoresDialog open={manageOpen} onClose={() => setManageOpen(false)} />
+    </section>
+  )
+}
+
+function ManageStoresDialog({ open, onClose }: { open: boolean; onClose: () => void }) {
+  const { state, dispatch } = useStore()
+  const stores = state.settings.stores ?? []
+  const [name, setName] = useState("")
+  const [url, setUrl] = useState("")
+  const [error, setError] = useState<string | null>(null)
+
+  function addStore() {
+    const normalized = normalizeStoreUrl(url)
+    if (!name.trim()) {
+      setError("Give the store a name.")
+      return
+    }
+    if (!normalized) {
+      setError("Enter a valid website address.")
+      return
+    }
+    dispatch({ type: "ADD_STORE", store: { id: newId("store"), name: name.trim(), url: normalized } })
+    setName("")
+    setUrl("")
+    setError(null)
+  }
+
+  return (
+    <Dialog open={open} onClose={onClose}>
+      <DialogHeader
+        icon={<Store className="h-5 w-5" />}
+        title="Saved stores"
+        description="Quick links to the shops you buy filament from."
+      />
+      <DialogBody>
+        <div className="space-y-4">
+          {stores.length > 0 && (
+            <ul className="space-y-2">
+              {stores.map((s) => (
+                <StoreRow key={s.id} store={s} />
+              ))}
+            </ul>
+          )}
+
+          <div className="space-y-3 rounded-lg border border-border bg-background/40 p-3">
+            <span className="text-sm font-medium text-foreground">Add a store</span>
+            <Field label="Name">
+              <Input
+                value={name}
+                onChange={(e) => setName(e.target.value)}
+                placeholder="e.g. Amazon"
+                aria-label="Store name"
+              />
+            </Field>
+            <Field label="Website">
+              <Input
+                value={url}
+                onChange={(e) => setUrl(e.target.value)}
+                placeholder="e.g. amazon.com"
+                aria-label="Store URL"
+                inputMode="url"
+                spellCheck={false}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" && !e.nativeEvent.isComposing && e.keyCode !== 229) addStore()
+                }}
+              />
+            </Field>
+            {error && <p className="text-xs text-destructive">{error}</p>}
+            <Button onClick={addStore} className="w-full">
+              <Plus className="h-4 w-4" /> Add store
+            </Button>
+          </div>
+        </div>
+      </DialogBody>
+      <DialogFooter>
+        <Button variant="ghost" onClick={onClose}>
+          Done
+        </Button>
+      </DialogFooter>
+    </Dialog>
+  )
+}
+
+/** A single saved store inside the manage dialog: inline rename + relink + delete. */
+function StoreRow({ store }: { store: OrderStore }) {
+  const { dispatch } = useStore()
+  const [editing, setEditing] = useState(false)
+  const [name, setName] = useState(store.name)
+  const [url, setUrl] = useState(store.url)
+  const [error, setError] = useState<string | null>(null)
+
+  function save() {
+    const normalized = normalizeStoreUrl(url)
+    if (!name.trim() || !normalized) {
+      setError("Enter a name and a valid website.")
+      return
+    }
+    dispatch({ type: "UPDATE_STORE", id: store.id, changes: { name: name.trim(), url: normalized } })
+    setError(null)
+    setEditing(false)
+  }
+
+  if (editing) {
+    return (
+      <li className="space-y-2 rounded-lg border border-primary/40 bg-background/60 p-3">
+        <Input value={name} onChange={(e) => setName(e.target.value)} aria-label="Store name" className="h-9" />
+        <Input
+          value={url}
+          onChange={(e) => setUrl(e.target.value)}
+          aria-label="Store URL"
+          inputMode="url"
+          spellCheck={false}
+          className="h-9"
+        />
+        {error && <p className="text-xs text-destructive">{error}</p>}
+        <div className="flex justify-end gap-2">
+          <Button variant="ghost" size="sm" onClick={() => setEditing(false)}>
+            Cancel
+          </Button>
+          <Button size="sm" onClick={save}>
+            Save
+          </Button>
+        </div>
+      </li>
+    )
+  }
+
+  return (
+    <li className="flex items-center gap-2 rounded-lg border border-border bg-background/60 p-3">
+      <ExternalLink className="h-4 w-4 shrink-0 text-muted-foreground" />
+      <div className="min-w-0 flex-1">
+        <p className="truncate text-sm font-medium text-foreground">{store.name}</p>
+        <p className="truncate font-mono text-xs text-muted-foreground">{store.url}</p>
+      </div>
+      <button
+        type="button"
+        onClick={() => {
+          setName(store.name)
+          setUrl(store.url)
+          setEditing(true)
+        }}
+        aria-label={`Edit ${store.name}`}
+        className="flex h-8 w-8 items-center justify-center rounded-md text-muted-foreground transition-colors hover:text-foreground"
+      >
+        <Pencil className="h-4 w-4" />
+      </button>
+      <button
+        type="button"
+        onClick={() => dispatch({ type: "REMOVE_STORE", id: store.id })}
+        aria-label={`Delete ${store.name}`}
+        className="flex h-8 w-8 items-center justify-center rounded-md text-muted-foreground transition-colors hover:text-destructive"
+      >
+        <Trash2 className="h-4 w-4" />
+      </button>
     </li>
   )
 }

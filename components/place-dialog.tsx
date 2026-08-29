@@ -45,7 +45,7 @@ export function PlaceDialog({ open, onClose }: { open: boolean; onClose: () => v
             Storage is full. Remove a spool before adding a new one.
           </p>
         ) : (
-          <SpoolForm value={draft} onChange={setDraft} showProfiles showQuantity showBarcode />
+          <SpoolForm value={draft} onChange={setDraft} showProfiles showQuantity showBarcode showTag />
         )}
       </DialogBody>
       <DialogFooter>

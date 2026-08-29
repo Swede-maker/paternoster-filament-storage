@@ -144,6 +144,12 @@ export function NodeConnection() {
             // Real sensor crossing during motion — always authoritative.
             dispatch({ type: "NODE_POS", nodeId, currentShelf: ev.shelf })
             break
+          case "sensor":
+            // Live level of the physical shelf proximity sensor (GPIO), pushed
+            // whenever it changes and once on connect. Drives the real-time
+            // sensor lamp on the carousel.
+            dispatch({ type: "NODE_SENSOR", nodeId, on: ev.on })
+            break
           case "arrived":
             if (conn) {
               conn.commandActive = false

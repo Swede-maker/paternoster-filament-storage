@@ -8,6 +8,7 @@ import { newId } from "@/lib/filament"
 import type { AppState } from "@/lib/types"
 import type { ActiveJob, Printer, QueueItem, Spool } from "@/lib/types"
 import type { SpoolDraft } from "./spool-form"
+import { draftToSpoolFields } from "./spool-form"
 
 /** A storage location qualified by which node (paternoster unit) it lives in. */
 export interface NodeLocation {
@@ -225,17 +226,18 @@ export function FlowProvider({ children }: { children: ReactNode }) {
         // active section) — including a library, which auto-placement otherwise
         // skips. `quantity` is a form-only field and never stored on a spool.
         const count = Math.max(1, Math.round(draftSpool.quantity ?? 1))
-        const { quantity: _q, ...spoolFields } = draftSpool
         setDraft((prev) => {
           const created: PendingItem[] = []
           for (let n = 0; n < count; n++) {
-            const spool: Spool = { id: newId("spool"), createdAt: Date.now(), ...spoolFields }
+            // Each physical spool in a batch gets its OWN minted QR/tag id (the
+            // Nth of draft.tagIds), so every spool is individually scannable.
+            const spool: Spool = { id: newId("spool"), createdAt: Date.now(), ...draftToSpoolFields(draftSpool, n) }
             // Register the spool immediately so it exists during placement.
             dispatch({ type: "UPSERT_SPOOL", spool })
             const reserved = [...prev.inItems, ...created].map((i) => ({ nodeId: i.nodeId, shelf: i.shelf, slot: i.slot }))
             const dest = pickDestination(state, spool.grams, reserved, preferredNodeId, spool.containerId)
             if (!dest) break
-            created.push({ spool, nodeId: dest.nodeId, shelf: dest.shelf, slot: dest.slot, grams: spoolFields.grams, isNew: true })
+            created.push({ spool, nodeId: dest.nodeId, shelf: dest.shelf, slot: dest.slot, grams: spool.grams, isNew: true })
           }
           if (created.length === 0) return prev
           return { ...prev, view: "in", inItems: [...prev.inItems, ...created] }

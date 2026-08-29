@@ -1,14 +1,16 @@
 "use client"
 
 import { useEffect, useState } from "react"
-import { Loader2, CheckCircle2, ArrowUpCircle, ArrowDownCircle, MapPin } from "lucide-react"
+import { Loader2, CheckCircle2, ArrowUpCircle, ArrowDownCircle, MapPin, Layers, QrCode, ScanLine } from "lucide-react"
 import { useStore } from "@/lib/store"
 import { Button } from "./ui/button"
 import { Input, Field } from "./ui/field"
 import { SpoolDisc, discColor2 } from "./spool"
 import { formatGrams, isLightColor } from "@/lib/filament"
 import { printerSlotLabel, shelfLabel, getNode } from "@/lib/selectors"
-import type { Printer, StorageNode } from "@/lib/types"
+import { findBinding, shortTagId } from "@/lib/tags"
+import { TagScanner } from "./tag-scanner"
+import type { Printer, Spool, StorageNode } from "@/lib/types"
 
 /**
  * Full-screen operation overlay shown whenever a job is running. Displays the
@@ -19,6 +21,11 @@ export function MotionOverlay() {
   const { state, dispatch } = useStore()
   const job = state.job
   const [grams, setGrams] = useState<string>("")
+  // Scan-to-confirm state for disambiguating identical spools (see below).
+  const [scanOpen, setScanOpen] = useState(false)
+  const [scanError, setScanError] = useState<string | null>(null)
+  // Clear any stale scan warning whenever we advance to a new stop.
+  useEffect(() => setScanError(null), [job?.currentIndex])
 
   const item = job?.items[job.currentIndex] ?? null
   // The overlay follows the node that hosts the current job item.
@@ -64,8 +71,77 @@ export function MotionOverlay() {
   const step = job.currentIndex + 1
   const isStore = job.mode === "store" || job.mode === "place"
 
+  // --- Identical-spool disambiguation ---------------------------------------
+  // When several physically identical spools (same material + colour) are being
+  // stored in one job, the operator can't tell which one a given slot wants. We
+  // detect that here, surface the expected spool's QR id, and offer a scan that
+  // auto-corrects the plan so the scanned spool takes the current slot.
+  const sig = (s: Spool) =>
+    `${s.material}|${(s.color || "").toLowerCase()}|${(s.color2 || "").toLowerCase()}|${(s.colorName || "").trim().toLowerCase()}`
+  const group =
+    isStore && spool
+      ? job.items.filter((it) => {
+          if (it.done) return false
+          const s = state.spools[it.spoolId]
+          return s ? sig(s) === sig(spool) : false
+        })
+      : []
+  const expectedTagId = spool?.tagId
+  // Only caution when the operator actually has a way to tell the spools apart:
+  // more than one indistinguishable spool is still unplaced AND this spool
+  // carries a QR/RFID tag. If tags aren't in use there's no ID to verify, so we
+  // stay out of the way entirely.
+  const ambiguous = group.length > 1 && !!expectedTagId
+  const canScan = ambiguous
+
+  const commitStore = () => {
+    const g = Number.parseInt(grams)
+    dispatch({ type: "CONFIRM_STOP", grams: Number.isFinite(g) ? Math.max(0, g) : undefined })
+  }
+
+  // Resolve a raw scan to a spool id: prefer a direct spool-tag match among the
+  // job's spools, then fall back to a stored binding.
+  const resolveScannedSpool = (scanned: string): string | null => {
+    const direct = job.items.find((it) => state.spools[it.spoolId]?.tagId === scanned)
+    if (direct) return direct.spoolId
+    const b = findBinding(state, scanned)
+    return b?.target.kind === "spool" ? b.target.spoolId : null
+  }
+
+  const handleConfirmScan = (scanned: string) => {
+    setScanOpen(false)
+    if (!item) return
+    const sid = resolveScannedSpool(scanned)
+    if (!sid) {
+      setScanError(`QR ${shortTagId(scanned)} isn't recognised. Scan one of the spools from this batch.`)
+      return
+    }
+    // Right spool already — just store it.
+    if (sid === item.spoolId) {
+      setScanError(null)
+      commitStore()
+      return
+    }
+    // A different but identical spool still waiting in this job → auto-correct
+    // so the one in hand takes this slot, then store.
+    const scannedSpool = state.spools[sid]
+    const inGroup =
+      !!scannedSpool &&
+      !!spool &&
+      sig(scannedSpool) === sig(spool) &&
+      job.items.some((it) => !it.done && it.spoolId === sid)
+    if (inGroup) {
+      setScanError(null)
+      dispatch({ type: "SWAP_JOB_SPOOL", scannedSpoolId: sid })
+      commitStore()
+      return
+    }
+    setScanError(`That spool (QR ${shortTagId(scanned)}) isn't one of the spools left in this batch.`)
+  }
+
   return (
-    <div className="pointer-events-none fixed inset-x-0 bottom-0 z-50 flex justify-center p-3 pb-[max(0.75rem,env(safe-area-inset-bottom))]">
+    <>
+      <div className="pointer-events-none fixed inset-x-0 bottom-0 z-50 flex justify-center p-3 pb-[max(0.75rem,env(safe-area-inset-bottom))]">
       <div className="pointer-events-auto max-h-[58vh] w-full max-w-md overflow-y-auto rounded-2xl border border-primary/30 bg-card/95 p-5 shadow-2xl backdrop-blur-md scrollbar-thin lg:max-h-[85vh]">
         {/* progress */}
         <div className="mb-4 flex items-center justify-between text-xs text-muted-foreground">
@@ -166,6 +242,30 @@ export function MotionOverlay() {
                   </p>
                 )
               })()}
+            {ambiguous && (
+              <div className="mb-4 rounded-xl border border-warning/40 bg-warning/5 p-3">
+                <p className="flex items-center gap-2 text-sm font-medium text-foreground">
+                  <Layers className="h-4 w-4 text-warning" />
+                  {group.length} identical spools left in this batch
+                </p>
+                <p className="mt-1 text-xs text-muted-foreground text-pretty">
+                  They look the same, so make sure you grab the right one.
+                  {expectedTagId && (
+                    <>
+                      {" "}
+                      This slot expects the spool labelled{" "}
+                      <span className="font-mono font-semibold text-foreground">QR {shortTagId(expectedTagId)}</span>.
+                    </>
+                  )}
+                </p>
+                {canScan && (
+                  <Button variant="outline" size="sm" className="mt-2 w-full" onClick={() => setScanOpen(true)}>
+                    <ScanLine className="h-4 w-4" /> Scan spool to confirm
+                  </Button>
+                )}
+                {scanError && <p className="mt-2 text-xs font-medium text-destructive text-pretty">{scanError}</p>}
+              </div>
+            )}
             {isStore && (
               <Field label="Update remaining weight (optional)" className="mb-4">
                 <div className="flex items-center gap-2">
@@ -185,13 +285,11 @@ export function MotionOverlay() {
             )}
             <Button
               size="lg"
+              variant={ambiguous ? "outline" : "primary"}
               className="w-full"
-              onClick={() => {
-                const g = Number.parseInt(grams)
-                dispatch({ type: "CONFIRM_STOP", grams: Number.isFinite(g) ? Math.max(0, g) : undefined })
-              }}
+              onClick={commitStore}
             >
-              <CheckCircle2 className="h-5 w-5" /> Confirm store
+              <CheckCircle2 className="h-5 w-5" /> {ambiguous ? "Confirm without scanning" : "Confirm store"}
             </Button>
           </div>
         )}
@@ -216,8 +314,17 @@ export function MotionOverlay() {
         >
           Cancel operation
         </button>
+        </div>
       </div>
-    </div>
+
+      <TagScanner
+        open={scanOpen}
+        title="Scan this spool"
+        description="Point the camera at the spool's QR label, or use a wireless reader, to confirm which spool goes in this slot."
+        onScan={handleConfirmScan}
+        onClose={() => setScanOpen(false)}
+      />
+    </>
   )
 }
 

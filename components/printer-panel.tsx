@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useState } from "react"
 import useSWR from "swr"
-import { Plus, Trash2, Printer as PrinterIcon, Wifi, WifiOff, Loader2, Flame } from "lucide-react"
+import { Plus, Trash2, Pencil, Printer as PrinterIcon, Wifi, WifiOff, Loader2, Flame, ChevronDown } from "lucide-react"
 import { useStore } from "@/lib/store"
 import { cn } from "@/lib/utils"
 import { activePrinter } from "@/lib/selectors"
@@ -18,6 +18,7 @@ import { SpoolDisc, discColor2 } from "./spool"
 import { AddPrinterDialog } from "./add-printer-dialog"
 import { BambuCloudSignIn } from "./bambu-cloud-sign-in"
 import { FilamentUsedCard } from "./filament-used-card"
+import { usePersistentBoolean } from "@/lib/use-persistent"
 import type { Printer, Spool } from "@/lib/types"
 
 export function PrinterPanel({
@@ -34,6 +35,11 @@ export function PrinterPanel({
 }) {
   const { state, dispatch } = useStore()
   const [addOpen, setAddOpen] = useState(false)
+  // When set, the printer dialog opens in EDIT mode for this printer.
+  const [editPrinter, setEditPrinter] = useState<Printer | null>(null)
+  // Collapse the printer section (selector + AMS grid) to reclaim space; the
+  // title bar stays. Starts open and is remembered per device.
+  const [open, setOpen] = usePersistentBoolean("pax:home:printersOpen", true)
   const printer = activePrinter(state)
 
   function handleSlot(p: Printer, index: number) {
@@ -46,51 +52,76 @@ export function PrinterPanel({
     <div className="flex flex-col gap-4 lg:min-h-0">
       <FilamentUsedCard />
       <section className="flex flex-col rounded-2xl border border-border bg-card p-4 lg:min-h-0">
-      <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
-        <h2 className="text-base font-semibold">AMS / Toolchanger Status</h2>
-        <div className="flex items-center gap-2">
-          {/* Printer selector */}
-          <div className="flex max-w-full items-center gap-1 overflow-x-auto scrollbar-thin">
-            {state.printers.map((p) => (
-              <button
-                key={p.id}
-                type="button"
-                onClick={() => dispatch({ type: "SET_ACTIVE_PRINTER", id: p.id })}
-                className={cn(
-                  "shrink-0 rounded-lg border px-3 py-1.5 text-sm font-medium transition-colors",
-                  p.id === state.activePrinterId
-                    ? "border-primary bg-primary/15 text-primary"
-                    : "border-border text-muted-foreground hover:text-foreground",
-                )}
-              >
-                {p.name}
-              </button>
-            ))}
-          </div>
-          <Button size="sm" variant="outline" onClick={() => setAddOpen(true)}>
-            <Plus className="h-4 w-4" /> Add printer
-          </Button>
+      <div className={cn("flex flex-wrap items-center justify-between gap-2", open && "mb-3")}>
+        <div className="flex items-center gap-1.5">
+          {/* Chevron toggles the whole printer section to free up space. */}
+          <button
+            type="button"
+            onClick={() => setOpen((v) => !v)}
+            aria-expanded={open}
+            aria-label={open ? "Hide printers" : "Show printers"}
+            className="flex h-7 w-7 items-center justify-center rounded-md text-muted-foreground transition-colors hover:text-foreground"
+          >
+            <ChevronDown className={cn("h-4 w-4 transition-transform", open ? "rotate-180" : "rotate-0")} />
+          </button>
+          <h2 className="text-base font-semibold">AMS / Toolchanger Status</h2>
         </div>
+        {open && (
+          <div className="flex items-center gap-2">
+            {/* Printer selector */}
+            <div className="flex max-w-full items-center gap-1 overflow-x-auto scrollbar-thin">
+              {state.printers.map((p) => (
+                <button
+                  key={p.id}
+                  type="button"
+                  onClick={() => dispatch({ type: "SET_ACTIVE_PRINTER", id: p.id })}
+                  className={cn(
+                    "shrink-0 rounded-lg border px-3 py-1.5 text-sm font-medium transition-colors",
+                    p.id === state.activePrinterId
+                      ? "border-primary bg-primary/15 text-primary"
+                      : "border-border text-muted-foreground hover:text-foreground",
+                  )}
+                >
+                  {p.name}
+                </button>
+              ))}
+            </div>
+            <Button size="sm" variant="outline" onClick={() => setAddOpen(true)}>
+              <Plus className="h-4 w-4" /> Add printer
+            </Button>
+          </div>
+        )}
       </div>
 
-      {!printer ? (
-        <EmptyPrinterState onAdd={() => setAddOpen(true)} />
-      ) : (
-        <PrinterCard
-          key={printer.id}
-          printer={printer}
-          spools={state.spools}
-          onSlot={handleSlot}
-          onRemove={() => {
-            if (confirm(`Remove "${printer.name}"? Spools loaded on it will be discarded.`)) {
-              dispatch({ type: "REMOVE_PRINTER", id: printer.id })
-            }
-          }}
-          queuedPrinterSlots={queuedPrinterSlots}
-        />
-      )}
+      {open &&
+        (!printer ? (
+          <EmptyPrinterState onAdd={() => setAddOpen(true)} />
+        ) : (
+          <PrinterCard
+            key={printer.id}
+            printer={printer}
+            spools={state.spools}
+            onSlot={handleSlot}
+            onEdit={() => setEditPrinter(printer)}
+            onRemove={() => {
+              if (confirm(`Remove "${printer.name}"? Spools loaded on it will be discarded.`)) {
+                dispatch({ type: "REMOVE_PRINTER", id: printer.id })
+              }
+            }}
+            queuedPrinterSlots={queuedPrinterSlots}
+          />
+        ))}
 
       <AddPrinterDialog open={addOpen} onClose={() => setAddOpen(false)} />
+      {/* Same dialog, edit mode — keyed by printer id so it re-mounts per target. */}
+      {editPrinter && (
+        <AddPrinterDialog
+          key={editPrinter.id}
+          open={!!editPrinter}
+          printer={editPrinter}
+          onClose={() => setEditPrinter(null)}
+        />
+      )}
       </section>
     </div>
   )
@@ -332,12 +363,14 @@ function PrinterCard({
   printer,
   spools,
   onSlot,
+  onEdit,
   onRemove,
   queuedPrinterSlots,
 }: {
   printer: Printer
   spools: Record<string, Spool>
   onSlot: (p: Printer, index: number) => void
+  onEdit: () => void
   onRemove: () => void
   queuedPrinterSlots?: number[]
 }) {
@@ -357,14 +390,22 @@ function PrinterCard({
 
   return (
     <div className="lg:min-h-0 lg:flex-1 lg:overflow-auto lg:scrollbar-thin">
-      <PrinterHeader printer={printer} onRemove={onRemove} />
+      <PrinterHeader printer={printer} onEdit={onEdit} onRemove={onRemove} />
       <PrinterLinkRow printer={printer} live={live} bambu={bambu} />
       <PrinterBody printer={printer} spools={spools} onSlot={onSlot} queuedPrinterSlots={queuedPrinterSlots} live={live} />
     </div>
   )
 }
 
-function PrinterHeader({ printer, onRemove }: { printer: Printer; onRemove: () => void }) {
+function PrinterHeader({
+  printer,
+  onEdit,
+  onRemove,
+}: {
+  printer: Printer
+  onEdit: () => void
+  onRemove: () => void
+}) {
   const kindLabel =
     printer.kind === "single" ? "Single Spool" : printer.kind === "ams" ? "AMS" : "Toolchanger"
   return (
@@ -374,13 +415,22 @@ function PrinterHeader({ printer, onRemove }: { printer: Printer; onRemove: () =
         <span className="font-medium text-foreground">{printer.name}</span>
         <span className="rounded-md bg-secondary px-2 py-0.5 text-xs">{kindLabel}</span>
       </div>
-      <button
-        type="button"
-        onClick={onRemove}
-        className="flex items-center gap-1 rounded-md px-2 py-1 text-xs text-muted-foreground transition-colors hover:text-destructive"
-      >
-        <Trash2 className="h-3.5 w-3.5" /> Remove
-      </button>
+      <div className="flex items-center gap-1">
+        <button
+          type="button"
+          onClick={onEdit}
+          className="flex items-center gap-1 rounded-md px-2 py-1 text-xs text-muted-foreground transition-colors hover:text-foreground"
+        >
+          <Pencil className="h-3.5 w-3.5" /> Edit
+        </button>
+        <button
+          type="button"
+          onClick={onRemove}
+          className="flex items-center gap-1 rounded-md px-2 py-1 text-xs text-muted-foreground transition-colors hover:text-destructive"
+        >
+          <Trash2 className="h-3.5 w-3.5" /> Remove
+        </button>
+      </div>
     </div>
   )
 }

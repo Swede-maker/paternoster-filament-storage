@@ -30,6 +30,9 @@ export function newTracker(): ConsumptionTracker {
 export interface Decrement {
   spoolId: string
   grams: number
+  /** Which printer extruded this filament, for per-printer statistics. */
+  printerId: string
+  printerName: string
 }
 
 /**
@@ -59,7 +62,7 @@ export function consumeFromMm(
   const spool = id ? spools[id] : null
   if (!spool) return null
   const grams = lengthToGrams(delta, spoolDiameter(spool, defaultDiameter), spoolDensity(spool))
-  return grams > 0 ? { spoolId: spool.id, grams } : null
+  return grams > 0 ? { spoolId: spool.id, grams, printerId: printer.id, printerName: printer.name } : null
 }
 
 /**
@@ -85,7 +88,7 @@ export function consumeFromBambu(
     if (!spool) continue
     const cap = spool.capacity && spool.capacity > 0 ? spool.capacity : tray.capacityG ?? 1000
     const grams = ((prev - tray.remainPct) / 100) * cap
-    if (grams > 0) out.push({ spoolId: spool.id, grams })
+    if (grams > 0) out.push({ spoolId: spool.id, grams, printerId: printer.id, printerName: printer.name })
   }
   return out
 }

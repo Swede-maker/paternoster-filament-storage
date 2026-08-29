@@ -1,4 +1,5 @@
-import type { AppState, NodeType, Spool, StorageLocation, StorageNode } from "./types"
+import type { AppState, NodeType, Printer, Spool, StorageLocation, StorageNode } from "./types"
+import { printerAmsUnits } from "./filament"
 
 export interface Stats {
   totalSlots: number
@@ -233,14 +234,28 @@ export function activePrinter(state: AppState) {
 
 /** Human-readable label for a printer slot index (AMS unit/slot or tool number). */
 export function printerSlotLabel(
-  printer: { kind: string; slotsPerAms: number; amsUnits: number; toolheads: number },
+  printer: Pick<Printer, "kind" | "ams" | "slotsPerAms" | "amsUnits" | "toolheads">,
   index: number,
 ): string {
   if (printer.kind === "single") return "Spool"
   if (printer.kind === "toolchanger") return `T${index + 1}`
-  const unit = Math.floor(index / printer.slotsPerAms) + 1
-  const slot = (index % printer.slotsPerAms) + 1
-  return `${unit}-${slot}`
+  // Walk the (possibly mixed-size, named) AMS units to find which unit this flat
+  // slot index falls in, and its position within that unit.
+  const units = printerAmsUnits(printer)
+  let remaining = index
+  for (let u = 0; u < units.length; u++) {
+    const unit = units[u]
+    if (remaining < unit.slots) {
+      const slot = remaining + 1
+      // A unit with a custom name (anything other than the default "AMS N")
+      // reads better as "Name · N"; otherwise keep the compact "unit-slot".
+      const isDefaultName = unit.name === `AMS ${u + 1}`
+      return isDefaultName ? `${u + 1}-${slot}` : `${unit.name} · ${slot}`
+    }
+    remaining -= unit.slots
+  }
+  // Index past the configured units (shouldn't happen) — fall back gracefully.
+  return `${index + 1}`
 }
 
 // ---------------------------------------------------------------------------

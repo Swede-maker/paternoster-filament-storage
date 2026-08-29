@@ -2,6 +2,7 @@ import "server-only"
 import { db } from "@/lib/db"
 import type { PersistedState } from "@/lib/types"
 import type { Decrement } from "./consumption"
+import { dayKey, upsertConsumptionBucket } from "@/lib/statistics"
 
 /**
  * Persist server-computed filament consumption to the shared system document,
@@ -57,23 +58,52 @@ export function applyConsumption(decrements: Decrement[]): ConsumptionResult | n
     const spools = state.spools ?? {}
     let applied = 0
 
-    // Merge decrements by spool so several trays hitting the same spool combine.
-    const byspool = new Map<string, number>()
-    for (const d of positive) byspool.set(d.spoolId, (byspool.get(d.spoolId) ?? 0) + d.grams)
+    // Merge decrements by spool so several trays hitting the same spool combine,
+    // keeping the printer identity (a loaded spool prints on one printer at a
+    // time) so per-printer statistics stay attributable.
+    const byspool = new Map<string, { grams: number; printerId: string; printerName: string }>()
+    for (const d of positive) {
+      const prev = byspool.get(d.spoolId)
+      byspool.set(d.spoolId, {
+        grams: (prev?.grams ?? 0) + d.grams,
+        printerId: d.printerId ?? prev?.printerId ?? "",
+        printerName: d.printerName ?? prev?.printerName ?? "",
+      })
+    }
 
-    for (const [spoolId, grams] of byspool) {
+    const today = dayKey()
+    let log = Array.isArray(state.consumptionLog) ? state.consumptionLog : []
+
+    for (const [spoolId, entry] of byspool) {
       const spool = spools[spoolId]
       if (!spool) continue // spool was deleted/unloaded since the poll — skip
       const before = typeof spool.grams === "number" ? spool.grams : 0
-      const after = Math.max(0, before - grams)
+      const after = Math.max(0, before - entry.grams)
       if (after === before) continue
       spool.grams = after
       // Count only the grams that actually came off the spool toward the tally,
       // so hitting an already-empty spool doesn't inflate the lifetime total.
-      applied += before - after
+      const usedG = before - after
+      applied += usedG
+      // Record the day's consumption for the Statistik charts (accurate, written
+      // even with no browser open). Attributed to the printer + this spool's
+      // material/color.
+      if (entry.printerId) {
+        log = upsertConsumptionBucket(log, {
+          day: today,
+          printerId: entry.printerId,
+          printerName: entry.printerName,
+          material: spool.material,
+          color: spool.color,
+          colorName: spool.colorName,
+          grams: usedG,
+        })
+      }
     }
 
     if (applied <= 0) return null
+
+    state.consumptionLog = log
 
     // Advance the lifetime/resettable usage counter (tolerate older docs).
     const usage = state.usage ?? { currentG: 0, since: Date.now(), archived: [] }

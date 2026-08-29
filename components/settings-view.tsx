@@ -22,18 +22,27 @@ import {
   Sun,
   Moon,
   Barcode as BarcodeIcon,
+  Nfc,
+  QrCode as QrIcon,
+  Printer as PrinterIcon,
+  Link2Off,
+  Package as PackageIcon,
 } from "lucide-react"
 import { useStore } from "@/lib/store"
 import { useTheme } from "@/lib/use-theme"
 import { cn } from "@/lib/utils"
-import { getStats, nodeSlotCount } from "@/lib/selectors"
+import { getStats, nodeSlotCount, shelfLabel } from "@/lib/selectors"
 import { newId, formatGrams } from "@/lib/filament"
-import type { Container, StorageNode } from "@/lib/types"
+import { newQrTagId, qrPayload, allBindings, describeTarget } from "@/lib/tags"
+import { QrPrintButton } from "./qr-print-button"
+import type { Container, StorageNode, TagBinding } from "@/lib/types"
 import { Button } from "./ui/button"
 import { Field, Input, Select, Checkbox } from "./ui/field"
 import { SpoolDisc, discColor2 } from "./spool"
 import { NumField } from "./spool-form"
+import { QrCode } from "./qr-code"
 import { BarcodeScanner } from "./barcode-scanner"
+import { ReaderManager } from "./reader-manager"
 import {
   draftFromNode,
   draftToConfig,
@@ -186,6 +195,17 @@ export function SettingsView() {
           <Stat label="Total slots" value={stats.totalSlots} />
           <Stat label="Printers" value={state.printers.length} />
         </dl>
+      </Section>
+
+      {/* RFID / QR tags */}
+      <Section icon={<Nfc className="h-5 w-5 text-primary" />} title="RFID / QR tags">
+        <p className="text-sm text-muted-foreground">
+          Print a QR code for each shelf so a phone camera can scan it (works on any phone). On Android you can also bind
+          physical NFC tags. Manage every bound tag below — rebind, or erase to reuse a tag.
+        </p>
+        <LocationQrManager />
+        <ReaderManager />
+        <TagManager />
       </Section>
 
       {/* Danger zone */}
@@ -923,6 +943,159 @@ function PresetList({
         </ul>
       )}
     </div>
+  )
+}
+
+/**
+ * Generate + print a QR code for a storage shelf. Picking a unit and shelf mints
+ * (or reuses) a stable tag id bound to that shelf and shows its printable QR.
+ */
+function LocationQrManager() {
+  const { state, dispatch } = useStore()
+  const [nodeId, setNodeId] = useState(state.nodes[0]?.id ?? "")
+  const [shelf, setShelf] = useState(0)
+
+  const node = state.nodes.find((n) => n.id === nodeId) ?? state.nodes[0]
+  const shelfCount = node?.slots.length ?? 0
+
+  // Reuse an existing shelf binding if one exists, else mint a fresh id.
+  const existing = allBindings(state).find(
+    (b) => b.target.kind === "shelf" && b.target.nodeId === node?.id && b.target.shelf === shelf,
+  )
+  const [minted, setMinted] = useState<string | null>(null)
+  const id = existing?.id ?? minted
+
+  function makeCode() {
+    if (!node) return
+    if (existing) return // already bound; QR shown below
+    const newIdVal = newQrTagId()
+    setMinted(newIdVal)
+    dispatch({
+      type: "BIND_TAG",
+      binding: { id: newIdVal, target: { kind: "shelf", nodeId: node.id, shelf }, boundAt: Date.now(), via: "qr" },
+    })
+  }
+
+  if (!node) {
+    return <p className="text-sm text-muted-foreground">Add a storage unit first to create location QR codes.</p>
+  }
+
+  const label = `${node.name} · ${shelfLabel(node, shelf)}`
+
+  return (
+    <div className="rounded-xl border border-border bg-background/50 p-3">
+      <h3 className="flex items-center gap-2 text-sm font-semibold">
+        <MapPin className="h-4 w-4 text-muted-foreground" /> Location QR codes
+      </h3>
+      <div className="mt-3 grid grid-cols-1 gap-3 sm:grid-cols-2">
+        <Field label="Storage unit">
+          <Select
+            value={node.id}
+            onChange={(e) => {
+              setNodeId(e.target.value)
+              setShelf(0)
+              setMinted(null)
+            }}
+          >
+            {state.nodes.map((n) => (
+              <option key={n.id} value={n.id}>
+                {n.name}
+              </option>
+            ))}
+          </Select>
+        </Field>
+        <Field label="Shelf">
+          <Select
+            value={shelf}
+            onChange={(e) => {
+              setShelf(Number(e.target.value))
+              setMinted(null)
+            }}
+          >
+            {Array.from({ length: shelfCount }, (_, i) => (
+              <option key={i} value={i}>
+                {shelfLabel(node, i)}
+              </option>
+            ))}
+          </Select>
+        </Field>
+      </div>
+
+      {id ? (
+        <div className="mt-4 flex flex-col items-center gap-3">
+          <QrCode id={id} size={168} />
+          <p className="text-xs font-medium text-foreground">{label}</p>
+          <QrPrintButton labels={[{ contents: qrPayload(id), caption: label, sub: "Storage location" }]} />
+        </div>
+      ) : (
+        <Button size="sm" variant="outline" className="mt-3" onClick={makeCode}>
+          <QrIcon className="h-4 w-4" /> Create QR for {shelfLabel(node, shelf)}
+        </Button>
+      )}
+    </div>
+  )
+}
+
+/** List every bound tag with what it points at, plus per-tag erase (rebind is
+ *  done by scanning). Erasing frees the id so the physical tag can be reused. */
+function TagManager() {
+  const { state, dispatch } = useStore()
+  const bindings = allBindings(state)
+
+  if (bindings.length === 0) {
+    return (
+      <div className="rounded-xl border border-border bg-background/50 p-3">
+        <h3 className="flex items-center gap-2 text-sm font-semibold">
+          <Tags className="h-4 w-4 text-muted-foreground" /> Bound tags
+        </h3>
+        <p className="mt-2 text-xs text-muted-foreground">
+          No tags bound yet. Bind one from a spool&apos;s Edit dialog, the Scan tab, or create a location QR above.
+        </p>
+      </div>
+    )
+  }
+
+  return (
+    <div className="rounded-xl border border-border bg-background/50 p-3">
+      <h3 className="flex items-center gap-2 text-sm font-semibold">
+        <Tags className="h-4 w-4 text-muted-foreground" /> Bound tags
+        <span className="ml-auto text-xs font-normal text-muted-foreground">{bindings.length}</span>
+      </h3>
+      <ul className="mt-3 space-y-2">
+        {[...bindings]
+          .sort((a, b) => b.boundAt - a.boundAt)
+          .map((b) => (
+            <TagRow key={b.id} binding={b} onErase={() => dispatch({ type: "UNBIND_TAG", id: b.id })} />
+          ))}
+      </ul>
+    </div>
+  )
+}
+
+function TagRow({ binding, onErase }: { binding: TagBinding; onErase: () => void }) {
+  const { state } = useStore()
+  const info = describeTarget(state, binding.target)
+  const Icon = binding.target.kind === "spool" ? PackageIcon : binding.target.kind === "shelf" ? MapPin : PrinterIcon
+  return (
+    <li className="flex items-center gap-3 rounded-lg border border-border bg-card px-3 py-2">
+      <Icon className="h-4 w-4 shrink-0 text-muted-foreground" />
+      <div className="min-w-0 flex-1">
+        <p className="truncate text-sm font-medium text-foreground">{info.title}</p>
+        <p className="truncate text-xs text-muted-foreground">
+          {info.subtitle ? info.subtitle + " · " : ""}
+          <span className="font-mono">{binding.via === "nfc" ? "NFC" : "QR"}</span>
+        </p>
+      </div>
+      <button
+        type="button"
+        onClick={onErase}
+        aria-label="Erase tag binding"
+        title="Erase — frees the tag to be reused"
+        className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-secondary hover:text-destructive"
+      >
+        <Link2Off className="h-4 w-4" />
+      </button>
+    </li>
   )
 }
 

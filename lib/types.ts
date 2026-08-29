@@ -60,6 +60,13 @@ export interface Spool {
   /** Scanned barcode string associated with this spool, if any. */
   barcode?: string
   /**
+   * Stable id of the RFID/QR tag bound to this spool (see `Settings.tagBindings`
+   * and `TagBinding`). For an NFC tag this is the hardware serial number; for a
+   * printable QR it is the generated `PAX:<uuid>` value encoded in the code.
+   * Absent = no tag/QR is linked to this spool yet.
+   */
+  tagId?: string
+  /**
    * Optional "dry this filament" reminder. When set, an alert surfaces once
    * `setAt + days` has passed. The user can reset it (restart the countdown from
    * now) or clear it entirely. Absent = no reminder.
@@ -127,6 +134,49 @@ export interface FilamentOrder {
   name: string
   createdAt: number
   items: OrderItem[]
+  /** Optional link to a saved store this order was/should be placed with. */
+  storeId?: string
+}
+
+/**
+ * A saved shop the user buys filament from. Rendered as a quick-launch button in
+ * the Orders tab that opens `url` in a new browser tab (e.g. "Amazon").
+ */
+export interface OrderStore {
+  id: string
+  name: string
+  /** Absolute URL (normalised to include a scheme before saving). */
+  url: string
+}
+
+/**
+ * One day's aggregated filament consumption, keyed (in the log) by
+ * `day|printerId|material|color`. Written going forward as printers extrude, so
+ * the Statistik charts are built from real usage rather than estimates.
+ */
+export interface ConsumptionBucket {
+  /** Local calendar day, YYYY-MM-DD. */
+  day: string
+  printerId: string
+  printerName: string
+  material: string
+  /** Hex color of the filament. */
+  color: string
+  colorName: string
+  /** Grams consumed that day for this printer/material/color. */
+  grams: number
+}
+
+/**
+ * A once-per-day snapshot of overall storage fullness, powering the
+ * "storage usage over time" line chart. Deduped by `day`.
+ */
+export interface StorageSnapshot {
+  /** Local calendar day, YYYY-MM-DD. */
+  day: string
+  usedSlots: number
+  totalSlots: number
+  totalGrams: number
 }
 
 /**
@@ -147,6 +197,54 @@ export interface StorageLocation {
   slot: number
 }
 
+/**
+ * What a scanned RFID/QR tag points at. A tag is bound to exactly one of:
+ * - a spool (follows the physical spool as it moves around),
+ * - a shelf in a storage unit (scanning it shows that shelf's contents),
+ * - a printer slot / toolhead / AMS tray (a fixed spot on a machine).
+ *
+ * A whole single-shelf unit (a plain shelf or a library) is represented as its
+ * shelf 0, so "bind to this unit" and "bind to a shelf" share one kind.
+ */
+export type TagTarget =
+  | { kind: "spool"; spoolId: string }
+  | { kind: "shelf"; nodeId: string; shelf: number }
+  | { kind: "printerSlot"; printerId: string; slot: number }
+
+export type TagBindingVia = "nfc" | "qr" | "manual"
+
+/**
+ * A binding from a stable tag id to what it represents. Stored on
+ * `Settings.tagBindings` so it syncs across every device (the wall display sees
+ * a phone's scan immediately). The `id` is the NFC hardware serial number, or
+ * the `PAX:<uuid>` value encoded in a printable QR code.
+ */
+export interface TagBinding {
+  id: string
+  target: TagTarget
+  /** When the binding was created (ms epoch). */
+  boundAt: number
+  /** How the tag was first written, for display in the tag manager. */
+  via?: TagBindingVia
+}
+
+/**
+ * A paired wireless RFID/NFC reader (ESP32, Raspberry Pi, or similar). The
+ * `token` is a high-entropy shared secret the device is flashed with; the app
+ * subscribes to it to receive scans. Bindings themselves live in `tagBindings`,
+ * so a reader only ever reports a tag uid — no per-reader data model beyond this.
+ */
+export interface RfidReader {
+  id: string
+  /** Friendly name shown in the UI, e.g. "Workbench reader". */
+  name: string
+  /** Pairing token / channel id the device posts with. Treat as a secret. */
+  token: string
+  /** What kind of device it is, for the setup instructions shown in the app. */
+  kind: "esp32" | "pi" | "other"
+  createdAt: number
+}
+
 /** Where a spool currently lives. */
 export type SpoolPlacement =
   | { type: "storage"; shelf: number; slot: number }
@@ -154,13 +252,34 @@ export type SpoolPlacement =
 
 export type PrinterKind = "single" | "ams" | "toolchanger"
 
+/**
+ * A single AMS unit attached to a printer. Units can differ in size (e.g. a
+ * 4-slot AMS alongside a 1-slot AMS Lite / external spool) and carry a custom
+ * name the user can rename freely.
+ */
+export interface AmsUnit {
+  id: string
+  /** User-facing name, e.g. "AMS", "AMS Lite", "External". */
+  name: string
+  /** Number of filament slots in this unit (>= 1). */
+  slots: number
+}
+
 export interface Printer {
   id: string
   name: string
   kind: PrinterKind
-  /** AMS only: number of AMS units connected. */
+  /**
+   * AMS printers: the connected AMS units, each with its own slot count and
+   * custom name. When present this is the source of truth for slot layout; the
+   * legacy `amsUnits`/`slotsPerAms` fields are kept in sync (derived) so older
+   * call sites keep working. `migrate()` synthesises this for printers saved
+   * before mixed AMS support existed.
+   */
+  ams?: AmsUnit[]
+  /** AMS only: number of AMS units connected. Derived from `ams` when present. */
   amsUnits: number
-  /** AMS only: spools per AMS unit. */
+  /** AMS only: spools per AMS unit (legacy uniform value; see `ams`). */
   slotsPerAms: number
   /** Toolchanger only: number of toolheads. */
   toolheads: number
@@ -259,6 +378,15 @@ export interface Machine {
    * whenever `status` is not "stopped".
    */
   resumeStatus?: MachineStatus | null
+  /**
+   * Live level of the physical shelf proximity sensor, as last reported by the
+   * Pi agent over the wire (the `sensor` event). `true` = a shelf's metal flag
+   * is in the sensor window, `false` = nothing detected, `null`/undefined =
+   * unknown (no hardware link, or a simulated node). The carousel indicator
+   * shows this real reading when known and falls back to an inferred state
+   * otherwise.
+   */
+  sensor?: boolean | null
 }
 
 /**
@@ -322,8 +450,23 @@ export interface Settings {
   filamentProfiles?: FilamentProfile[]
   /** Scanned-barcode → saved-profile mappings, so a scan can prefill a spool. */
   barcodes?: { code: string; profileId: string }[]
+  /**
+   * RFID/QR tag bindings: each maps a stable tag id to the spool, shelf, or
+   * printer slot it represents. Synced across devices so a scan on a phone is
+   * reflected everywhere. Optional for backwards-compat with old saves.
+   */
+  tagBindings?: TagBinding[]
+  /**
+   * Paired wireless RFID/NFC readers (ESP32 / Raspberry Pi). Each holds a
+   * pairing token the physical device is flashed with; the app listens on that
+   * token so any browser — including iPhones, which can't read NFC on the web —
+   * can receive scans from the hardware reader.
+   */
+  readers?: RfidReader[]
   /** Incoming filament orders / carts waiting to be received into storage. */
   orders?: FilamentOrder[]
+  /** Saved shops (name + URL) shown as quick-launch buttons in the Orders tab. */
+  stores?: OrderStore[]
   /**
    * User-saved custom colors (name + hex) that appear as reusable swatches in
    * the spool editor, alongside the built-in presets. Optional for
@@ -571,6 +714,10 @@ export interface AppState {
   history: HistoryEvent[]
   /** Lifetime + resettable filament-consumption tracking. */
   usage: FilamentUsage
+  /** Per-day, per-printer/material/color consumption for the Statistik charts. */
+  consumptionLog: ConsumptionBucket[]
+  /** Once-per-day storage fullness snapshots for the storage-over-time chart. */
+  storageSnapshots: StorageSnapshot[]
 }
 
 /**
@@ -591,4 +738,8 @@ export interface PersistedState {
   history: HistoryEvent[]
   /** Lifetime + resettable filament-consumption tracking (shared + synced). */
   usage: FilamentUsage
+  /** Per-day consumption buckets for statistics (shared + synced). */
+  consumptionLog: ConsumptionBucket[]
+  /** Daily storage snapshots for statistics (shared + synced). */
+  storageSnapshots: StorageSnapshot[]
 }
