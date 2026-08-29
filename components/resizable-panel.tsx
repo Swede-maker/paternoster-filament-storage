@@ -1,7 +1,7 @@
 "use client"
 
-import { useCallback, useRef, type ReactNode } from "react"
-import { usePersistentNumber } from "@/lib/use-persistent"
+import { useCallback, useLayoutEffect, useRef, useState, type ReactNode } from "react"
+import { usePersistentBoolean, usePersistentNumber } from "@/lib/use-persistent"
 
 /**
  * Wraps a card/panel and lets the user drag its bottom edge to grow or shrink
@@ -10,7 +10,13 @@ import { usePersistentNumber } from "@/lib/use-persistent"
  * panel and scrolls internally if it overflows the chosen height, so nothing is
  * ever clipped out of reach.
  *
- * `defaultHeight` is the natural starting height; drag adjusts within
+ * With `autoFit`, the panel measures its content and sizes itself to show
+ * everything (clamped to [minHeight, maxHeight]) UNTIL the user drags the
+ * handle — after that the manual height wins and is remembered. This keeps
+ * variable-length cards (e.g. a shelf list that grows with more storage units)
+ * fully visible without the user having to resize them.
+ *
+ * `defaultHeight` is the fallback starting height; drag adjusts within
  * [minHeight, maxHeight]. Keyboard users can focus the handle and use the
  * arrow keys.
  */
@@ -20,6 +26,7 @@ export function ResizablePanel({
   minHeight = 160,
   maxHeight = 1200,
   label = "panel",
+  autoFit = false,
   children,
   className,
 }: {
@@ -28,11 +35,34 @@ export function ResizablePanel({
   minHeight?: number
   maxHeight?: number
   label?: string
+  autoFit?: boolean
   children: ReactNode
   className?: string
 }) {
   const [height, setHeight] = usePersistentNumber(storageKey, defaultHeight, minHeight, maxHeight)
+  // Once the user drags/keys the handle we stop auto-fitting and honor `height`.
+  const [manual, setManual] = usePersistentBoolean(`${storageKey}:manual`, false)
   const drag = useRef<{ startY: number; startH: number } | null>(null)
+
+  // Natural content height, measured when auto-fitting.
+  const contentRef = useRef<HTMLDivElement | null>(null)
+  const [measured, setMeasured] = useState<number | null>(null)
+  const clamp = useCallback((n: number) => Math.min(maxHeight, Math.max(minHeight, n)), [minHeight, maxHeight])
+
+  useLayoutEffect(() => {
+    if (!autoFit || manual) return
+    const el = contentRef.current
+    if (!el) return
+    const measure = () => setMeasured(el.scrollHeight)
+    measure()
+    const ro = new ResizeObserver(measure)
+    ro.observe(el)
+    return () => ro.disconnect()
+  }, [autoFit, manual])
+
+  const autoActive = autoFit && !manual
+  // +12px leaves room for the drag handle strip below the content.
+  const effectiveHeight = autoActive && measured != null ? clamp(measured + 12) : height
 
   const onPointerMove = useCallback(
     (e: PointerEvent) => {
@@ -54,42 +84,69 @@ export function ResizablePanel({
   const startDrag = useCallback(
     (e: React.PointerEvent) => {
       e.preventDefault()
-      drag.current = { startY: e.clientY, startH: height }
+      // Lock in the current (possibly auto-fit) height as the manual baseline.
+      if (!manual) {
+        setManual(true)
+        setHeight(Math.round(effectiveHeight))
+      }
+      drag.current = { startY: e.clientY, startH: Math.round(effectiveHeight) }
       window.addEventListener("pointermove", onPointerMove)
       window.addEventListener("pointerup", endDrag)
       document.body.style.cursor = "ns-resize"
       document.body.style.userSelect = "none"
     },
-    [height, onPointerMove, endDrag],
+    [manual, effectiveHeight, setManual, setHeight, onPointerMove, endDrag],
+  )
+
+  const nudge = useCallback(
+    (delta: number) => {
+      if (!manual) {
+        setManual(true)
+        setHeight(Math.round(effectiveHeight) + delta)
+      } else {
+        setHeight((h) => h + delta)
+      }
+    },
+    [manual, effectiveHeight, setManual, setHeight],
   )
 
   const onKeyDown = useCallback(
     (e: React.KeyboardEvent) => {
       if (e.key === "ArrowUp") {
         e.preventDefault()
-        setHeight((h) => h - 24)
+        nudge(-24)
       } else if (e.key === "ArrowDown") {
         e.preventDefault()
-        setHeight((h) => h + 24)
+        nudge(24)
       }
     },
-    [setHeight],
+    [nudge],
   )
 
+  // Double-click the handle to return to auto-fit (when enabled).
+  const onDoubleClick = useCallback(() => {
+    if (autoFit) setManual(false)
+  }, [autoFit, setManual])
+
   return (
-    <div className={`group/panel relative flex flex-col ${className ?? ""}`} style={{ height }}>
-      {/* The card fills the panel; its own content scrolls if taller. */}
-      <div className="min-h-0 flex-1 overflow-y-auto scrollbar-thin [&>*]:h-full">{children}</div>
+    <div className={`group/panel relative flex flex-col ${className ?? ""}`} style={{ height: effectiveHeight }}>
+      {/* The card fills the panel; its own content scrolls if taller. In
+          auto-fit mode we measure the content's natural height via this ref. */}
+      <div className={`min-h-0 flex-1 overflow-y-auto scrollbar-thin ${autoActive ? "" : "[&>*]:h-full"}`}>
+        <div ref={contentRef}>{children}</div>
+      </div>
 
       {/* Bottom drag handle */}
       <div
         role="separator"
         aria-orientation="horizontal"
         aria-label={`Resize ${label}`}
-        aria-valuenow={Math.round(height)}
+        aria-valuenow={Math.round(effectiveHeight)}
         tabIndex={0}
         onPointerDown={startDrag}
         onKeyDown={onKeyDown}
+        onDoubleClick={onDoubleClick}
+        title={autoFit ? "Drag to resize · double-click to auto-fit" : "Drag to resize"}
         className="absolute inset-x-0 bottom-0 flex h-3 cursor-ns-resize items-center justify-center rounded-b-xl outline-none"
       >
         <span className="h-1 w-10 rounded-full bg-muted-foreground/25 transition-colors group-hover/panel:bg-muted-foreground/50 group-focus-within/panel:bg-primary/70" />

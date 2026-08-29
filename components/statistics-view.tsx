@@ -191,16 +191,22 @@ export function StatisticsView() {
         >
           <StorageOverTimeCard snapshots={snapshots} rangeLabel={rangeLabel} />
         </ResizablePanel>
-        <ResizablePanel storageKey="pax:stats:byMaterialV1" defaultHeight={380} label="usage by material">
+        <ResizablePanel storageKey="pax:stats:byMaterialV1" defaultHeight={380} autoFit label="usage by material">
           <UsageByMaterialCard buckets={buckets} rangeLabel={rangeLabel} />
         </ResizablePanel>
-        <ResizablePanel storageKey="pax:stats:byColorV1" defaultHeight={380} label="usage by color">
+        <ResizablePanel storageKey="pax:stats:byColorV1" defaultHeight={380} autoFit label="usage by color">
           <UsageByColorCard buckets={buckets} rangeLabel={rangeLabel} />
         </ResizablePanel>
-        <ResizablePanel storageKey="pax:stats:printerUsageV1" defaultHeight={380} label="printer usage">
+        <ResizablePanel storageKey="pax:stats:printerUsageV1" defaultHeight={380} autoFit label="printer usage">
           <PrinterUsageCard buckets={buckets} rangeLabel={rangeLabel} />
         </ResizablePanel>
-        <ResizablePanel storageKey="pax:stats:byShelfV1" defaultHeight={380} label="storage by shelf">
+        <ResizablePanel
+          storageKey="pax:stats:byShelfV1"
+          defaultHeight={380}
+          maxHeight={720}
+          autoFit
+          label="storage by shelf"
+        >
           <StorageByShelfCard
             shelves={activeShelfView?.shelves ?? []}
             usedSlots={activeShelfView?.usedSlots ?? 0}

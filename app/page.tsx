@@ -1,14 +1,18 @@
 "use client"
 
-import { useState } from "react"
+import { useEffect, useState } from "react"
 import { StoreProvider, useStore } from "@/lib/store"
+import { getStats } from "@/lib/selectors"
+import { dayKey } from "@/lib/statistics"
 import { FlowProvider } from "@/components/flow-controller"
 import { SetupWizard } from "@/components/setup-wizard"
 import { HomeView } from "@/components/home-view"
+import { ScanView } from "@/components/scan-view"
 import { OrdersView } from "@/components/orders-view"
 import { HistoryView } from "@/components/history-view"
 import { FilamentDryingView } from "@/components/filament-drying-view"
 import { InventoryView } from "@/components/inventory-view"
+import { StatisticsView } from "@/components/statistics-view"
 import { SettingsView } from "@/components/settings-view"
 import { MotionOverlay } from "@/components/motion-overlay"
 import { BottomNav, type NavTab } from "@/components/bottom-nav"
@@ -19,10 +23,30 @@ export default function Page() {
     <StoreProvider>
       <FlowProvider>
         <NodeConnection />
+        <DailyStorageSnapshot />
         <AppShell />
       </FlowProvider>
     </StoreProvider>
   )
+}
+
+/**
+ * Records one storage-fullness snapshot per calendar day so the Statistik
+ * "storage usage over time" chart has real data points. Renders nothing; the
+ * reducer dedupes to a single snapshot per day, so re-running is harmless.
+ */
+function DailyStorageSnapshot() {
+  const { state, dispatch, ready } = useStore()
+  useEffect(() => {
+    if (!ready) return
+    const day = dayKey()
+    if ((state.storageSnapshots ?? []).some((s) => s.day === day)) return
+    const { usedSlots, totalSlots, totalGrams } = getStats(state)
+    if (totalSlots === 0) return
+    dispatch({ type: "RECORD_STORAGE_SNAPSHOT", snapshot: { day, usedSlots, totalSlots, totalGrams } })
+    // Re-check when the day rolls over or storage totals change materially.
+  }, [ready, state, dispatch])
+  return null
 }
 
 function AppShell() {
@@ -76,9 +100,21 @@ function AppShell() {
 
   return (
     <div className="flex h-dvh flex-col overflow-hidden bg-background text-foreground">
-      <main className="flex min-h-0 flex-1 flex-col overflow-y-auto lg:overflow-hidden">
+      {/* Home is a fixed dashboard that fills the viewport (no page scroll on
+          desktop). Every other view is document-flow and can exceed the
+          viewport, so it must scroll on desktop too — otherwise its lower cards
+          get clipped. */}
+      <main
+        className={
+          tab === "home"
+            ? "flex min-h-0 flex-1 flex-col overflow-y-auto lg:overflow-hidden"
+            : "flex min-h-0 flex-1 flex-col overflow-y-auto"
+        }
+      >
         {tab === "home" ? (
           <HomeView />
+        ) : tab === "scan" ? (
+          <ScanView />
         ) : tab === "orders" ? (
           <OrdersView />
         ) : tab === "history" ? (
@@ -87,6 +123,8 @@ function AppShell() {
           <FilamentDryingView />
         ) : tab === "inventory" ? (
           <InventoryView onGoHome={() => setTab("home")} />
+        ) : tab === "statistics" ? (
+          <StatisticsView />
         ) : (
           <SettingsView />
         )}

@@ -33,6 +33,19 @@ export function kg(grams: number): string {
   return `${(grams / 1000).toFixed(1)} kg`
 }
 
+/**
+ * Compact weight label for a chart axis where the datum is in kilograms. Small
+ * ranges (under 1 kg) are shown in grams so ticks stay short and readable
+ * (e.g. `6 g` instead of `0.006kg`, which used to overflow and clip). Larger
+ * values collapse to a trimmed kg string.
+ */
+function axisWeight(valueKg: number): string {
+  if (!Number.isFinite(valueKg) || valueKg === 0) return "0"
+  if (valueKg < 1) return `${Math.round(valueKg * 1000)} g`
+  const s = valueKg.toFixed(valueKg < 10 ? 1 : 0)
+  return `${s.replace(/\.0$/, "")} kg`
+}
+
 /** Short "Apr 20" style label for a YYYY-MM-DD day key. */
 function shortDay(day: string): string {
   return parseDayKey(day).toLocaleDateString(undefined, { month: "short", day: "numeric" })
@@ -135,7 +148,7 @@ export function UsageByColorCard({ buckets, rangeLabel }: { buckets: Consumption
           <EmptyChart message="No consumption recorded yet for this range." />
         ) : (
           <ChartContainer config={{ kg: { label: "kg" } }} className="h-[240px] w-full">
-            <BarChart data={data} margin={{ top: 16, right: 8, left: -8, bottom: 0 }}>
+            <BarChart data={data} margin={{ top: 16, right: 8, left: 0, bottom: 0 }}>
               <CartesianGrid vertical={false} strokeDasharray="3 3" stroke="var(--color-border)" />
               <XAxis
                 dataKey="label"
@@ -148,7 +161,13 @@ export function UsageByColorCard({ buckets, rangeLabel }: { buckets: Consumption
                 textAnchor={data.length > 5 ? "end" : "middle"}
                 height={data.length > 5 ? 48 : 24}
               />
-              <YAxis tickLine={false} axisLine={false} width={48} fontSize={11} unit="kg" />
+              <YAxis
+                tickLine={false}
+                axisLine={false}
+                width={56}
+                fontSize={11}
+                tickFormatter={axisWeight}
+              />
               <ChartTooltip
                 content={<ChartTooltipContent nameKey="label" formatter={(v) => `${Number(v).toFixed(1)} kg`} />}
               />
