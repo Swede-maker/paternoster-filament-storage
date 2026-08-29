@@ -1,0 +1,13 @@
+# PAX wireless RFID reader (Raspberry Pi) dependencies.
+# Only `requests` is always needed; install the extra for YOUR reader.
+
+requests>=2.31
+
+# --- PN532 over I2C (default; --reader pn532) ---
+# adafruit-circuitpython-pn532>=2.4
+
+# --- MFRC522 over SPI (--reader rc522) ---
+# mfrc522>=0.0.7
+# RPi.GPIO>=0.7
+
+# The `usb` and `mock` readers need nothing beyond `requests`.

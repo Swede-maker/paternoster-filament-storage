@@ -5,7 +5,7 @@ import { PackagePlus } from "lucide-react"
 import { useStore } from "@/lib/store"
 import { Dialog, DialogHeader, DialogBody, DialogFooter } from "./ui/dialog"
 import { Button } from "./ui/button"
-import { SpoolForm, emptyDraft, type SpoolDraft } from "./spool-form"
+import { SpoolForm, emptyDraft, draftToSpoolFields, type SpoolDraft } from "./spool-form"
 import { newId } from "@/lib/filament"
 import type { Spool } from "@/lib/types"
 
@@ -33,9 +33,10 @@ export function LibraryAddDialog({
   const qty = Math.max(1, Math.round(draft.quantity ?? 1))
 
   function submit() {
-    const { quantity: _q, ...fields } = draft
     for (let i = 0; i < qty; i++) {
-      const spool: Spool = { id: newId("spool"), createdAt: Date.now(), ...fields }
+      // Each spool takes the Nth minted QR id (if any), so a batch yields unique
+      // per-spool tags rather than one shared code.
+      const spool: Spool = { id: newId("spool"), createdAt: Date.now(), ...draftToSpoolFields(draft, i) }
       dispatch({ type: "LIBRARY_ADD_SPOOL", nodeId, spool })
     }
     setDraft(emptyDraft(state.settings.defaultSpoolWeight, state.settings.defaultDiameter))
@@ -50,7 +51,7 @@ export function LibraryAddDialog({
         description="Catalog a spool you own. It's added to the library instantly — no slot, no movement."
       />
       <DialogBody>
-        <SpoolForm value={draft} onChange={setDraft} showProfiles showQuantity showBarcode />
+        <SpoolForm value={draft} onChange={setDraft} showProfiles showQuantity showBarcode showTag />
       </DialogBody>
       <DialogFooter>
         <Button variant="ghost" onClick={onClose}>

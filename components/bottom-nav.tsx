@@ -1,11 +1,11 @@
 "use client"
 
-import { Home, Settings, ShoppingCart, History, Droplets, Boxes } from "lucide-react"
+import { Home, Settings, ShoppingCart, History, Droplets, Boxes, BarChart3, ScanLine } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { useStore } from "@/lib/store"
 import { dueReminders } from "@/lib/selectors"
 
-export type NavTab = "home" | "orders" | "history" | "drying" | "inventory" | "settings"
+export type NavTab = "home" | "scan" | "orders" | "history" | "drying" | "inventory" | "statistics" | "settings"
 
 export function BottomNav({
   tab,
@@ -23,10 +23,12 @@ export function BottomNav({
 
   const items: { id: NavTab; label: string; icon: typeof Home; badge?: number; alert?: boolean }[] = [
     { id: "home", label: "Home", icon: Home },
+    { id: "scan", label: "Scan", icon: ScanLine },
     { id: "orders", label: "Orders", icon: ShoppingCart, badge: orderCount || undefined },
     { id: "history", label: "History", icon: History },
     { id: "drying", label: "Filament Drying", icon: Droplets, badge: dueCount || undefined, alert: dueCount > 0 },
     { id: "inventory", label: "All Filament In Storage", icon: Boxes },
+    { id: "statistics", label: "Statistik", icon: BarChart3 },
     { id: "settings", label: "Settings", icon: Settings },
   ]
 

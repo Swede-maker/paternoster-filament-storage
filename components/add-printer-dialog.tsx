@@ -1,21 +1,40 @@
 "use client"
 
-import { useState } from "react"
-import { Printer as PrinterIcon } from "lucide-react"
+import { useEffect, useState } from "react"
+import { Printer as PrinterIcon, Plus, X } from "lucide-react"
 import { useStore } from "@/lib/store"
 import { Dialog, DialogHeader, DialogBody, DialogFooter } from "./ui/dialog"
 import { Button } from "./ui/button"
 import { Field, Input, Segmented, NumberChips } from "./ui/field"
-import { newId, printerSlotCount, MAX_PRINTERS } from "@/lib/filament"
-import type { Printer, PrinterKind, PrinterFirmware } from "@/lib/types"
+import { newId, printerSlotCount, printerAmsUnits, MAX_PRINTERS } from "@/lib/filament"
+import type { AmsUnit, Printer, PrinterKind, PrinterFirmware } from "@/lib/types"
 import { BambuCloudSignIn, type BambuCloudLink } from "./bambu-cloud-sign-in"
 
-export function AddPrinterDialog({ open, onClose }: { open: boolean; onClose: () => void }) {
+/** Max AMS units on one printer, and max slots per unit. */
+const MAX_AMS_UNITS = 8
+const MAX_SLOTS_PER_UNIT = 8
+
+/**
+ * Add / edit a printer. When `printer` is supplied the dialog opens in EDIT mode
+ * — fields are prefilled and saving dispatches UPDATE_PRINTER (which re-maps the
+ * loaded spools to the new slot layout) instead of ADD_PRINTER. This is what
+ * lets users change a printer in place rather than deleting and recreating it.
+ */
+export function AddPrinterDialog({
+  open,
+  onClose,
+  printer: editing,
+}: {
+  open: boolean
+  onClose: () => void
+  printer?: Printer
+}) {
   const { state, dispatch } = useStore()
+  const isEdit = !!editing
   const [name, setName] = useState("")
   const [kind, setKind] = useState<PrinterKind>("single")
-  const [amsUnits, setAmsUnits] = useState(1)
-  const [slotsPerAms, setSlotsPerAms] = useState(4)
+  // Mixed AMS units: each has a custom name and its own slot count.
+  const [ams, setAms] = useState<AmsUnit[]>([{ id: newId("ams"), name: "AMS 1", slots: 4 }])
   const [toolheads, setToolheads] = useState(4)
   const [firmware, setFirmware] = useState<PrinterFirmware>("klipper")
   const [ip, setIp] = useState("")
@@ -28,15 +47,37 @@ export function AddPrinterDialog({ open, onClose }: { open: boolean; onClose: ()
   // Result of a completed Bambu cloud sign-in (cloud mode only).
   const [cloudLink, setCloudLink] = useState<BambuCloudLink | null>(null)
 
-  const atLimit = state.printers.length >= MAX_PRINTERS
+  // Prefill the form whenever the dialog opens (or the target printer changes).
+  // Add mode resets to defaults; edit mode mirrors the existing printer.
+  useEffect(() => {
+    if (!open) return
+    if (editing) {
+      setName(editing.name)
+      setKind(editing.kind)
+      setAms(printerAmsUnits(editing))
+      setToolheads(Math.max(1, editing.toolheads || 4))
+      setFirmware(editing.firmware ?? "klipper")
+      setIp(editing.ip ?? "")
+      setPort(editing.port ? String(editing.port) : editing.firmware === "prusalink" ? "80" : "7125")
+      setApiKey(editing.apiKey ?? "")
+      setSerial(editing.serial ?? "")
+      setAccessCode(editing.accessCode ?? "")
+      setBambuMode(editing.bambuMode ?? "lan")
+      setCloudLink(null)
+    } else {
+      reset()
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, editing])
+
+  const atLimit = !isEdit && state.printers.length >= MAX_PRINTERS
   const isBambu = firmware === "bambu"
   const isPrusa = firmware === "prusalink"
 
   function reset() {
     setName("")
     setKind("single")
-    setAmsUnits(1)
-    setSlotsPerAms(4)
+    setAms([{ id: newId("ams"), name: "AMS 1", slots: 4 }])
     setToolheads(4)
     setFirmware("klipper")
     setIp("")
@@ -48,35 +89,52 @@ export function AddPrinterDialog({ open, onClose }: { open: boolean; onClose: ()
     setCloudLink(null)
   }
 
+  // --- AMS unit editing helpers ---
+  function addAmsUnit() {
+    setAms((prev) =>
+      prev.length >= MAX_AMS_UNITS ? prev : [...prev, { id: newId("ams"), name: `AMS ${prev.length + 1}`, slots: 4 }],
+    )
+  }
+  function removeAmsUnit(id: string) {
+    setAms((prev) => (prev.length <= 1 ? prev : prev.filter((u) => u.id !== id)))
+  }
+  function updateAmsUnit(id: string, changes: Partial<AmsUnit>) {
+    setAms((prev) => prev.map((u) => (u.id === id ? { ...u, ...changes } : u)))
+  }
+
   // Cloud Bambu printers are only ready once the user has signed in and picked
   // a device; LAN printers just need their fields filled as before.
   const isBambuCloud = isBambu && bambuMode === "cloud"
   const canSubmit = !atLimit && (!isBambuCloud || !!cloudLink)
 
   function submit() {
-    const draft = { kind, amsUnits, slotsPerAms, toolheads }
-    const count = printerSlotCount(draft)
     // For a cloud Bambu printer the serial comes from the chosen cloud device.
     const bambuSerial = isBambuCloud ? cloudLink?.serial : serial.trim() || undefined
-    const printer: Printer = {
-      id: newId("printer"),
+    // Sanitise the AMS units the reducer will normalise anyway (names + slots).
+    const cleanAms: AmsUnit[] = ams.map((u, i) => ({
+      id: u.id,
+      name: u.name.trim() || `AMS ${i + 1}`,
+      slots: Math.max(1, Math.min(MAX_SLOTS_PER_UNIT, Math.floor(u.slots) || 1)),
+    }))
+
+    const common = {
       name: name.trim() || `Printer ${state.printers.length + 1}`,
       kind,
-      amsUnits,
-      slotsPerAms,
+      ams: kind === "ams" ? cleanAms : undefined,
       toolheads,
       // Firmware selects the live-read transport (Klipper heater names over
       // Moonraker, or Bambu AMS/RFID over MQTT). Store it for toolchangers, any
       // linked Klipper/Marlin printer, and any Bambu printer.
-      firmware: kind === "toolchanger" || ip.trim() || isBambu ? firmware : undefined,
-      loaded: Array.from({ length: count }, () => null),
+      firmware: (kind === "toolchanger" || ip.trim() || isBambu ? firmware : undefined) as
+        | PrinterFirmware
+        | undefined,
       // Bambu LAN also uses the IP; cloud mode doesn't require it.
       ip: isBambuCloud ? undefined : ip.trim() || undefined,
       port: !isBambu && ip.trim() ? Number.parseInt(port) || (isPrusa ? 80 : 7125) : undefined,
       apiKey: !isBambu && ip.trim() && apiKey.trim() ? apiKey.trim() : undefined,
       serial: isBambu ? bambuSerial : undefined,
       accessCode: isBambu && !isBambuCloud && accessCode.trim() ? accessCode.trim() : undefined,
-      bambuMode: isBambu ? bambuMode : undefined,
+      bambuMode: (isBambu ? bambuMode : undefined) as "lan" | "cloud" | undefined,
       // Cloud account link (tokens only — never the password).
       bambuRegion: isBambuCloud ? cloudLink?.region : undefined,
       bambuToken: isBambuCloud ? cloudLink?.token : undefined,
@@ -84,21 +142,44 @@ export function AddPrinterDialog({ open, onClose }: { open: boolean; onClose: ()
       bambuAccountEmail: isBambuCloud ? cloudLink?.email : undefined,
       bambuRefreshToken: isBambuCloud ? cloudLink?.refreshToken : undefined,
       bambuTokenExpiresAt: isBambuCloud ? cloudLink?.expiresAt : undefined,
-      link: "offline",
     }
-    dispatch({ type: "ADD_PRINTER", printer })
+
+    if (isEdit && editing) {
+      // UPDATE_PRINTER re-normalises and re-maps the loaded array, keeping the
+      // spools that still fit the new layout.
+      dispatch({ type: "UPDATE_PRINTER", id: editing.id, changes: common })
+    } else {
+      const count = printerSlotCount({ kind, ams: common.ams, amsUnits: cleanAms.length, slotsPerAms: cleanAms[0]?.slots ?? 1, toolheads })
+      const printer: Printer = {
+        id: newId("printer"),
+        ...common,
+        // Legacy uniform fields (kept in sync by the reducer's normalizePrinter).
+        amsUnits: cleanAms.length,
+        slotsPerAms: cleanAms[0]?.slots ?? 4,
+        loaded: Array.from({ length: count }, () => null),
+        link: "offline",
+      }
+      dispatch({ type: "ADD_PRINTER", printer })
+    }
     reset()
     onClose()
   }
 
-  const preview = printerSlotCount({ kind, amsUnits, slotsPerAms, toolheads })
+  const preview =
+    kind === "ams"
+      ? ams.reduce((sum, u) => sum + Math.max(1, u.slots || 1), 0)
+      : printerSlotCount({ kind, amsUnits: 1, slotsPerAms: 1, toolheads })
 
   return (
     <Dialog open={open} onClose={onClose}>
       <DialogHeader
         icon={<PrinterIcon className="h-5 w-5" />}
-        title="Add a printer"
-        description="Tell the system what kind of machine this is."
+        title={isEdit ? "Edit printer" : "Add a printer"}
+        description={
+          isEdit
+            ? "Change this printer's setup. Loaded spools that still fit are kept."
+            : "Tell the system what kind of machine this is."
+        }
       />
       <DialogBody>
         {atLimit ? (
@@ -131,13 +212,52 @@ export function AddPrinterDialog({ open, onClose }: { open: boolean; onClose: ()
             )}
 
             {kind === "ams" && (
-              <div className="grid grid-cols-2 gap-4">
-                <Field label="Spools per AMS unit">
-                  <NumberChips min={1} max={8} value={slotsPerAms} onChange={setSlotsPerAms} />
-                </Field>
-                <Field label="AMS units connected">
-                  <NumberChips min={1} max={4} value={amsUnits} onChange={setAmsUnits} />
-                </Field>
+              <div className="space-y-3">
+                <div className="flex items-center justify-between">
+                  <span className="text-sm font-medium text-muted-foreground">AMS units</span>
+                  <button
+                    type="button"
+                    onClick={addAmsUnit}
+                    disabled={ams.length >= MAX_AMS_UNITS}
+                    className="inline-flex items-center gap-1 rounded-md border border-primary/40 bg-primary/5 px-2.5 py-1.5 text-xs font-medium text-primary transition-colors hover:bg-primary/10 disabled:opacity-40"
+                  >
+                    <Plus className="h-3.5 w-3.5" />
+                    Add unit
+                  </button>
+                </div>
+                {/* One row per AMS unit: rename it and set its own slot count, so a
+                    4-slot AMS and a 1-slot AMS Lite can live on the same printer. */}
+                {ams.map((unit, i) => (
+                  <div key={unit.id} className="rounded-lg border border-border bg-background/40 p-3">
+                    <div className="flex items-center gap-2">
+                      <Input
+                        aria-label={`AMS unit ${i + 1} name`}
+                        value={unit.name}
+                        onChange={(e) => updateAmsUnit(unit.id, { name: e.target.value })}
+                        placeholder={`AMS ${i + 1}`}
+                        className="h-9 flex-1"
+                      />
+                      <button
+                        type="button"
+                        onClick={() => removeAmsUnit(unit.id)}
+                        disabled={ams.length <= 1}
+                        aria-label={`Remove ${unit.name || `AMS ${i + 1}`}`}
+                        className="flex h-9 w-9 shrink-0 items-center justify-center rounded-md border border-border text-muted-foreground transition-colors hover:border-destructive/50 hover:text-destructive disabled:opacity-30"
+                      >
+                        <X className="h-4 w-4" />
+                      </button>
+                    </div>
+                    <div className="mt-2">
+                      <span className="mb-1.5 block text-xs text-muted-foreground">Slots in this unit</span>
+                      <NumberChips
+                        min={1}
+                        max={MAX_SLOTS_PER_UNIT}
+                        value={unit.slots}
+                        onChange={(v) => updateAmsUnit(unit.id, { slots: v })}
+                      />
+                    </div>
+                  </div>
+                ))}
               </div>
             )}
 
@@ -295,7 +415,7 @@ export function AddPrinterDialog({ open, onClose }: { open: boolean; onClose: ()
           Cancel
         </Button>
         <Button onClick={submit} disabled={!canSubmit}>
-          Add printer
+          {isEdit ? "Save changes" : "Add printer"}
         </Button>
       </DialogFooter>
     </Dialog>

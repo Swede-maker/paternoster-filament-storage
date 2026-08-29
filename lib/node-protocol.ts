@@ -122,13 +122,25 @@ export interface HomedEvent {
   shelf: number
 }
 
+/**
+ * Live level of the single-shelf inductive proximity sensor (the NPN switch on
+ * the Pi's GPIO), emitted whenever it changes and once on connect. `on` is the
+ * LOGICAL "a shelf is present in the window" state — the agent has already
+ * folded in sensor polarity (NPN/PNP) and the invert flag, so the app can use it
+ * directly. This is a real hardware read, not inferred from position.
+ */
+export interface SensorEvent {
+  type: "sensor"
+  on: boolean
+}
+
 /** A hardware fault, e-stop, or command that could not be completed. */
 export interface FaultEvent {
   type: "fault"
   message: string
 }
 
-export type NodeEvent = HelloEvent | StateEvent | PosEvent | ArrivedEvent | HomedEvent | FaultEvent
+export type NodeEvent = HelloEvent | StateEvent | PosEvent | ArrivedEvent | HomedEvent | SensorEvent | FaultEvent
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -163,6 +175,7 @@ export function parseEvent(data: string): NodeEvent | null {
     case "pos":
     case "arrived":
     case "homed":
+    case "sensor":
     case "fault":
       return msg as NodeEvent
     default:

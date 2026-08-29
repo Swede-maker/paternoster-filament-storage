@@ -27,7 +27,8 @@ import { nodeFreeSlots } from "@/lib/balance"
 import { cn } from "@/lib/utils"
 import { Dialog, DialogHeader, DialogBody, DialogFooter } from "./ui/dialog"
 import { Button } from "./ui/button"
-import { SpoolForm, emptyDraft, type SpoolDraft } from "./spool-form"
+import { SpoolForm, emptyDraft, draftToSpoolFields, type SpoolDraft } from "./spool-form"
+import { SpoolTagSection } from "./spool-tag-section"
 import { SpoolDisc, discColor2 } from "./spool"
 import { newId, spoolFill } from "@/lib/filament"
 import type { NodeLocation } from "./flow-controller"
@@ -132,8 +133,7 @@ export function SlotActionDialog({
   }
 
   function fillEmpty() {
-    const { quantity: _q, ...spoolFields } = draft
-    const spool: Spool = { id: newId("spool"), createdAt: Date.now(), ...spoolFields }
+    const spool: Spool = { id: newId("spool"), createdAt: Date.now(), ...draftToSpoolFields(draft) }
     dispatch({ type: "UPSERT_SPOOL", spool })
     dispatch({ type: "SET_STORAGE_SLOT", nodeId: node.id, shelf: target!.shelf, slot: target!.slot, spoolId: spool.id })
     onClose()
@@ -425,6 +425,11 @@ export function SlotActionDialog({
       />
       <DialogBody>
         <SpoolForm value={draft} onChange={setDraft} showProfiles showBarcode />
+        {existing && (
+          <div className="mt-4">
+            <SpoolTagSection spool={existing} />
+          </div>
+        )}
       </DialogBody>
       <DialogFooter>
         {existing ? (

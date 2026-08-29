@@ -12,6 +12,7 @@ import {
 import type {
   ActiveJob,
   AppState,
+  ConsumptionBucket,
   FilamentOrder,
   FilamentProfile,
   FilamentUsage,
@@ -23,16 +24,20 @@ import type {
   NodeRole,
   NodeType,
   OrderItem,
+  OrderStore,
   PersistedState,
   Printer,
+  StorageSnapshot,
   PrinterLinkStatus,
   Settings,
   ShelfMeta,
   Spool,
   StorageConfig,
   StorageNode,
+  TagBinding,
+  RfidReader,
 } from "./types"
-import { printerSlotCount, rampStepMs, newId, DEFAULT_RAMP_PCT } from "./filament"
+import { printerAmsUnits, printerSlotCount, rampStepMs, newId, DEFAULT_RAMP_PCT } from "./filament"
 import { shelfLabel, printerSlotLabel } from "./selectors"
 import { shortestRotation } from "./balance"
 import { getSystemVersion, loadSystemState, saveSystemState } from "@/app/actions/system-state"
@@ -55,6 +60,47 @@ const HISTORY_CAP = 1000
 
 /** Cap on archived usage tallies kept, so the synced doc stays small. */
 const USAGE_ARCHIVE_CAP = 500
+
+/**
+ * Cap on daily consumption buckets retained. One row per
+ * day×printer×material×color; a couple of years of varied use stays well under
+ * this, and old rows drop off oldest-first so the synced doc stays small.
+ */
+const CONSUMPTION_LOG_CAP = 5000
+
+/** Cap on daily storage snapshots (one per day) — roughly 5+ years. */
+const STORAGE_SNAPSHOT_CAP = 2000
+
+/**
+ * Keep a printer's mixed-AMS array and its legacy uniform fields consistent.
+ *
+ * `ams` (when present) is the source of truth for AMS printers. We derive
+ * `amsUnits` from its length and `slotsPerAms` from the first unit so every
+ * legacy call site that still reads the flat fields keeps working, and we
+ * re-sync the flat `loaded` array to the true total slot count.
+ */
+/** Keep only the first item for each id, preserving order (self-heals dup data). */
+function dedupeById<T extends { id: string }>(items: T[]): T[] {
+  const seen = new Set<string>()
+  const out: T[] = []
+  for (const it of items) {
+    if (seen.has(it.id)) continue
+    seen.add(it.id)
+    out.push(it)
+  }
+  return out
+}
+
+function normalizePrinter(p: Printer): Printer {
+  const units = printerAmsUnits(p)
+  const next: Printer =
+    p.kind === "ams"
+      ? { ...p, ams: units, amsUnits: units.length, slotsPerAms: Math.max(1, units[0]?.slots ?? 1) }
+      : { ...p, ams: undefined }
+  const count = printerSlotCount(next)
+  const loaded = Array.from({ length: count }, (_, i) => next.loaded?.[i] ?? null)
+  return { ...next, loaded }
+}
 
 /** A fresh, empty filament-usage tracker. */
 function defaultUsage(): FilamentUsage {
@@ -114,10 +160,14 @@ function toPersisted(state: AppState): PersistedState {
       }),
     ),
     activeNodeId: state.activeNodeId,
-    printers: state.printers,
+    // Normalise so the mixed-AMS array and legacy uniform fields never drift
+    // apart in the synced document. Live link status is per-device.
+    printers: state.printers.map(normalizePrinter),
     activePrinterId: state.activePrinterId,
     history: state.history ?? [],
     usage: state.usage ?? defaultUsage(),
+    consumptionLog: state.consumptionLog ?? [],
+    storageSnapshots: state.storageSnapshots ?? [],
   }
 }
 
@@ -206,6 +256,29 @@ function mergeServerConsumption(
  * state (nodes, slots, printers, spools) stays last-write-wins, which is correct
  * for a physical carousel's current layout.
  */
+/**
+ * Merge daily consumption buckets across devices. Each bucket is keyed by
+ * day|printerId|material|color and its grams only ever grow within a day, so on
+ * a key conflict we take the MAX (whichever device saw more) and union the rest.
+ * This preserves the server-written record while tolerating a stale browser.
+ */
+function mergeConsumptionLog(
+  local: ConsumptionBucket[] | undefined,
+  remote: ConsumptionBucket[] | undefined,
+): ConsumptionBucket[] {
+  const key = (b: ConsumptionBucket) => `${b.day}|${b.printerId}|${b.material}|${b.color}`
+  const map = new Map<string, ConsumptionBucket>()
+  for (const b of local ?? []) map.set(key(b), b)
+  for (const b of remote ?? []) {
+    const k = key(b)
+    const prev = map.get(k)
+    if (!prev || b.grams > prev.grams) map.set(k, b)
+  }
+  return [...map.values()]
+    .sort((a, b) => (a.day < b.day ? -1 : a.day > b.day ? 1 : 0))
+    .slice(-CONSUMPTION_LOG_CAP)
+}
+
 function mergeCatalog(local: PersistedState, remote: PersistedState, baseline: PersistedState | null): PersistedState {
   const ls = local.settings
   const rs = remote.settings
@@ -245,19 +318,35 @@ function mergeCatalog(local: PersistedState, remote: PersistedState, baseline: P
   // baseline on top of the local value, so background consumption survives a
   // concurrent local save. A local refill/edit that raises grams still wins.
   const spools = mergeServerConsumption(local.spools, remote.spools, baseline?.spools)
+  // Consumption buckets and daily storage snapshots are append-mostly records
+  // written by the server (and any device); preserve entries from other devices.
+  const consumptionLog = mergeConsumptionLog(local.consumptionLog, remote.consumptionLog)
+  const storageSnapshots = mergeByKey(
+    local.storageSnapshots,
+    remote.storageSnapshots,
+    baseline?.storageSnapshots,
+    (s) => s.day,
+  )
+    .sort((a, b) => (a.day < b.day ? -1 : a.day > b.day ? 1 : 0))
+    .slice(-STORAGE_SNAPSHOT_CAP)
   return {
     ...local,
     spools,
     history,
     usage,
+    consumptionLog,
+    storageSnapshots,
     settings: {
       ...ls,
       filamentProfiles: mergeByKey(ls.filamentProfiles, rs.filamentProfiles, bs?.filamentProfiles, (p) => p.id),
       barcodes: mergeByKey(ls.barcodes, rs.barcodes, bs?.barcodes, (b) => b.code),
+      tagBindings: mergeByKey(ls.tagBindings, rs.tagBindings, bs?.tagBindings, (t) => t.id),
+      readers: mergeByKey(ls.readers, rs.readers, bs?.readers, (r) => r.id),
       containers: mergeByKey(ls.containers, rs.containers, bs?.containers, (c) => c.id),
       customMaterials: mergeByKey(ls.customMaterials, rs.customMaterials, bs?.customMaterials, (m) => m),
       customBrands: mergeByKey(ls.customBrands, rs.customBrands, bs?.customBrands, (b) => b),
       orders: mergeByKey(ls.orders, rs.orders, bs?.orders, (o) => o.id),
+      stores: mergeByKey(ls.stores, rs.stores, bs?.stores, (s) => s.id),
       customColors: mergeByKey(ls.customColors, rs.customColors, bs?.customColors, (c) => c.hex.toLowerCase()),
     },
   }
@@ -288,6 +377,8 @@ const defaultSettings: Settings = {
   defaultDiameter: 1.75,
   filamentProfiles: [],
   barcodes: [],
+  tagBindings: [],
+  readers: [],
   orders: [],
   customColors: [],
   showUsageCardOnHome: true,
@@ -390,6 +481,8 @@ function makeInitialState(): AppState {
     pendingJobs: [],
     history: [],
     usage: defaultUsage(),
+    consumptionLog: [],
+    storageSnapshots: [],
   }
 }
 
@@ -440,6 +533,7 @@ type Action =
   | { type: "NODE_LINK"; nodeId: string; link: PrinterLinkStatus; reason?: string }
   | { type: "NODE_AGENT_MODE"; nodeId: string; simulated: boolean; reason?: string }
   | { type: "NODE_POS"; nodeId: string; currentShelf: number }
+  | { type: "NODE_SENSOR"; nodeId: string; on: boolean }
   | { type: "NODE_ARRIVED"; nodeId: string; shelf: number }
   | { type: "NODE_HOMED"; nodeId: string; currentShelf?: number }
   | { type: "NODE_FAULT"; nodeId: string; message: string }
@@ -470,12 +564,24 @@ type Action =
   // Barcode → profile mappings
   | { type: "ADD_BARCODE"; code: string; profileId: string }
   | { type: "REMOVE_BARCODE"; code: string }
+  // RFID / QR tag bindings (bind a tag id to a spool, shelf, or printer slot)
+  | { type: "BIND_TAG"; binding: TagBinding }
+  /** Remove a tag binding by id, clearing a spool's `tagId` if it pointed there. */
+  | { type: "UNBIND_TAG"; id: string }
+  // Wireless RFID/NFC readers (ESP32 / Pi)
+  | { type: "ADD_READER"; reader: RfidReader }
+  | { type: "UPDATE_READER"; id: string; changes: Partial<Pick<RfidReader, "name">> }
+  | { type: "REMOVE_READER"; id: string }
   // Incoming orders / carts
   | { type: "ADD_ORDER"; order: FilamentOrder }
   | { type: "RENAME_ORDER"; id: string; name: string }
   | { type: "REMOVE_ORDER"; id: string }
   | { type: "ADD_ORDER_ITEM"; orderId: string; item: OrderItem }
   | { type: "REMOVE_ORDER_ITEM"; orderId: string; itemId: string }
+  | { type: "ADD_STORE"; store: OrderStore }
+  | { type: "UPDATE_STORE"; id: string; changes: Partial<Omit<OrderStore, "id">> }
+  | { type: "REMOVE_STORE"; id: string }
+  | { type: "RECORD_STORAGE_SNAPSHOT"; snapshot: StorageSnapshot }
   | { type: "SET_STORAGE_SLOT"; nodeId: string; shelf: number; slot: number; spoolId: string | null }
   /** Create a brand-new spool directly into a library node's inventory row. */
   | { type: "LIBRARY_ADD_SPOOL"; nodeId: string; spool: Spool }
@@ -509,6 +615,13 @@ type Action =
   /** Queue several jobs to run back-to-back (first runs now, rest wait). */
   | { type: "START_JOBS"; jobs: ActiveJob[] }
   | { type: "CONFIRM_STOP"; grams?: number }
+  /**
+   * Correct a mix-up between physically identical spools: the operator scanned a
+   * spool other than the one the current stop expected. Swaps which spool id the
+   * current stop and the scanned spool's queued stop each carry, so the spool in
+   * the operator's hand goes into the current slot and the plan stays consistent.
+   */
+  | { type: "SWAP_JOB_SPOOL"; scannedSpoolId: string }
   | { type: "CANCEL_JOB" }
 
 // ---------------------------------------------------------------------------
@@ -838,17 +951,19 @@ function coreReducer(state: AppState, action: Action): AppState {
 
     // ----- printers -----
     case "ADD_PRINTER": {
-      const printers = [...state.printers, action.printer]
+      // normalizePrinter keeps the mixed-AMS array and legacy fields in step and
+      // sizes the loaded array to the true slot count.
+      const printers = [...state.printers, normalizePrinter(action.printer)]
       return { ...state, printers, activePrinterId: state.activePrinterId ?? action.printer.id }
     }
 
     case "UPDATE_PRINTER": {
       const printers = state.printers.map((p) => {
         if (p.id !== action.id) return p
-        const merged = { ...p, ...action.changes }
-        const count = printerSlotCount(merged)
-        const loaded = Array.from({ length: count }, (_, i) => merged.loaded[i] ?? null)
-        return { ...merged, loaded }
+        // Re-normalise after the edit so changing AMS units (count, sizes) or
+        // kind rebuilds `ams`/`amsUnits`/`slotsPerAms` and preserves as many
+        // loaded spools as still fit.
+        return normalizePrinter({ ...p, ...action.changes })
       })
       return { ...state, printers }
     }
@@ -871,8 +986,23 @@ function coreReducer(state: AppState, action: Action): AppState {
       return { ...state, activePrinterId: action.id }
 
     // ----- spools -----
-    case "UPSERT_SPOOL":
-      return { ...state, spools: { ...state.spools, [action.spool.id]: action.spool } }
+    case "UPSERT_SPOOL": {
+      const spools = { ...state.spools, [action.spool.id]: action.spool }
+      // If the spool carries a tag id (e.g. a QR minted during creation) and it
+      // isn't bound yet, register the binding now so the printed code resolves.
+      const tagId = action.spool.tagId
+      let settings = state.settings
+      if (tagId && !(state.settings.tagBindings ?? []).some((b) => b.id === tagId)) {
+        const binding: TagBinding = {
+          id: tagId,
+          target: { kind: "spool", spoolId: action.spool.id },
+          boundAt: Date.now(),
+          via: tagId.startsWith("PAX:") ? "qr" : "nfc",
+        }
+        settings = { ...state.settings, tagBindings: [...(state.settings.tagBindings ?? []), binding] }
+      }
+      return { ...state, spools, settings }
+    }
 
     case "UPDATE_SPOOL": {
       const existing = state.spools[action.id]
@@ -994,6 +1124,77 @@ function coreReducer(state: AppState, action: Action): AppState {
       return { ...state, settings: { ...state.settings, barcodes: list.filter((b) => b.code !== action.code) } }
     }
 
+    // ----- RFID / QR tag bindings -----
+    case "BIND_TAG": {
+      const { binding } = action
+      // A tag id maps to exactly one target: replace any existing binding for
+      // this id (overwrite/rebind), and drop any OTHER binding that pointed at
+      // this same spool so a spool never carries two tags at once.
+      const others = (state.settings.tagBindings ?? []).filter((b) => {
+        if (b.id === binding.id) return false
+        if (binding.target.kind === "spool" && b.target.kind === "spool" && b.target.spoolId === binding.target.spoolId)
+          return false
+        return true
+      })
+      const tagBindings = [...others, binding]
+      // Keep the spool's own `tagId` in sync so its QR/Edit affordance resolves.
+      let spools = state.spools
+      if (binding.target.kind === "spool") {
+        const spool = state.spools[binding.target.spoolId]
+        if (spool && spool.tagId !== binding.id) {
+          spools = { ...state.spools, [binding.target.spoolId]: { ...spool, tagId: binding.id } }
+        }
+        // Clear tagId off whatever spool previously wore this id.
+        for (const b of state.settings.tagBindings ?? []) {
+          if (b.id === binding.id && b.target.kind === "spool" && b.target.spoolId !== binding.target.spoolId) {
+            const prev = spools[b.target.spoolId]
+            if (prev?.tagId === binding.id) spools = { ...spools, [b.target.spoolId]: { ...prev, tagId: undefined } }
+          }
+        }
+      }
+      return { ...state, spools, settings: { ...state.settings, tagBindings } }
+    }
+
+    case "UNBIND_TAG": {
+      const list = state.settings.tagBindings ?? []
+      const removed = list.find((b) => b.id === action.id)
+      const tagBindings = list.filter((b) => b.id !== action.id)
+      let spools = state.spools
+      if (removed?.target.kind === "spool") {
+        const spool = state.spools[removed.target.spoolId]
+        if (spool?.tagId === action.id) {
+          spools = { ...state.spools, [removed.target.spoolId]: { ...spool, tagId: undefined } }
+        }
+      }
+      return { ...state, spools, settings: { ...state.settings, tagBindings } }
+    }
+
+    // ----- wireless RFID/NFC readers -----
+    case "ADD_READER":
+      return {
+        ...state,
+        settings: { ...state.settings, readers: [...(state.settings.readers ?? []), action.reader] },
+      }
+
+    case "UPDATE_READER": {
+      const name = action.changes.name?.trim()
+      return {
+        ...state,
+        settings: {
+          ...state.settings,
+          readers: (state.settings.readers ?? []).map((r) =>
+            r.id === action.id ? { ...r, ...(name ? { name } : {}) } : r,
+          ),
+        },
+      }
+    }
+
+    case "REMOVE_READER":
+      return {
+        ...state,
+        settings: { ...state.settings, readers: (state.settings.readers ?? []).filter((r) => r.id !== action.id) },
+      }
+
     // ----- incoming orders / carts -----
     case "ADD_ORDER":
       return { ...state, settings: { ...state.settings, orders: [...(state.settings.orders ?? []), action.order] } }
@@ -1021,6 +1222,37 @@ function coreReducer(state: AppState, action: Action): AppState {
         o.id === action.orderId ? { ...o, items: o.items.filter((it) => it.id !== action.itemId) } : o,
       )
       return { ...state, settings: { ...state.settings, orders } }
+    }
+
+    case "ADD_STORE": {
+      const stores = [...(state.settings.stores ?? []), action.store]
+      return { ...state, settings: { ...state.settings, stores } }
+    }
+
+    case "UPDATE_STORE": {
+      const stores = (state.settings.stores ?? []).map((s) =>
+        s.id === action.id ? { ...s, ...action.changes } : s,
+      )
+      return { ...state, settings: { ...state.settings, stores } }
+    }
+
+    case "REMOVE_STORE": {
+      const stores = (state.settings.stores ?? []).filter((s) => s.id !== action.id)
+      // Detach the deleted store from any orders that referenced it.
+      const orders = (state.settings.orders ?? []).map((o) =>
+        o.storeId === action.id ? { ...o, storeId: undefined } : o,
+      )
+      return { ...state, settings: { ...state.settings, stores, orders } }
+    }
+
+    case "RECORD_STORAGE_SNAPSHOT": {
+      // One snapshot per calendar day: replace today's if it already exists,
+      // otherwise append, and cap the retained history oldest-first.
+      const rest = (state.storageSnapshots ?? []).filter((s) => s.day !== action.snapshot.day)
+      const next = [...rest, action.snapshot]
+        .sort((a, b) => (a.day < b.day ? -1 : a.day > b.day ? 1 : 0))
+        .slice(-STORAGE_SNAPSHOT_CAP)
+      return { ...state, storageSnapshots: next }
     }
 
     case "SET_STORAGE_SLOT":
@@ -1261,6 +1493,11 @@ function coreReducer(state: AppState, action: Action): AppState {
               ...n,
               link: action.link,
               linkError: action.link === "online" ? undefined : action.reason ?? n.linkError,
+              // A dropped/ reconnecting link means the last sensor reading is
+              // stale — mark it unknown so the indicator falls back to the
+              // inferred state rather than freezing on a value that no longer
+              // reflects the hardware.
+              machine: action.link === "online" ? n.machine : { ...n.machine, sensor: null },
             }
           : n,
       )
@@ -1279,6 +1516,14 @@ function coreReducer(state: AppState, action: Action): AppState {
       return withNode(state, action.nodeId, (n) => ({
         ...n,
         machine: { ...n.machine, currentShelf: action.currentShelf },
+      }))
+
+    case "NODE_SENSOR":
+      // Live level of the physical shelf proximity sensor, read off the Pi's
+      // GPIO and forwarded by the agent's `sensor` event.
+      return withNode(state, action.nodeId, (n) => ({
+        ...n,
+        machine: { ...n.machine, sensor: action.on },
       }))
 
     case "NODE_ARRIVED": {
@@ -1421,6 +1666,27 @@ function coreReducer(state: AppState, action: Action): AppState {
       }
       const advanced = { ...next, job: { ...job, items, currentIndex: nextIndex } }
       return serviceCurrentItem(advanced)
+    }
+
+    case "SWAP_JOB_SPOOL": {
+      const job = state.job
+      if (!job) return state
+      const idx = job.currentIndex
+      const current = job.items[idx]
+      if (!current) return state
+      // Already the right spool — nothing to correct.
+      if (current.spoolId === action.scannedSpoolId) return state
+      // The scanned spool must be another not-yet-serviced stop in THIS job.
+      const otherIdx = job.items.findIndex((it, i) => i > idx && !it.done && it.spoolId === action.scannedSpoolId)
+      if (otherIdx < 0) return state
+      // Swap only the spool identity; each stop keeps its own slot/grams/from so
+      // the plan is untouched — just which physical spool fills each slot changes.
+      const items = job.items.map((it, i) => {
+        if (i === idx) return { ...it, spoolId: action.scannedSpoolId }
+        if (i === otherIdx) return { ...it, spoolId: current.spoolId }
+        return it
+      })
+      return { ...state, job: { ...job, items } }
     }
 
     case "EMERGENCY_STOP": {
@@ -1698,12 +1964,24 @@ function migrate(parsed: any): AppState {
     spools: parsed.spools ?? {},
     nodes,
     activeNodeId,
-    printers: (parsed.printers ?? []).map((p: Printer) => ({ ...p, link: "offline" })),
+    // Normalise every printer so mixed-AMS (`ams`) and the legacy uniform
+    // fields agree, synthesising `ams` for printers saved before it existed.
+    // De-dupe by id first: older data could contain the same printer twice
+    // (a double ADD_PRINTER), which crashed React with duplicate keys.
+    printers: dedupeById<Printer>((parsed.printers ?? []) as Printer[]).map((p) =>
+      normalizePrinter({ ...p, link: "offline" }),
+    ),
     activePrinterId: parsed.activePrinterId ?? null,
     job: null,
     pendingJobs: [],
     history: Array.isArray(parsed.history) ? parsed.history.slice(0, HISTORY_CAP) : [],
     usage: coerceUsage(parsed.usage),
+    consumptionLog: Array.isArray(parsed.consumptionLog)
+      ? parsed.consumptionLog.slice(-CONSUMPTION_LOG_CAP)
+      : [],
+    storageSnapshots: Array.isArray(parsed.storageSnapshots)
+      ? parsed.storageSnapshots.slice(-STORAGE_SNAPSHOT_CAP)
+      : [],
   }
 }
 
@@ -1747,7 +2025,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const baselineRef = useRef<PersistedState | null>(null)
   const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   // A save that has been scheduled/started but not yet acknowledged by the
-  // server. While this is true, a poll must not reload — otherwise it can fetch
+  // server. While this is true, a poll must not reload �� otherwise it can fetch
   // a version from before our write landed and clobber the local change.
   const saveInFlight = useRef(false)
   // Always-fresh view of state so the poll can consult the live job/state

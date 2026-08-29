@@ -1,4 +1,4 @@
-import type { FilamentMaterial, Printer, Spool } from "./types"
+import type { AmsUnit, FilamentMaterial, Printer, Spool } from "./types"
 
 export const MATERIALS: FilamentMaterial[] = [
   "PLA",
@@ -220,13 +220,40 @@ export function rampStepMs(baseMs: number, stepIndex: number, totalSteps: number
   return Math.round(baseMs * (1 + strength * shape))
 }
 
+/**
+ * Normalised AMS units for a printer. When the printer carries the richer
+ * `ams` array (mixed, named units) that is the source of truth; otherwise we
+ * synthesise a uniform layout from the legacy `amsUnits`/`slotsPerAms` fields so
+ * every consumer can treat AMS printers the same way.
+ */
+export function printerAmsUnits(
+  p: Pick<Printer, "ams" | "amsUnits" | "slotsPerAms">,
+): AmsUnit[] {
+  if (p.ams && p.ams.length > 0) {
+    return p.ams.map((u, i) => ({
+      id: u.id || `ams-${i + 1}`,
+      name: u.name?.trim() || `AMS ${i + 1}`,
+      slots: Math.max(1, Math.floor(u.slots)),
+    }))
+  }
+  const count = Math.max(1, p.amsUnits)
+  const per = Math.max(1, p.slotsPerAms)
+  return Array.from({ length: count }, (_, i) => ({
+    id: `ams-${i + 1}`,
+    name: `AMS ${i + 1}`,
+    slots: per,
+  }))
+}
+
 /** Total number of loadable slots for a printer based on its kind. */
-export function printerSlotCount(p: Pick<Printer, "kind" | "amsUnits" | "slotsPerAms" | "toolheads">): number {
+export function printerSlotCount(
+  p: Pick<Printer, "kind" | "ams" | "amsUnits" | "slotsPerAms" | "toolheads">,
+): number {
   switch (p.kind) {
     case "single":
       return 1
     case "ams":
-      return Math.max(1, p.amsUnits) * Math.max(1, p.slotsPerAms)
+      return printerAmsUnits(p).reduce((sum, u) => sum + u.slots, 0)
     case "toolchanger":
       return Math.max(1, p.toolheads)
     default:

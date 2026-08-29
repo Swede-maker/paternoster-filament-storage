@@ -5,8 +5,7 @@ import { Boxes, Package, Plus, Server, Loader2, MapPin } from "lucide-react"
 import { useStore } from "@/lib/store"
 import { useFlow, type NodeLocation } from "./flow-controller"
 import { Button } from "./ui/button"
-import { ShelfOverview } from "./shelf-overview"
-import { ManualControl } from "./manual-control"
+import { ResizableSidebar } from "./resizable-sidebar"
 import { StatsBar } from "./stats-bar"
 import { CarouselView } from "./carousel-view"
 import { ShelfStorageView } from "./shelf-storage-view"
@@ -20,12 +19,12 @@ import { SlotActionDialog } from "./slot-action-dialog"
 import { UnloadDialog } from "./unload-dialog"
 import { NewSpoolDialog } from "./new-spool-dialog"
 import { SlotPickerDialog } from "./slot-picker-dialog"
-import { SearchActionDialog } from "./search-action-dialog"
 import { PrinterPickerDialog } from "./printer-picker-dialog"
 import { QueuePlaceDialog } from "./queue-place-dialog"
 import { activeNode, printerSlotLabel, shelfLabel } from "@/lib/selectors"
 import { newId } from "@/lib/filament"
 import type { SpoolDraft } from "./spool-form"
+import { draftToSpoolFields } from "./spool-form"
 import type { Printer, Spool } from "@/lib/types"
 
 export function HomeView() {
@@ -52,22 +51,24 @@ export function HomeView() {
   // slot, plus the printer that seeds the loaded-spool picker's tabs.
   const [fillFromPrinterTarget, setFillFromPrinterTarget] = useState<{ shelf: number; slot: number } | null>(null)
   const [fillPickerPrinter, setFillPickerPrinter] = useState<Printer | null>(null)
-  // Search-driven actions: a tapped stored spool being acted on. loc carries
-  // the node it lives in (NodeLocation) so cross-unit picks target correctly.
-  const [searchTarget, setSearchTarget] = useState<{ spool: Spool; loc: NodeLocation } | null>(null)
+  // Search-driven actions: printer picker + slot picker targets used when
+  // loading a tapped stored spool onto a printer.
   const [printerPickTarget, setPrinterPickTarget] = useState<{ spool: Spool; loc: NodeLocation } | null>(null)
   const [searchLoad, setSearchLoad] = useState<{ spool: Spool; loc: NodeLocation; printer: Printer } | null>(null)
 
   // Consume an "act on this spool" request handed off from the All Filament In
-  // Storage tab: focus that spool's unit and open the same action hub the search
-  // browser uses (load / take out). Runs once per request, then clears it.
+  // Storage tab: focus that spool's unit and open the FULL slot action hub
+  // (load / take out / move / dry reminder / edit / delete) — the same one a
+  // direct slot tap opens — so the tab isn't limited to load/take-out. Since the
+  // node is now active, the spool lives at loc.shelf/loc.slot on it. Runs once
+  // per request, then clears it.
   useEffect(() => {
     const req = flow.inspectRequest
     if (!req) return
     if (state.activeNodeId !== req.loc.nodeId) {
       dispatch({ type: "SET_ACTIVE_NODE", id: req.loc.nodeId })
     }
-    setSearchTarget({ spool: req.spool, loc: req.loc })
+    setSlotTarget({ shelf: req.loc.shelf, slot: req.loc.slot })
     flow.consumeInspect()
   }, [flow.inspectRequest, state.activeNodeId, dispatch, flow])
 
@@ -122,17 +123,22 @@ export function HomeView() {
   // printer slot. No storage location and no carousel movement needed.
   function handleNewSpool(draft: SpoolDraft) {
     if (!pickTarget) return
-    const spool: Spool = { id: newId("spool"), createdAt: Date.now(), ...draft }
+    const spool: Spool = { id: newId("spool"), createdAt: Date.now(), ...draftToSpoolFields(draft) }
     dispatch({ type: "UPSERT_SPOOL", spool })
     dispatch({ type: "SET_PRINTER_SLOT", printerId: pickTarget.printer.id, slot: pickTarget.slot, spoolId: spool.id })
     setNewSpoolOpen(false)
     setPickTarget(null)
   }
 
-  // A stored spool was tapped in the SEARCH browser → open the action menu.
-  function handleInspect(spool: Spool, loc: NodeLocation) {
+  // A stored spool was tapped in the SEARCH browser → focus its unit and open
+  // the full slot action hub (same as a direct slot tap), so search and direct
+  // taps offer identical options.
+  function handleInspect(_spool: Spool, loc: NodeLocation) {
     setBrowserOpen(false)
-    setSearchTarget({ spool, loc })
+    if (state.activeNodeId !== loc.nodeId) {
+      dispatch({ type: "SET_ACTIVE_NODE", id: loc.nodeId })
+    }
+    setSlotTarget({ shelf: loc.shelf, slot: loc.slot })
   }
 
   // Begin loading a stored spool onto a printer: go straight to slot selection
@@ -144,21 +150,6 @@ export function HomeView() {
     } else if (loadablePrinters.length > 1) {
       setPrinterPickTarget({ spool, loc })
     }
-  }
-
-  // Action menu: "Load onto a printer".
-  function handleSearchLoad() {
-    if (!searchTarget) return
-    const { spool, loc } = searchTarget
-    setSearchTarget(null)
-    beginLoad(spool, loc)
-  }
-
-  // Action menu: "Take out of storage" → retrieve into the user's hand.
-  function handleSearchTakeOut() {
-    if (!searchTarget) return
-    flow.startRetrieve(searchTarget.spool, searchTarget.loc)
-    setSearchTarget(null)
   }
 
   // A printer was chosen for a search-load → move on to slot selection.
@@ -258,8 +249,7 @@ export function HomeView() {
       {!isManual && (
         <aside className="flex w-full shrink-0 flex-col rounded-2xl border border-border bg-panel lg:w-[300px] lg:min-h-0">
           <SidebarHeader />
-          <ShelfOverview />
-          <ManualControl />
+          <ResizableSidebar />
         </aside>
       )}
 
@@ -434,15 +424,6 @@ export function HomeView() {
           setSlotPickerPrinter(null)
         }}
         onPick={handleSlotPicked}
-      />
-
-      {/* Search-driven actions: tap a stored spool → act on it. */}
-      <SearchActionDialog
-        target={searchTarget}
-        canLoad={loadablePrinters.length > 0}
-        onLoad={handleSearchLoad}
-        onTakeOut={handleSearchTakeOut}
-        onClose={() => setSearchTarget(null)}
       />
 
       <PrinterPickerDialog

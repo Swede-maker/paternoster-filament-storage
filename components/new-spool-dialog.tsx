@@ -51,7 +51,7 @@ export function NewSpoolDialog({
         }
       />
       <DialogBody>
-        <SpoolForm value={draft} onChange={setDraft} showProfiles showBarcode />
+        <SpoolForm value={draft} onChange={setDraft} showProfiles showBarcode showTag />
       </DialogBody>
       <DialogFooter>
         <Button variant="ghost" onClick={onClose}>

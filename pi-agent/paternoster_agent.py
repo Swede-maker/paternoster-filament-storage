@@ -95,6 +95,11 @@ HOME_TIMEOUT = 30.0   # seconds to find the index sensor before faulting
 # feel instant to an operator, large enough not to spin the CPU.
 ABORT_POLL_SECONDS = 0.02
 SENSOR_BOUNCE = 0.01  # debounce (s) for the inductive sensors
+# How often the sensor-watch thread samples the shelf sensor's logical level to
+# report it to the app. This drives only the UI status lamp — NOT shelf counting
+# (that is edge-driven in the motion code) — so a light 20 Hz poll is plenty
+# responsive without loading the CPU or perturbing the timing-critical counting.
+SENSOR_POLL_SECONDS = 0.05
 # ---------------------------------------------------------------------------
 # Mechanical shelf-bounce filter.
 #
@@ -831,6 +836,16 @@ class Carousel:
         self._worker = threading.Thread(target=self._run, daemon=True)
         self._worker.start()
 
+        # Independent watcher that reports the physical shelf sensor's level to
+        # the app. Kept OFF the motion path on purpose: shelf counting is driven
+        # by the sensor's edge callbacks with carefully tuned lockouts, and this
+        # must never interfere with that. It only reads the same debounced
+        # logical level (`shelf_active()`, which already folds in SENSOR_INVERT
+        # and polarity) and emits a `sensor` event when it changes.
+        self._sensor_last: Optional[bool] = None
+        self._sensor_thread = threading.Thread(target=self._watch_sensor, daemon=True)
+        self._sensor_thread.start()
+
     # ---- public API (called from the WebSocket thread) ----
     def request_home(self) -> None:
         self._set_command(("home",))
@@ -1228,6 +1243,42 @@ class Carousel:
 
     def snapshot(self) -> dict:
         return {"type": "state", "status": self.status, "shelf": self.current_shelf, "homed": self.homed}
+
+    def sensor_snapshot(self) -> Optional[dict]:
+        """
+        Current shelf-sensor level as a `sensor` event, or None if it cannot be
+        read. Sent to each browser as it connects so a freshly opened tab shows
+        the true lamp state immediately, without waiting for the next change.
+        """
+        try:
+            return {"type": "sensor", "on": bool(self.hw.shelf_active())}
+        except Exception:
+            return None
+
+    def _watch_sensor(self) -> None:
+        """
+        Poll the shelf proximity sensor and emit a `sensor` event on every change
+        so the app's carousel lamp mirrors the real GPIO input in real time.
+
+        This is deliberately edge-agnostic and lock-free: it reads the same
+        debounced logical level the motion code uses and reports transitions.
+        Position/counting are unaffected — they remain driven by the hardware
+        edge callbacks elsewhere in this file.
+        """
+        while self._alive:
+            try:
+                val: Optional[bool] = bool(self.hw.shelf_active())
+            except Exception:
+                val = None
+            if val is not None and val != self._sensor_last:
+                self._sensor_last = val
+                try:
+                    self.emit({"type": "sensor", "on": val})
+                except Exception:
+                    # A transport hiccup must not kill the watcher; the next
+                    # change (or a reconnecting browser's snapshot) recovers it.
+                    pass
+            time.sleep(SENSOR_POLL_SECONDS)
 
     # ---- internals ----
     def _set_command(self, cmd: tuple) -> None:
@@ -1912,6 +1963,11 @@ async def serve(args) -> None:
             # dead socket in `clients` forever.
             await ws.send(json.dumps({"type": "hello", "name": args.name, "shelves": carousel.shelves, "firmware": "pax-agent-1.0", "simulated": sim_reason is not None, "simReason": sim_reason}))
             await ws.send(json.dumps(carousel.snapshot()))
+            # Sync the live shelf-sensor lamp immediately, so a tab that opens
+            # while the level is steady doesn't wait for the next transition.
+            _sensor = carousel.sensor_snapshot()
+            if _sensor is not None:
+                await ws.send(json.dumps(_sensor))
             async for raw in ws:
                 try:
                     msg = json.loads(raw)
