@@ -1,5 +1,6 @@
 "use client"
 
+import { useEffect, useState } from "react"
 import type { NodeType, ShelfMeta, StorageConfig } from "@/lib/types"
 import { Boxes, LayoutGrid, Library, Package, SlidersHorizontal } from "lucide-react"
 import { Field, Input } from "./ui/field"
@@ -33,6 +34,66 @@ export const LIMITS = {
 
 export const clampInt = (v: number, min: number, max: number) =>
   Math.max(min, Math.min(max, Math.floor(Number.isFinite(v) ? v : min)))
+
+/**
+ * Integer input that can be cleared and retyped without snapping to the minimum
+ * on every keystroke. It holds a local text buffer while focused so you can, for
+ * example, delete "10" entirely and type "20"; it only commits in-range numbers
+ * as you type and clamps to [min, max] on blur. When not focused it mirrors the
+ * committed `value` prop.
+ */
+function NumberInput({
+  value,
+  min,
+  max,
+  disabled,
+  className,
+  onCommit,
+}: {
+  value: number
+  min: number
+  max: number
+  disabled?: boolean
+  className?: string
+  onCommit: (n: number) => void
+}) {
+  const [text, setText] = useState(String(value))
+  const [focused, setFocused] = useState(false)
+
+  // Reflect external changes only while the user isn't mid-edit.
+  useEffect(() => {
+    if (!focused) setText(String(value))
+  }, [value, focused])
+
+  return (
+    <Input
+      type="number"
+      inputMode="numeric"
+      min={min}
+      max={max}
+      disabled={disabled}
+      className={className}
+      value={text}
+      onFocus={() => setFocused(true)}
+      onChange={(e) => {
+        const raw = e.target.value
+        setText(raw)
+        // Empty / partial input is allowed to persist in the field; only push a
+        // committed value when it's a valid, in-range integer.
+        if (raw === "") return
+        const n = Number.parseInt(raw, 10)
+        if (Number.isFinite(n) && n >= min && n <= max) onCommit(n)
+      }}
+      onBlur={() => {
+        setFocused(false)
+        const n = Number.parseInt(text, 10)
+        const clamped = clampInt(Number.isFinite(n) ? n : min, min, max)
+        setText(String(clamped))
+        onCommit(clamped)
+      }}
+    />
+  )
+}
 
 export function makeDraft(nodeType: NodeType): StorageDraft {
   // A library has no configurable grid, so its shelf/slot values are nominal.
@@ -227,24 +288,15 @@ export function StorageLayoutEditor({
         <>
           <div className="grid grid-cols-2 gap-4">
             <Field label={`Number of shelves (1–${limit.shelves})`}>
-              <Input
-                type="number"
-                inputMode="numeric"
-                min={1}
-                max={limit.shelves}
-                value={draft.shelves}
-                onChange={(e) => setShelves(Number.parseInt(e.target.value) || 1)}
-              />
+              <NumberInput min={1} max={limit.shelves} value={draft.shelves} onCommit={setShelves} />
             </Field>
             <Field label={`Slots per shelf (1–${limit.slots})`}>
-              <Input
-                type="number"
-                inputMode="numeric"
+              <NumberInput
                 min={1}
                 max={limit.slots}
                 value={draft.slotsPerShelf}
                 disabled={draft.jagged}
-                onChange={(e) => setSlotsPerShelf(Number.parseInt(e.target.value) || 1)}
+                onCommit={setSlotsPerShelf}
               />
             </Field>
           </div>
@@ -293,15 +345,13 @@ export function StorageLayoutEditor({
                   <span className="flex-1 text-sm text-muted-foreground">Shelf {i + 1}</span>
                 )}
                 <div className="flex items-center gap-1">
-                  <Input
-                    type="number"
-                    inputMode="numeric"
+                  <NumberInput
                     min={1}
                     max={limit.slots}
                     className="w-20"
                     value={p.slots}
                     disabled={!draft.jagged}
-                    onChange={(e) => setShelf(i, { slots: clampInt(Number.parseInt(e.target.value) || 1, 1, limit.slots) })}
+                    onCommit={(n) => setShelf(i, { slots: n })}
                   />
                   <span className="text-xs text-muted-foreground">slots</span>
                 </div>

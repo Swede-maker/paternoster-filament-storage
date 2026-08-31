@@ -16,8 +16,13 @@ import { usePersistentBoolean, usePersistentNumber } from "@/lib/use-persistent"
  * variable-length cards (e.g. a shelf list that grows with more storage units)
  * fully visible without the user having to resize them.
  *
+ * The panel can never be dragged TALLER than its content: the natural content
+ * height is the ceiling, so the handle never floats over empty space. The user
+ * can still drag it SHORTER than the content (down to `minHeight`), in which
+ * case the content scrolls inside the panel.
+ *
  * `defaultHeight` is the fallback starting height; drag adjusts within
- * [minHeight, maxHeight]. Keyboard users can focus the handle and use the
+ * [minHeight, contentHeight]. Keyboard users can focus the handle and use the
  * arrow keys.
  */
 export function ResizablePanel({
@@ -44,25 +49,30 @@ export function ResizablePanel({
   const [manual, setManual] = usePersistentBoolean(`${storageKey}:manual`, false)
   const drag = useRef<{ startY: number; startH: number } | null>(null)
 
-  // Natural content height, measured when auto-fitting.
+  // Natural content height, always measured so it can serve as the drag ceiling.
   const contentRef = useRef<HTMLDivElement | null>(null)
   const [measured, setMeasured] = useState<number | null>(null)
-  const clamp = useCallback((n: number) => Math.min(maxHeight, Math.max(minHeight, n)), [minHeight, maxHeight])
 
   useLayoutEffect(() => {
-    if (!autoFit || manual) return
     const el = contentRef.current
     if (!el) return
-    const measure = () => setMeasured(el.scrollHeight)
+    // +12px leaves room for the drag handle strip below the content.
+    const measure = () => setMeasured(el.scrollHeight + 12)
     measure()
     const ro = new ResizeObserver(measure)
     ro.observe(el)
     return () => ro.disconnect()
-  }, [autoFit, manual])
+  }, [])
+
+  // Ceiling = content height (capped by maxHeight); the panel can't grow past
+  // what it has to show, but can still shrink to minHeight.
+  const ceiling = measured != null ? Math.min(maxHeight, Math.max(minHeight, measured)) : maxHeight
+  const clamp = useCallback((n: number) => Math.min(ceiling, Math.max(minHeight, n)), [ceiling, minHeight])
 
   const autoActive = autoFit && !manual
-  // +12px leaves room for the drag handle strip below the content.
-  const effectiveHeight = autoActive && measured != null ? clamp(measured + 12) : height
+  // Auto-fit → exactly the content height. Manual → the saved height, but never
+  // taller than the content (so the handle never floats over emptiness).
+  const effectiveHeight = autoActive ? ceiling : clamp(height)
 
   const onPointerMove = useCallback(
     (e: PointerEvent) => {
@@ -130,9 +140,9 @@ export function ResizablePanel({
 
   return (
     <div className={`group/panel relative flex flex-col ${className ?? ""}`} style={{ height: effectiveHeight }}>
-      {/* The card fills the panel; its own content scrolls if taller. In
-          auto-fit mode we measure the content's natural height via this ref. */}
-      <div className={`min-h-0 flex-1 overflow-y-auto scrollbar-thin ${autoActive ? "" : "[&>*]:h-full"}`}>
+      {/* Content renders at its natural height (measured via this ref to cap the
+          drag ceiling). If the user shrinks the panel below that, it scrolls. */}
+      <div className="min-h-0 flex-1 overflow-y-auto scrollbar-thin">
         <div ref={contentRef}>{children}</div>
       </div>
 

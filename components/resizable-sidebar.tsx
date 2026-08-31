@@ -1,5 +1,6 @@
 "use client"
 
+import type { ReactNode } from "react"
 import { useCallback, useRef } from "react"
 import { ShelfOverview } from "./shelf-overview"
 import { ManualControl } from "./manual-control"
@@ -16,10 +17,25 @@ const MIN_SHELF_PX = 96
  * room; the height is saved per device. Only active on the desktop two-column
  * layout, where the sidebar has a bounded height to redistribute — on mobile
  * the two sections simply stack at their natural heights.
+ *
+ * `overview` / `control` default to the filament Shelf Overview + Manual
+ * Control, but the hardware area passes its own (part-colored overview, same
+ * controls bound to the hardware unit) so both areas share this drag behavior.
+ * `storageKey` keeps each area's divider height independent.
  */
-export function ResizableSidebar() {
+export function ResizableSidebar({
+  overview,
+  control,
+  storageKey = "pax:sidebar:shelfHeightV1",
+}: {
+  overview?: ReactNode
+  control?: ReactNode
+  storageKey?: string
+} = {}) {
   const isDesktop = useIsDesktop()
-  const [shelfHeight, setShelfHeight] = usePersistentNumber("pax:sidebar:shelfHeightV1", 220, MIN_SHELF_PX, 2000)
+  const [shelfHeight, setShelfHeight] = usePersistentNumber(storageKey, 220, MIN_SHELF_PX, 2000)
+  const overviewNode = overview ?? <ShelfOverview />
+  const controlNode = control ?? <ManualControl />
   const containerRef = useRef<HTMLDivElement>(null)
   const drag = useRef<{ startY: number; startH: number } | null>(null)
 
@@ -74,8 +90,8 @@ export function ResizableSidebar() {
   if (!isDesktop) {
     return (
       <>
-        <ShelfOverview />
-        <ManualControl />
+        {overviewNode}
+        {controlNode}
       </>
     )
   }
@@ -85,7 +101,7 @@ export function ResizableSidebar() {
       {/* Shelf overview gets a user-controlled fixed height; its inner list
           scrolls within it. */}
       <div style={{ height: shelfHeight }} className="flex min-h-0 shrink-0 flex-col">
-        <ShelfOverview />
+        {overviewNode}
       </div>
 
       {/* Drag handle */}
@@ -104,7 +120,7 @@ export function ResizableSidebar() {
 
       {/* Manual control takes the remainder and scrolls if needed. */}
       <div className="flex min-h-0 flex-1 flex-col overflow-y-auto scrollbar-thin">
-        <ManualControl />
+        {controlNode}
       </div>
     </div>
   )

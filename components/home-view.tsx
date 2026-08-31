@@ -21,7 +21,7 @@ import { NewSpoolDialog } from "./new-spool-dialog"
 import { SlotPickerDialog } from "./slot-picker-dialog"
 import { PrinterPickerDialog } from "./printer-picker-dialog"
 import { QueuePlaceDialog } from "./queue-place-dialog"
-import { activeNode, printerSlotLabel, shelfLabel } from "@/lib/selectors"
+import { activeNode, nodesForSystem, printerSlotLabel, shelfLabel } from "@/lib/selectors"
 import { newId } from "@/lib/filament"
 import type { SpoolDraft } from "./spool-form"
 import { draftToSpoolFields } from "./spool-form"
@@ -30,6 +30,9 @@ import type { Printer, Spool } from "@/lib/types"
 export function HomeView() {
   const { state, dispatch } = useStore()
   const flow = useFlow()
+  // The filament home only lists filament units; hardware carousels live in the
+  // Hardware area even though both share the physical node list.
+  const filamentNodes = nodesForSystem(state, "filament")
 
   // Which printer slot a fresh pick should target (set when tapping an empty slot).
   const [pickTarget, setPickTarget] = useState<{ printer: Printer; slot: number } | null>(null)
@@ -72,7 +75,12 @@ export function HomeView() {
     flow.consumeInspect()
   }, [flow.inspectRequest, state.activeNodeId, dispatch, flow])
 
-  const currentNode = activeNode(state)
+  // Never show a hardware unit as the filament home's main unit: if the shared
+  // activeNodeId points at a hardware carousel, fall back to the first filament
+  // unit (or the raw active node when no filament unit exists yet).
+  const sharedNode = activeNode(state)
+  const currentNode =
+    sharedNode.system === "hardware" ? (filamentNodes[0] ?? sharedNode) : sharedNode
   const isShelf = (currentNode.type ?? "paternoster") === "shelf"
   const isLibrary = (currentNode.type ?? "paternoster") === "library"
   // Both shelf and library are manual (no motor); the carousel chrome + auto
@@ -257,10 +265,11 @@ export function HomeView() {
       <div className="flex min-h-0 min-w-0 flex-1 flex-col gap-3">
         <StatsBar onSearchClick={() => setBrowserOpen(true)} />
 
-        {/* Node switcher — only shown when more than one unit is linked. */}
-        {state.nodes.length > 1 && (
+        {/* Node switcher — filament units only, so hardware carousels never
+            leak into the filament tab strip. Only shown when >1 filament unit. */}
+        {filamentNodes.length > 1 && (
           <div className="flex flex-wrap items-center gap-2" role="tablist" aria-label="Storage units">
-            {state.nodes.map((n) => {
+            {filamentNodes.map((n) => {
               const active = n.id === state.activeNodeId
               const nodeType = n.type ?? "paternoster"
               const nodeIsShelf = nodeType === "shelf"

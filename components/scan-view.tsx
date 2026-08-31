@@ -24,7 +24,7 @@ import {
 } from "lucide-react"
 import { useStore } from "@/lib/store"
 import { shelfLabel, printerSlotLabel } from "@/lib/selectors"
-import { nodeSlotCount } from "@/lib/selectors"
+import { nodeSlotCount, nodesForSystem } from "@/lib/selectors"
 import { bestNodeSlot, containerWeight } from "@/lib/balance"
 import { printerSlotCount } from "@/lib/filament"
 import { newId, spoolFill } from "@/lib/filament"
@@ -242,7 +242,7 @@ export function ScanView() {
           onBack={() => go({ v: "unbound", id: view.id, rebind: view.rebind })}
         >
           <div className="grid gap-2 sm:grid-cols-2">
-            {state.nodes.map((n) => {
+            {nodesForSystem(state, "filament").map((n) => {
               const type = n.type ?? "paternoster"
               const multiShelf = n.slots.length > 1 && type !== "library"
               const Icon = type === "library" ? Boxes : type === "shelf" ? Package : Server

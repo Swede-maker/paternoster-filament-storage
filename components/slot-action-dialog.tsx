@@ -22,7 +22,7 @@ import {
   AlertTriangle,
 } from "lucide-react"
 import { useStore } from "@/lib/store"
-import { activeNode, shelfLabel, reminderDueAt, isReminderDue } from "@/lib/selectors"
+import { activeNode, nodeSystem, shelfLabel, reminderDueAt, isReminderDue } from "@/lib/selectors"
 import { nodeFreeSlots } from "@/lib/balance"
 import { cn } from "@/lib/utils"
 import { Dialog, DialogHeader, DialogBody, DialogFooter } from "./ui/dialog"
@@ -121,7 +121,11 @@ export function SlotActionDialog({
   // Other units that can accept the spool. A library is unbounded, so it always
   // has room; fixed grids (paternoster/shelf) need at least one free slot.
   const moveTargets = state.nodes.filter(
-    (n) => n.id !== node.id && ((n.type ?? "paternoster") === "library" || nodeFreeSlots(n) > 0),
+    (n) =>
+      n.id !== node.id &&
+      // A spool can only move between filament units, never into hardware.
+      nodeSystem(n) === "filament" &&
+      ((n.type ?? "paternoster") === "library" || nodeFreeSlots(n) > 0),
   )
 
   function saveEdit() {
