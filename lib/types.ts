@@ -398,7 +398,19 @@ export interface Machine {
 export type QueueMode = "pick" | "store" | "place"
 
 export interface QueueItem {
+  /**
+   * Id of the occupant being moved. For a filament job this is a spool id; for a
+   * hardware job (`occupantKind: "part"`) it is a {@link HardwarePart} id. The
+   * field name is kept for backwards-compat with the existing motion engine.
+   */
   spoolId: string
+  /**
+   * What kind of occupant `spoolId` refers to. Absent/`"spool"` = a filament
+   * spool (default, so every existing job keeps working); `"part"` = a hardware
+   * part box. The store/confirm steps branch on this to write the right slot and
+   * skip filament-only fields (grams edits, history logging).
+   */
+  occupantKind?: OccupantKind
   /** Storage node (paternoster unit) this item belongs to. */
   nodeId: string
   /** Storage destination/source. */
@@ -415,6 +427,14 @@ export interface QueueItem {
   from?: { nodeId: string; shelf: number; slot: number }
   /** Remaining-weight override (grams) captured while assembling a store/place. */
   grams?: number
+  /**
+   * Hardware count change applied at the moment the carousel reaches this slot
+   * (only set for `occupantKind: "part"` jobs). `"add"` grows the box (store
+   * more), `"take"` removes pieces (take out); a take that empties the box also
+   * frees the slot and deletes the part. Absent for a plain new-box placement,
+   * whose count is already set on the part when it is created.
+   */
+  partOp?: { kind: "add" | "take"; count: number }
   done: boolean
 }
 
@@ -427,8 +447,14 @@ export interface ActiveJob {
 
 export interface Settings {
   systemName: string
-  /** Ask the user to confirm before every carousel movement. */
+  /** Ask the user to confirm before every carousel movement (filament units). */
   confirmBeforeMove: boolean
+  /**
+   * Same safety gate, but for hardware units. Kept separate so each area toggles
+   * independently. Optional for backwards-compat with saves made before the
+   * hardware area existed; falls back to `confirmBeforeMove` when absent.
+   */
+  confirmBeforeMoveHardware?: boolean
   /** Full spool weight assumption (g) used for new spools. */
   defaultSpoolWeight: number
   /** User-saved material/type names (in addition to the built-in list). */
@@ -480,6 +506,17 @@ export interface Settings {
    * here. Defaults to true when absent.
    */
   showUsageCardOnHome?: boolean
+  /**
+   * Which tracking area the app is currently showing. Persisted so the choice
+   * survives reloads. Defaults to "filament" when absent.
+   */
+  activeArea?: SystemKind
+  /** Saved hardware categories the user can pick when adding a part. */
+  hardwareCategories?: HardwareCategory[]
+  /** Saved hardware color presets (name + hex) for the part color picker. */
+  hardwareColorPresets?: { name: string; hex: string }[]
+  /** Saved shops (name + URL) shown as quick-launch buttons in Hardware Orders. */
+  hardwareStores?: OrderStore[]
 }
 
 export interface StorageConfig {
@@ -535,6 +572,14 @@ export interface StorageNode {
   id: string
   name: string
   /**
+   * Which tracking area this unit belongs to. "filament" stores spools;
+   * "hardware" stores {@link HardwarePart} boxes (bolts, nuts, …). The two areas
+   * never mix in the UI — every node list is filtered by the active area's
+   * system. Optional for backwards-compat with older saves (treated as
+   * "filament", so existing paternosters stay in the filament area).
+   */
+  system?: SystemKind
+  /**
    * The kind of storage this node is. Paternoster nodes are driven by a
    * controller; shelf nodes are plain manual shelving with no hardware.
    * Optional for backwards-compat with older saves (treated as "paternoster").
@@ -547,6 +592,24 @@ export interface StorageNode {
   /** IP address / hostname of the controller (RPi, microcontroller, …). */
   ip: string
   role: NodeRole
+  /**
+   * Pairing state for a real slave unit linked by a PAIRING CODE instead of an
+   * IP address. A slave never has a fixed, known address (DHCP), so it connects
+   * OUT to the master and presents this code ("phone-home"); the master then
+   * binds that physical unit to this record. No IP is ever typed by hand.
+   *
+   * - "unpaired": created as a real slave, waiting to be linked.
+   * - "pairing":  a code has been issued and we're waiting for the slave to check in.
+   * - "paired":   a slave has claimed the code and is linked.
+   *
+   * Absent on manual units (shelf/library) and on legacy nodes configured the
+   * old IP way, which keep using {@link link}.
+   */
+  pairStatus?: "unpaired" | "pairing" | "paired"
+  /** Short human code shown while waiting for the slave to check in (pairing). */
+  pairingCode?: string
+  /** Stable id the paired slave reports once linked (mock: generated locally). */
+  deviceId?: string
   /** Whether this node is simulated or backed by a real Pi agent. */
   driver: NodeDriver
   /** WebSocket port the Pi agent listens on (hardware driver). Default 8765. */
@@ -690,12 +753,86 @@ export interface FilamentUsage {
   archived: FilamentUsageArchive[]
 }
 
+// ---------------------------------------------------------------------------
+// Hardware tracking (parallel area to filament)
+// ---------------------------------------------------------------------------
+
+/** Which tracking area something belongs to. */
+export type SystemKind = "filament" | "hardware"
+
+/** What a storage slot / queue item holds. */
+export type OccupantKind = "spool" | "part"
+
+/**
+ * A batch of identical hardware pieces stored in a single carousel slot — e.g.
+ * "25× M5×40 bolts". The slot's balance weight is `count * perPieceWeightGrams`,
+ * so the shared paternoster balance engine places a box exactly as it would a
+ * spool of that total mass. One part type occupies one slot; "store more" grows
+ * `count`, taking all of it out frees the slot.
+ */
+export interface HardwarePart {
+  id: string
+  /** Display name, e.g. "M5×40 socket screw". */
+  name: string
+  /** Category name (matches a saved {@link HardwareCategory}); free-form. */
+  category: string
+  /** How many pieces are in this box right now. */
+  count: number
+  /** Weight of a single piece in grams (used for carousel balance). */
+  perPieceWeightGrams: number
+  /** Free-text search tags (e.g. "steel", "M5", "hex"). */
+  tags: string[]
+  /** Hex color the slot/box is rendered in. */
+  color: string
+  /** Human-readable color name, e.g. "Steel Blue". */
+  colorName: string
+  /**
+   * Low-stock threshold. When `count <= lowStockThreshold` a notice surfaces on
+   * the Hardware nav + list. `null`/absent = never notify for this part.
+   */
+  lowStockThreshold?: number | null
+  /**
+   * Optional photo of the part (a data URL or remote URL). Shown in the Home
+   * carousel tote and the "All Hardware" list so a part is recognizable at a
+   * glance. Absent/null falls back to the colored tote graphic.
+   */
+  imageUrl?: string | null
+  createdAt: number
+}
+
+/** A saved hardware category the user can pick/create when adding parts. */
+export interface HardwareCategory {
+  id: string
+  name: string
+}
+
+/** A single line item in an incoming hardware order / cart. */
+export interface HardwareOrderItem {
+  id: string
+  name: string
+  category: string
+  /** How many pieces of this item are on order. */
+  quantity: number
+}
+
+/** A named incoming hardware order / shopping cart. */
+export interface HardwareOrder {
+  id: string
+  name: string
+  createdAt: number
+  items: HardwareOrderItem[]
+  /** Optional link to a saved store this order was/should be placed with. */
+  storeId?: string
+}
+
 export interface AppState {
   /** Whether first-run setup has been completed. */
   configured: boolean
   settings: Settings
   /** spoolId -> Spool */
   spools: Record<string, Spool>
+  /** partId -> HardwarePart (hardware-area occupants) */
+  parts: Record<string, HardwarePart>
   /** Linked storage units. Always has at least one (the master). */
   nodes: StorageNode[]
   /** Which node the storage UI is currently focused on. */
@@ -718,6 +855,15 @@ export interface AppState {
   consumptionLog: ConsumptionBucket[]
   /** Once-per-day storage fullness snapshots for the storage-over-time chart. */
   storageSnapshots: StorageSnapshot[]
+  /** Incoming hardware orders / carts waiting to be received into storage. */
+  hardwareOrders: HardwareOrder[]
+  /**
+   * Hardware parts the operator has queued to take out, as part ids. The user
+   * assembles this list first, then presses "Ready to take out" to run one pick
+   * job that visits each part in turn — the take quantity for each is entered at
+   * the stop, not here. Ephemeral runtime state, never persisted.
+   */
+  hwPickQueue: string[]
 }
 
 /**
@@ -730,6 +876,10 @@ export interface PersistedState {
   configured: boolean
   settings: Settings
   spools: Record<string, Spool>
+  /** partId -> HardwarePart (hardware-area occupants; shared + synced). */
+  parts: Record<string, HardwarePart>
+  /** Incoming hardware orders / carts (shared + synced). */
+  hardwareOrders: HardwareOrder[]
   nodes: StorageNode[]
   activeNodeId: string
   printers: Printer[]

@@ -1,5 +1,34 @@
-import type { AppState, NodeType, Printer, Spool, StorageLocation, StorageNode } from "./types"
+import type {
+  AppState,
+  HardwarePart,
+  NodeType,
+  Printer,
+  Spool,
+  StorageLocation,
+  StorageNode,
+  SystemKind,
+} from "./types"
 import { printerAmsUnits } from "./filament"
+
+/** The area currently shown; defaults to filament for older saves. */
+export function activeArea(state: AppState): SystemKind {
+  return state.settings.activeArea === "hardware" ? "hardware" : "filament"
+}
+
+/** A node's tracking area, defaulting to filament for legacy nodes. */
+export function nodeSystem(node: StorageNode): SystemKind {
+  return node.system === "hardware" ? "hardware" : "filament"
+}
+
+/** All storage units belonging to one area. */
+export function nodesForSystem(state: AppState, system: SystemKind): StorageNode[] {
+  return state.nodes.filter((n) => nodeSystem(n) === system)
+}
+
+/** Storage units in a given area (defaults to the currently-shown area). */
+export function areaNodes(state: AppState, system: SystemKind = activeArea(state)): StorageNode[] {
+  return nodesForSystem(state, system)
+}
 
 export interface Stats {
   totalSlots: number
@@ -143,12 +172,14 @@ export function masterNode(state: AppState): StorageNode {
   return state.nodes.find((n) => n.role === "master") ?? state.nodes[0]
 }
 
-/** Aggregate stats across every linked node (the whole storage pool). */
+/** Aggregate stats across every FILAMENT node (the filament storage pool). Hardware
+ *  units are excluded here — they have their own {@link getHardwareStats}. */
 export function getStats(state: AppState): Stats {
   let totalSlots = 0
   let usedSlots = 0
   let totalGrams = 0
   for (const node of state.nodes) {
+    if (nodeSystem(node) !== "filament") continue
     totalSlots += nodeSlotCount(node)
     for (const row of node.slots) {
       for (const spoolId of row) {
@@ -182,6 +213,8 @@ export function getNodeStats(state: AppState, node: StorageNode): Stats {
 export function storedSpools(state: AppState): StoredEntry[] {
   const out: StoredEntry[] = []
   for (const node of state.nodes) {
+    // Hardware units hold parts, not spools — keep them out of spool search.
+    if (nodeSystem(node) !== "filament") continue
     for (let shelf = 0; shelf < node.slots.length; shelf++) {
       const row = node.slots[shelf]
       for (let slot = 0; slot < row.length; slot++) {
@@ -281,4 +314,101 @@ export function dueReminders(state: AppState, now: number = Date.now()): Spool[]
   return Object.values(state.spools)
     .filter((s) => isReminderDue(s, now))
     .sort((a, b) => (reminderDueAt(a) ?? 0) - (reminderDueAt(b) ?? 0))
+}
+
+// ---------------------------------------------------------------------------
+// Hardware area
+// ---------------------------------------------------------------------------
+
+/** Total balance weight of a part box: pieces × per-piece grams. */
+export function partWeightGrams(part: HardwarePart): number {
+  return Math.max(0, part.count) * Math.max(0, part.perPieceWeightGrams)
+}
+
+/** Whether a part is at/below its configured low-stock threshold. */
+export function isPartLow(part: HardwarePart): boolean {
+  return typeof part.lowStockThreshold === "number" && part.count <= part.lowStockThreshold
+}
+
+/** Parts at/below their low-stock threshold (drives the nav badge + flags). */
+export function lowStockParts(state: AppState): HardwarePart[] {
+  return Object.values(state.parts ?? {}).filter(isPartLow)
+}
+
+/** A stored hardware part together with the node + location it sits in. */
+export interface StoredPart {
+  part: HardwarePart
+  nodeId: string
+  nodeName: string
+  nodeType: NodeType
+  area?: string
+  shelfName: string
+  loc: StorageLocation
+}
+
+/** Every hardware part currently sitting in a hardware-area node. */
+export function storedParts(state: AppState): StoredPart[] {
+  const out: StoredPart[] = []
+  for (const node of state.nodes) {
+    if (nodeSystem(node) !== "hardware") continue
+    for (let shelf = 0; shelf < node.slots.length; shelf++) {
+      const row = node.slots[shelf]
+      for (let slot = 0; slot < row.length; slot++) {
+        const id = row[slot]
+        if (id && state.parts?.[id]) {
+          out.push({
+            part: state.parts[id],
+            nodeId: node.id,
+            nodeName: node.name,
+            nodeType: node.type ?? "paternoster",
+            area: shelfArea(node, shelf),
+            shelfName: shelfLabel(node, shelf),
+            loc: { shelf, slot },
+          })
+        }
+      }
+    }
+  }
+  return out
+}
+
+/** Free-text search over stored parts (name, category, tags, location). */
+export function searchParts(entries: StoredPart[], query: string): StoredPart[] {
+  const q = query.trim().toLowerCase()
+  if (!q) return entries
+  return entries.filter(({ part, nodeName, shelfName, loc }) => {
+    const haystack = [
+      part.name,
+      part.category,
+      part.colorName,
+      ...part.tags,
+      nodeName,
+      shelfName,
+      `shelf ${loc.shelf + 1}`,
+      `slot ${loc.slot + 1}`,
+    ]
+      .join(" ")
+      .toLowerCase()
+    return haystack.includes(q)
+  })
+}
+
+/** Aggregate slot stats for one area's nodes (used by hardware storage cards). */
+export function getHardwareStats(state: AppState): Stats {
+  let totalSlots = 0
+  let usedSlots = 0
+  let totalGrams = 0
+  for (const node of state.nodes) {
+    if (nodeSystem(node) !== "hardware") continue
+    totalSlots += nodeSlotCount(node)
+    for (const row of node.slots) {
+      for (const id of row) {
+        if (id && state.parts?.[id]) {
+          usedSlots++
+          totalGrams += partWeightGrams(state.parts[id])
+        }
+      }
+    }
+  }
+  return { totalSlots, usedSlots, emptySlots: totalSlots - usedSlots, totalGrams }
 }

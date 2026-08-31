@@ -16,7 +16,13 @@ import { StatisticsView } from "@/components/statistics-view"
 import { SettingsView } from "@/components/settings-view"
 import { MotionOverlay } from "@/components/motion-overlay"
 import { BottomNav, type NavTab } from "@/components/bottom-nav"
+import { AreaSwitcher } from "@/components/area-switcher"
+import { HardwareHomeView } from "@/components/hardware/hardware-home-view"
+import { HardwareInventoryView } from "@/components/hardware/hardware-inventory-view"
+import { HardwareOrdersView } from "@/components/hardware/hardware-orders-view"
+import { HardwareSettingsView } from "@/components/hardware/hardware-settings-view"
 import { NodeConnection } from "@/components/node-connection"
+import type { SystemKind } from "@/lib/types"
 
 export default function Page() {
   return (
@@ -50,8 +56,24 @@ function DailyStorageSnapshot() {
 }
 
 function AppShell() {
-  const { state, ready, loadError } = useStore()
+  const { state, dispatch, ready, loadError } = useStore()
   const [tab, setTab] = useState<NavTab>("home")
+  // Which area is on screen is a LOCAL, per-device view choice — never persisted
+  // or synced. Keeping it out of the shared document means a background sync
+  // reconcile (which can overwrite persisted settings mid-operation) can never
+  // yank the user back to the other area while they're working.
+  const [area, setArea] = useState<SystemKind>("filament")
+
+  // Switching area is a full context change: focus that area's first storage
+  // unit (so activeNode resolves to a node in the shown area) and reset to the
+  // area's Home tab so we never land on a tab that area doesn't have.
+  function changeArea(next: SystemKind) {
+    if (next === area) return
+    const firstInArea = state.nodes.find((n) => (n.system === "hardware" ? "hardware" : "filament") === next)
+    if (firstInArea) dispatch({ type: "SET_ACTIVE_NODE", id: firstInArea.id })
+    setArea(next)
+    setTab("home")
+  }
 
   if (!ready) {
     return (
@@ -100,6 +122,10 @@ function AppShell() {
 
   return (
     <div className="flex h-dvh flex-col overflow-hidden bg-background text-foreground">
+      {/* Top-level area switcher — the only place the two worlds meet. */}
+      <header className="flex shrink-0 items-center justify-center border-b border-border bg-panel px-3 py-2">
+        <AreaSwitcher area={area} onChange={changeArea} />
+      </header>
       {/* Home is a fixed dashboard that fills the viewport (no page scroll on
           desktop). Every other view is document-flow and can exceed the
           viewport, so it must scroll on desktop too — otherwise its lower cards
@@ -111,7 +137,17 @@ function AppShell() {
             : "flex min-h-0 flex-1 flex-col overflow-y-auto"
         }
       >
-        {tab === "home" ? (
+        {area === "hardware" ? (
+          tab === "orders" ? (
+            <HardwareOrdersView />
+          ) : tab === "inventory" ? (
+            <HardwareInventoryView />
+          ) : tab === "settings" ? (
+            <HardwareSettingsView />
+          ) : (
+            <HardwareHomeView />
+          )
+        ) : tab === "home" ? (
           <HomeView />
         ) : tab === "scan" ? (
           <ScanView />
@@ -129,7 +165,7 @@ function AppShell() {
           <SettingsView />
         )}
       </main>
-      <BottomNav tab={tab} onChange={setTab} />
+      <BottomNav tab={tab} onChange={setTab} area={area} />
       <MotionOverlay />
     </div>
   )

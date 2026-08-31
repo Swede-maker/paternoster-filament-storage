@@ -1,4 +1,15 @@
-import type { Container, Settings, Spool, StorageLocation, StorageNode } from "./types"
+import type { Container, Settings, StorageLocation, StorageNode } from "./types"
+
+/**
+ * The minimal shape the balance engine needs from whatever lives in a slot. Both
+ * a filament {@link Spool} and a hardware part-box (its total weight =
+ * count × per-piece grams) satisfy this, so the exact same placement math serves
+ * both areas — a "20 bolts × 3g = 60g" box is balanced like a 60g spool.
+ */
+export interface BalanceOccupant {
+  grams: number
+  containerId?: string
+}
 
 /**
  * The carousel is a vertical loop (paternoster). Each shelf sits at an angle
@@ -9,7 +20,7 @@ import type { Container, Settings, Spool, StorageLocation, StorageNode } from ".
  * All balance math is per-node: each paternoster unit balances itself.
  */
 
-type Spools = Record<string, Spool>
+type Spools = Record<string, BalanceOccupant>
 
 /** Empty weight (g) of the container a spool sits in, or 0 for a bare spool. */
 export function containerWeight(containerId: string | undefined, containers: Container[] = []): number {
@@ -24,7 +35,7 @@ export function containerWeight(containerId: string | undefined, containers: Con
  * All balance math uses this instead of the bare `grams` so a heavy dry box is
  * accounted for when choosing the best-balanced slot.
  */
-export function effectiveWeight(spool: Spool, containers: Container[] = []): number {
+export function effectiveWeight(spool: BalanceOccupant, containers: Container[] = []): number {
   return spool.grams + containerWeight(spool.containerId, containers)
 }
 
