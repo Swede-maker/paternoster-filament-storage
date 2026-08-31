@@ -3,7 +3,7 @@
 import { useMemo, useState } from "react"
 import { BarChart3 } from "lucide-react"
 import { useStore } from "@/lib/store"
-import { shelfLabel, getStats } from "@/lib/selectors"
+import { shelfLabel, getStats, nodesForSystem } from "@/lib/selectors"
 import {
   filterBuckets,
   presetRange,
@@ -77,7 +77,7 @@ export function StatisticsView() {
   // this the card only ever showed the master node, hiding secondary units.
   const [shelfNodeId, setShelfNodeId] = useState<string>("all")
   const shelfViews = useMemo(() => {
-    const perNode = state.nodes.map((node) => {
+    const perNode = nodesForSystem(state, "filament").map((node) => {
       const rows: ShelfUsage[] = node.slots.map((row, shelf) => ({
         label: shelfLabel(node, shelf),
         used: row.filter(Boolean).length,

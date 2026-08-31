@@ -1,15 +1,19 @@
 "use client"
 
 import { useState } from "react"
-import { Boxes, Check, Scale } from "lucide-react"
+import { Boxes, Check, Scale, Layers, Wrench } from "lucide-react"
 import { useStore } from "@/lib/store"
 import { cn } from "@/lib/utils"
+import type { SystemKind } from "@/lib/types"
 import { Button } from "./ui/button"
 import { draftToConfig, makeDraft, StorageLayoutEditor } from "./storage-layout-editor"
 
 export function SetupWizard() {
   const { dispatch } = useStore()
   const [draft, setDraft] = useState(() => makeDraft("paternoster"))
+  // Which area this first unit belongs to. Filament is the classic flow;
+  // hardware stores parts (bolts, nuts…) by count instead of spools.
+  const [system, setSystem] = useState<SystemKind>("filament")
   // Where to surface the "Total filament used" totals. Chosen here at setup,
   // editable later under Settings.
   const [showUsageCardOnHome, setShowUsageCardOnHome] = useState(true)
@@ -19,6 +23,8 @@ export function SetupWizard() {
   // Both shelf and library are manual (no motor), so they skip carousel copy.
   const isManual = isShelf || isLibrary
 
+  const isHardware = system === "hardware"
+
   const build = () => {
     const { storage, shelfMeta } = draftToConfig(draft)
     const fallbackName = isLibrary ? "Library 1" : isShelf ? "Shelf Storage 1" : "Paternoster 1"
@@ -26,10 +32,16 @@ export function SetupWizard() {
       type: "SETUP",
       nodeType: draft.nodeType,
       name: draft.name.trim() || fallbackName,
+      system,
       area: draft.area,
       storage,
       shelfMeta,
-      settings: { systemName: draft.name.trim() || "PAX System", showUsageCardOnHome },
+      settings: {
+        systemName: draft.name.trim() || "PAX System",
+        showUsageCardOnHome,
+        // Open the app in the area the user just set up.
+        activeArea: system,
+      },
     })
   }
 
@@ -48,9 +60,49 @@ export function SetupWizard() {
           </div>
         </div>
 
+        {/* What are you storing? Filament vs hardware. */}
+        <div className="mb-6">
+          <p className="mb-1.5 text-sm font-medium text-muted-foreground">What are you storing?</p>
+          <div className="grid grid-cols-2 gap-2">
+            <button
+              type="button"
+              onClick={() => setSystem("filament")}
+              className={cn(
+                "flex items-center gap-2 rounded-lg border p-3 text-left transition-colors",
+                !isHardware
+                  ? "border-primary bg-primary/10 text-foreground"
+                  : "border-border text-muted-foreground hover:text-foreground",
+              )}
+            >
+              <Layers className="h-5 w-5 shrink-0" />
+              <span>
+                <span className="block text-sm font-medium">Filament</span>
+                <span className="block text-xs text-muted-foreground">Spools, by weight</span>
+              </span>
+            </button>
+            <button
+              type="button"
+              onClick={() => setSystem("hardware")}
+              className={cn(
+                "flex items-center gap-2 rounded-lg border p-3 text-left transition-colors",
+                isHardware
+                  ? "border-primary bg-primary/10 text-foreground"
+                  : "border-border text-muted-foreground hover:text-foreground",
+              )}
+            >
+              <Wrench className="h-5 w-5 shrink-0" />
+              <span>
+                <span className="block text-sm font-medium">Hardware</span>
+                <span className="block text-xs text-muted-foreground">Parts, by count</span>
+              </span>
+            </button>
+          </div>
+        </div>
+
         <StorageLayoutEditor draft={draft} onChange={setDraft} />
 
-        {/* Filament-usage visibility preference. */}
+        {/* Filament-usage visibility preference (filament area only). */}
+        {!isHardware && (
         <div className="mt-6 rounded-xl border border-border bg-background/60 p-4">
           <div className="mb-3 flex items-center gap-2">
             <span className="flex h-8 w-8 items-center justify-center rounded-lg bg-secondary">
@@ -93,6 +145,7 @@ export function SetupWizard() {
           </div>
           <p className="mt-2 text-xs text-muted-foreground">You can change this later under Settings.</p>
         </div>
+        )}
 
         <div className="mt-6 space-y-3">
           <Button size="lg" className="w-full" onClick={build}>

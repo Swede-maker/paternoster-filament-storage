@@ -3,7 +3,7 @@
 import { useEffect, useState } from "react"
 import { PackageMinus, Archive, Trash2, Server, Package, Library, MapPin, Pencil, Save, ArrowLeft } from "lucide-react"
 import { useStore } from "@/lib/store"
-import { printerSlotLabel } from "@/lib/selectors"
+import { printerSlotLabel, nodeSystem } from "@/lib/selectors"
 import { nodeFreeSlots } from "@/lib/balance"
 import { formatGrams, formatRemaining, isLightColor, spoolFill } from "@/lib/filament"
 import { Dialog, DialogHeader, DialogBody, DialogFooter } from "./ui/dialog"
@@ -52,7 +52,7 @@ export function UnloadDialog({
   // Units that still have room, with a friendly capacity/label for each. A
   // library is an unbounded catalog, so it always has room (never "Full") no
   // matter how many spools it already holds.
-  const options = state.nodes.map((n) => {
+  const options = state.nodes.filter((n) => nodeSystem(n) === "filament").map((n) => {
     const type = n.type ?? "paternoster"
     const isLibrary = type === "library"
     return {

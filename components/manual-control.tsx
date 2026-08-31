@@ -7,10 +7,14 @@ import { DEFAULT_RAMP_PCT, HOMING_DUTY_RATIO, homingDutyFor, moveDutyFor, approa
 import { Button } from "./ui/button"
 import { cn } from "@/lib/utils"
 import { usePersistentBoolean } from "@/lib/use-persistent"
+import type { StorageNode } from "@/lib/types"
 
-export function ManualControl() {
+export function ManualControl({ node: nodeProp }: { node?: StorageNode } = {}) {
   const { state, dispatch } = useStore()
-  const node = activeNode(state)
+  // Defaults to the shared active node (filament sidebar). The hardware sidebar
+  // passes its own unit explicitly so the controls always match the carousel
+  // shown, even if the shared active node briefly points elsewhere.
+  const node = nodeProp ?? activeNode(state)
   // Speed sliders start expanded; collapsing them frees sidebar space. The
   // choice is remembered per device.
   const [speedsOpen, setSpeedsOpen] = usePersistentBoolean("pax:manual:speedsOpen", true)

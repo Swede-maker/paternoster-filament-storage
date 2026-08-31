@@ -1,16 +1,19 @@
 "use client"
 
 import { useEffect, useState } from "react"
-import { Loader2, CheckCircle2, ArrowUpCircle, ArrowDownCircle, MapPin, Layers, QrCode, ScanLine } from "lucide-react"
+import { Loader2, CheckCircle2, ArrowUpCircle, ArrowDownCircle, MapPin, Layers, QrCode, ScanLine, Plus } from "lucide-react"
 import { useStore } from "@/lib/store"
 import { Button } from "./ui/button"
 import { Input, Field } from "./ui/field"
 import { SpoolDisc, discColor2 } from "./spool"
+import { PartBox } from "./hardware/part-box"
+import { HardwareForm } from "./hardware/hardware-form"
+import { placeNewPart } from "@/lib/hardware-flow"
 import { formatGrams, isLightColor } from "@/lib/filament"
-import { printerSlotLabel, shelfLabel, getNode } from "@/lib/selectors"
+import { printerSlotLabel, shelfLabel, getNode, partWeightGrams } from "@/lib/selectors"
 import { findBinding, shortTagId } from "@/lib/tags"
 import { TagScanner } from "./tag-scanner"
-import type { Printer, Spool, StorageNode } from "@/lib/types"
+import type { HardwarePart, Printer, Spool, StorageNode } from "@/lib/types"
 
 /**
  * Full-screen operation overlay shown whenever a job is running. Displays the
@@ -21,9 +24,15 @@ export function MotionOverlay() {
   const { state, dispatch } = useStore()
   const job = state.job
   const [grams, setGrams] = useState<string>("")
+  // How many pieces to take out at a hardware pick stop, entered live per box.
+  const [takeQty, setTakeQty] = useState<string>("1")
   // Scan-to-confirm state for disambiguating identical spools (see below).
   const [scanOpen, setScanOpen] = useState(false)
   const [scanError, setScanError] = useState<string | null>(null)
+  // "Queue another part" form, opened from the + in the progress row so the
+  // operator can pile up placements without leaving the running operation.
+  const [addOpen, setAddOpen] = useState(false)
+  const [queueError, setQueueError] = useState<string | null>(null)
   // Clear any stale scan warning whenever we advance to a new stop.
   useEffect(() => setScanError(null), [job?.currentIndex])
 
@@ -36,7 +45,12 @@ export function MotionOverlay() {
     targetShelf: null,
     currentShelf: 0,
   }
-  const spool = item ? state.spools[item.spoolId] : null
+  // An item is either a filament spool or a hardware part box. For a part,
+  // `spool` stays null (so all spool-only UI — disc, grams prompt, tag scan —
+  // is skipped) and we render the part identity instead.
+  const isPart = item?.occupantKind === "part"
+  const spool = item && !isPart ? state.spools[item.spoolId] : null
+  const part = item && isPart ? state.parts[item.spoolId] ?? null : null
   const printer: Printer | undefined = item?.printerId
     ? state.printers.find((p) => p.id === item.printerId)
     : undefined
@@ -55,6 +69,12 @@ export function MotionOverlay() {
       setGrams(String(Math.round(item?.grams ?? spool.grams)))
     }
   }, [status, spool, item?.grams])
+
+  // Reset the take-out quantity to 1 each time the carousel reaches a new
+  // hardware pick stop, so the operator deliberately dials in the amount.
+  useEffect(() => {
+    if (status === "awaiting-pick-confirm" && part) setTakeQty("1")
+  }, [status, part?.id])
 
   // When the machine stops at a shelf awaiting a pick/store confirm, bring the
   // carousel (with its flashing target slot) to the top of the screen so it
@@ -97,6 +117,14 @@ export function MotionOverlay() {
   const commitStore = () => {
     const g = Number.parseInt(grams)
     dispatch({ type: "CONFIRM_STOP", grams: Number.isFinite(g) ? Math.max(0, g) : undefined })
+  }
+
+  // Queue another hardware part behind the running operation. placeNewPart
+  // reserves already-queued slots, so the new box gets its own balanced slot and
+  // is appended to the current place job (or runs right after a pick/store one).
+  const handleQueue = (part: HardwarePart) => {
+    const ok = placeNewPart(state, dispatch, part, item?.nodeId)
+    setQueueError(ok ? null : "All hardware storage is full. Free a slot or add a unit first.")
   }
 
   // Resolve a raw scan to a spool id: prefer a direct spool-tag match among the
@@ -146,7 +174,11 @@ export function MotionOverlay() {
         {/* progress */}
         <div className="mb-4 flex items-center justify-between text-xs text-muted-foreground">
           <span className="uppercase tracking-wider">
-            {job.mode === "pick"
+            {isPart
+              ? job.mode === "pick"
+                ? "Retrieving hardware"
+                : "Placing hardware"
+              : job.mode === "pick"
               ? "Picking filament"
               : // A single store-mode job can carry placements (brand-new spools),
                 // stores (off a printer), and moves. Label by the current item so
@@ -155,10 +187,29 @@ export function MotionOverlay() {
                 ? "Placing filament"
                 : "Storing filament"}
           </span>
-          <span className="font-mono">
-            {step} / {total}
-          </span>
+          <div className="flex items-center gap-2">
+            <span className="font-mono">
+              {step} / {total}
+            </span>
+            {isPart && (
+              <button
+                type="button"
+                onClick={() => {
+                  setQueueError(null)
+                  setAddOpen(true)
+                }}
+                className="inline-flex items-center gap-1 rounded-md border border-primary/40 bg-primary/10 px-2 py-2.5 text-[11px] font-medium text-primary transition-colors hover:bg-primary/20"
+                aria-label="Queue another part behind this operation"
+                title="Queue another part"
+              >
+                <Plus className="h-3.5 w-3.5" strokeWidth={2.5} /> Queue
+              </button>
+            )}
+          </div>
         </div>
+        {queueError && (
+          <p className="-mt-2 mb-3 text-xs font-medium text-warning text-pretty">{queueError}</p>
+        )}
 
         {/* spool identity */}
         {spool && (
@@ -170,6 +221,20 @@ export function MotionOverlay() {
               </p>
               <p className="text-sm text-muted-foreground">
                 {spool.brand} · {formatGrams(spool.grams)}
+              </p>
+            </div>
+          </div>
+        )}
+
+        {/* hardware part identity */}
+        {part && (
+          <div className="mb-5 flex items-center gap-4">
+            <PartBox color={part.color} size={72} imageUrl={part.imageUrl} name={part.name} />
+            <div>
+              <p className="text-lg font-semibold text-foreground">{part.name}</p>
+              <p className="text-sm text-muted-foreground">
+                {part.category ? `${part.category} · ` : ""}
+                {part.count} pcs · {formatGrams(partWeightGrams(part))}
               </p>
             </div>
           </div>
@@ -204,7 +269,7 @@ export function MotionOverlay() {
               showNodeName={multiNode}
               shelf={item.shelf}
               slot={item.slot}
-              verb="Take spool from"
+              verb={isPart ? "Take hardware from" : "Take spool from"}
             />
             {printer && item.printerSlot != null && (
               <p className="mb-4 text-sm text-muted-foreground">
@@ -212,9 +277,43 @@ export function MotionOverlay() {
                 <span className="font-mono text-foreground">{printerSlotLabel(printer, item.printerSlot)}</span>
               </p>
             )}
-            <Button size="lg" className="w-full" onClick={() => dispatch({ type: "CONFIRM_STOP" })}>
-              <CheckCircle2 className="h-5 w-5" /> Confirm pick
-            </Button>
+            {isPart && part && item.partOp?.kind === "take" ? (
+              (() => {
+                const qty = Math.max(0, Math.round(Number.parseFloat(takeQty) || 0))
+                const capped = Math.min(qty, part.count)
+                return (
+                  <>
+                    <Field label={`How many to take out? (max ${part.count})`} className="mb-4 text-left">
+                      <Input
+                        type="number"
+                        inputMode="numeric"
+                        min={1}
+                        max={part.count}
+                        value={takeQty}
+                        autoFocus
+                        onChange={(e) => setTakeQty(e.target.value)}
+                      />
+                      <p className="mt-1.5 text-xs text-muted-foreground">
+                        Leaves <span className="font-mono text-foreground">{Math.max(0, part.count - capped)}</span> pcs.
+                        Taking all empties the slot.
+                      </p>
+                    </Field>
+                    <Button
+                      size="lg"
+                      className="w-full"
+                      disabled={capped <= 0}
+                      onClick={() => dispatch({ type: "CONFIRM_STOP", takeCount: capped })}
+                    >
+                      <CheckCircle2 className="h-5 w-5" /> Take {capped} &amp; confirm
+                    </Button>
+                  </>
+                )
+              })()
+            ) : (
+              <Button size="lg" className="w-full" onClick={() => dispatch({ type: "CONFIRM_STOP" })}>
+                <CheckCircle2 className="h-5 w-5" /> Confirm pick
+              </Button>
+            )}
           </div>
         )}
 
@@ -225,7 +324,15 @@ export function MotionOverlay() {
               showNodeName={multiNode}
               shelf={item.shelf}
               slot={item.slot}
-              verb={item.from ? "Move spool to" : item.printerId != null ? "Store spool in" : "Place spool in"}
+              verb={
+                isPart
+                  ? "Place hardware in"
+                  : item.from
+                  ? "Move spool to"
+                  : item.printerId != null
+                  ? "Store spool in"
+                  : "Place spool in"
+              }
             />
             {item.from &&
               (() => {
@@ -266,7 +373,7 @@ export function MotionOverlay() {
                 {scanError && <p className="mt-2 text-xs font-medium text-destructive text-pretty">{scanError}</p>}
               </div>
             )}
-            {isStore && (
+            {isStore && !isPart && (
               <Field label="Update remaining weight (optional)" className="mb-4">
                 <div className="flex items-center gap-2">
                   <Input
@@ -324,6 +431,9 @@ export function MotionOverlay() {
         onScan={handleConfirmScan}
         onClose={() => setScanOpen(false)}
       />
+
+      {/* Queue-another-part form, launched from the + in the progress row. */}
+      <HardwareForm open={addOpen} onClose={() => setAddOpen(false)} onSubmit={handleQueue} />
     </>
   )
 }

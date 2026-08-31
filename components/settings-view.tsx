@@ -31,7 +31,7 @@ import {
 import { useStore } from "@/lib/store"
 import { useTheme } from "@/lib/use-theme"
 import { cn } from "@/lib/utils"
-import { getStats, nodeSlotCount, shelfLabel } from "@/lib/selectors"
+import { getStats, nodeSlotCount, nodesForSystem, shelfLabel } from "@/lib/selectors"
 import { newId, formatGrams } from "@/lib/filament"
 import { newQrTagId, qrPayload, allBindings, describeTarget } from "@/lib/tags"
 import { QrPrintButton } from "./qr-print-button"
@@ -284,12 +284,15 @@ function LinkChip({ node }: { node: StorageNode }) {
 /** Lists every storage unit with its type, location, link state and slot count. */
 function NodeList() {
   const { state, dispatch } = useStore()
-  const canRemove = state.nodes.length > 1
+  // Filament Settings manages filament units only — hardware units have their
+  // own management screen in the Hardware area.
+  const filamentNodes = nodesForSystem(state, "filament")
+  const canRemove = filamentNodes.length > 1
   const [editingId, setEditingId] = useState<string | null>(null)
 
   return (
     <ul className="space-y-2">
-      {state.nodes.map((node) => {
+      {filamentNodes.map((node) => {
         const nodeType = node.type ?? "paternoster"
         const isShelf = nodeType === "shelf"
         const isLibrary = nodeType === "library"
@@ -952,10 +955,12 @@ function PresetList({
  */
 function LocationQrManager() {
   const { state, dispatch } = useStore()
-  const [nodeId, setNodeId] = useState(state.nodes[0]?.id ?? "")
+  // Location QR codes are a filament-area feature, so only filament units.
+  const qrNodes = nodesForSystem(state, "filament")
+  const [nodeId, setNodeId] = useState(qrNodes[0]?.id ?? "")
   const [shelf, setShelf] = useState(0)
 
-  const node = state.nodes.find((n) => n.id === nodeId) ?? state.nodes[0]
+  const node = qrNodes.find((n) => n.id === nodeId) ?? qrNodes[0]
   const shelfCount = node?.slots.length ?? 0
 
   // Reuse an existing shelf binding if one exists, else mint a fresh id.
@@ -997,7 +1002,7 @@ function LocationQrManager() {
               setMinted(null)
             }}
           >
-            {state.nodes.map((n) => (
+            {qrNodes.map((n) => (
               <option key={n.id} value={n.id}>
                 {n.name}
               </option>
