@@ -3,25 +3,32 @@
 import { Home, Settings, ShoppingCart, History, Droplets, Boxes, BarChart3, ScanLine } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { useStore } from "@/lib/store"
-import { dueReminders } from "@/lib/selectors"
+import { dueReminders, lowStockParts } from "@/lib/selectors"
+import type { SystemKind } from "@/lib/types"
 
 export type NavTab = "home" | "scan" | "orders" | "history" | "drying" | "inventory" | "statistics" | "settings"
 
 export function BottomNav({
   tab,
   onChange,
+  area = "filament",
 }: {
   tab: NavTab
   onChange: (t: NavTab) => void
+  /** Which area's tab set to render. Hardware drops printers/scan/drying/stats. */
+  area?: SystemKind
 }) {
   const { state } = useStore()
 
   const orderCount = (state.settings.orders ?? []).length
+  const hwOrderCount = (state.hardwareOrders ?? []).length
   // Surface overdue dry reminders as an alert badge on the Filament Drying tab —
   // like the Orders badge, but colored as an alert since it's time-sensitive.
   const dueCount = dueReminders(state).length
+  // Hardware low-stock count drives an alert badge on the hardware nav.
+  const lowCount = lowStockParts(state).length
 
-  const items: { id: NavTab; label: string; icon: typeof Home; badge?: number; alert?: boolean }[] = [
+  const filamentItems: { id: NavTab; label: string; icon: typeof Home; badge?: number; alert?: boolean }[] = [
     { id: "home", label: "Home", icon: Home },
     { id: "scan", label: "Scan", icon: ScanLine },
     { id: "orders", label: "Orders", icon: ShoppingCart, badge: orderCount || undefined },
@@ -31,6 +38,17 @@ export function BottomNav({
     { id: "statistics", label: "Statistik", icon: BarChart3 },
     { id: "settings", label: "Settings", icon: Settings },
   ]
+
+  // Hardware area: no printers, so no scan/drying/statistik. The inventory tab
+  // becomes "All Hardware", and low-stock parts get an alert badge on it.
+  const hardwareItems: typeof filamentItems = [
+    { id: "home", label: "Home", icon: Home },
+    { id: "inventory", label: "All Hardware In Storage", icon: Boxes, badge: lowCount || undefined, alert: lowCount > 0 },
+    { id: "orders", label: "Orders", icon: ShoppingCart, badge: hwOrderCount || undefined },
+    { id: "settings", label: "Settings", icon: Settings },
+  ]
+
+  const items = area === "hardware" ? hardwareItems : filamentItems
 
   // The system is "online" once every linked node is homed and none is homing.
   const anyHoming = state.nodes.some((n) => n.machine.status === "homing")
@@ -86,7 +104,7 @@ export function BottomNav({
       </nav>
 
       {/* Version footnote — desktop only; it just wastes width on a phone. */}
-      <div className="hidden shrink-0 text-xs text-muted-foreground lg:block">PAX Filament System v1.0.0</div>
+      <div className="hidden shrink-0 text-xs text-muted-foreground lg:block">PAX Storage System</div>
     </footer>
   )
 }

@@ -16,6 +16,11 @@ import type {
   FilamentOrder,
   FilamentProfile,
   FilamentUsage,
+  HardwareCategory,
+  HardwareOrder,
+  HardwareOrderItem,
+  HardwarePart,
+  SystemKind,
   HistoryEvent,
   HistoryEventKind,
   Machine,
@@ -25,6 +30,8 @@ import type {
   NodeType,
   OrderItem,
   OrderStore,
+  QueueItem,
+  QueueMode,
   PersistedState,
   Printer,
   StorageSnapshot,
@@ -127,6 +134,8 @@ function toPersisted(state: AppState): PersistedState {
     configured: state.configured,
     settings: state.settings,
     spools: state.spools,
+    parts: state.parts ?? {},
+    hardwareOrders: state.hardwareOrders ?? [],
     // Reset live link status so a saved snapshot doesn't claim a unit is
     // online on a device that isn't actually connected to it. Also normalize the
     // volatile machine-motion fields (status/target/direction) to their idle
@@ -204,6 +213,29 @@ function mergeByKey<T>(
   // not present locally AND not present in the baseline we diverged from.
   const extras = (remote ?? []).filter((r) => !seen.has(key(r)) && !baseKeys.has(key(r)))
   return extras.length ? [...base, ...extras] : base
+}
+
+/**
+ * Delete-safe merge of a keyed record (e.g. hardware parts). Local always wins
+ * for keys it holds; a remote entry is folded in only when its key is new since
+ * the `baseline` (a genuine concurrent add on another device). An entry that WAS
+ * in the baseline but is now missing locally is a local delete, so it is not
+ * resurrected. Mirrors {@link mergeByKey} for object maps.
+ */
+function mergeRecordByKey<T>(
+  local: Record<string, T> | undefined,
+  remote: Record<string, T> | undefined,
+  baseline: Record<string, T> | undefined,
+): Record<string, T> {
+  const base = local ?? {}
+  const baseKeys = new Set(Object.keys(baseline ?? {}))
+  let out: Record<string, T> | null = null
+  for (const [k, v] of Object.entries(remote ?? {})) {
+    if (k in base || baseKeys.has(k)) continue
+    if (!out) out = { ...base }
+    out[k] = v
+  }
+  return out ?? base
 }
 
 /**
@@ -329,15 +361,36 @@ function mergeCatalog(local: PersistedState, remote: PersistedState, baseline: P
   )
     .sort((a, b) => (a.day < b.day ? -1 : a.day > b.day ? 1 : 0))
     .slice(-STORAGE_SNAPSHOT_CAP)
+  // Hardware parts: a keyed map like spools but with no server-side background
+  // mutation, so local wins for keys we already know and we only fold in parts
+  // another device ADDED since our baseline (mirrors mergeByKey's delete-safe
+  // rule so a locally-removed part isn't resurrected).
+  const parts = mergeRecordByKey(local.parts, remote.parts, baseline?.parts)
+  const hardwareOrders = mergeByKey(local.hardwareOrders, remote.hardwareOrders, baseline?.hardwareOrders, (o) => o.id)
   return {
     ...local,
     spools,
+    parts,
+    hardwareOrders,
     history,
     usage,
     consumptionLog,
     storageSnapshots,
     settings: {
       ...ls,
+      hardwareCategories: mergeByKey(
+        ls.hardwareCategories,
+        rs.hardwareCategories,
+        bs?.hardwareCategories,
+        (c) => c.id,
+      ),
+      hardwareColorPresets: mergeByKey(
+        ls.hardwareColorPresets,
+        rs.hardwareColorPresets,
+        bs?.hardwareColorPresets,
+        (c) => c.hex.toLowerCase(),
+      ),
+      hardwareStores: mergeByKey(ls.hardwareStores, rs.hardwareStores, bs?.hardwareStores, (s) => s.id),
       filamentProfiles: mergeByKey(ls.filamentProfiles, rs.filamentProfiles, bs?.filamentProfiles, (p) => p.id),
       barcodes: mergeByKey(ls.barcodes, rs.barcodes, bs?.barcodes, (b) => b.code),
       tagBindings: mergeByKey(ls.tagBindings, rs.tagBindings, bs?.tagBindings, (t) => t.id),
@@ -370,6 +423,7 @@ const SIM_STEP_MS = 420
 const defaultSettings: Settings = {
   systemName: "PAX System",
   confirmBeforeMove: true,
+  confirmBeforeMoveHardware: true,
   defaultSpoolWeight: 1000,
   customMaterials: [],
   customBrands: [],
@@ -422,12 +476,25 @@ function shelfMachine(): Machine {
 const DEFAULT_AGENT_PORT = 8765
 
 let nodeCounter = 0
+/**
+ * A short, human-friendly pairing code (e.g. "K7QP-2M"). Ambiguous characters
+ * (0/O, 1/I/L) are omitted so it's easy to read off a screen and type on the
+ * slave. This is the value the slave presents when it phones home.
+ */
+function makePairingCode(): string {
+  const alphabet = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
+  let out = ""
+  for (let i = 0; i < 6; i++) out += alphabet[Math.floor(Math.random() * alphabet.length)]
+  return `${out.slice(0, 4)}-${out.slice(4)}`
+}
+
 function makeNode(opts: {
   name: string
   ip: string
   role: NodeRole
   storage: StorageConfig
   type?: NodeType
+  system?: SystemKind
   area?: string
   shelfMeta?: ShelfMeta[]
   driver?: NodeDriver
@@ -443,6 +510,7 @@ function makeNode(opts: {
   return {
     id: `node-${Date.now().toString(36)}-${nodeCounter}`,
     name: opts.name,
+    system: opts.system ?? "filament",
     type,
     area: opts.area?.trim() || undefined,
     shelfMeta: opts.shelfMeta,
@@ -473,6 +541,7 @@ function makeInitialState(): AppState {
     configured: false,
     settings: defaultSettings,
     spools: {},
+    parts: {},
     nodes: [master],
     activeNodeId: master.id,
     printers: [],
@@ -483,6 +552,8 @@ function makeInitialState(): AppState {
     usage: defaultUsage(),
     consumptionLog: [],
     storageSnapshots: [],
+    hardwareOrders: [],
+    hwPickQueue: [],
   }
 }
 
@@ -490,11 +561,12 @@ function makeInitialState(): AppState {
 // Actions
 // ---------------------------------------------------------------------------
 
-type Action =
+export type Action =
   | { type: "HYDRATE"; state: AppState }
   | {
       type: "SETUP"
       nodeType: NodeType
+      system?: SystemKind
       name?: string
       area?: string
       storage: StorageConfig
@@ -510,12 +582,15 @@ type Action =
       type: "ADD_NODE"
       name: string
       nodeType: NodeType
+      system?: SystemKind
       ip?: string
       area?: string
       storage: StorageConfig
       shelfMeta?: ShelfMeta[]
       driver?: NodeDriver
       port?: number
+      /** Mark this unit as a real slave to be linked later via a pairing code. */
+      pair?: boolean
     }
   | {
       type: "UPDATE_NODE"
@@ -529,6 +604,13 @@ type Action =
   | { type: "RECONNECT_NODE"; id: string }
   | { type: "SET_MASTER"; id: string }
   | { type: "SET_ACTIVE_NODE"; id: string }
+  // Pairing a real slave by code (no IP). See StorageNode.pairStatus.
+  /** Issue a fresh pairing code and wait for the slave to check in. */
+  | { type: "START_PAIRING"; id: string }
+  /** The slave checked in with the code — bind it (mock: id generated here). */
+  | { type: "CONFIRM_PAIRING"; id: string; deviceId?: string }
+  /** Unlink a paired slave; it returns to "unpaired" awaiting a new code. */
+  | { type: "UNPAIR_NODE"; id: string }
   // Hardware bridge (events reported by a real Pi agent over WebSocket)
   | { type: "NODE_LINK"; nodeId: string; link: PrinterLinkStatus; reason?: string }
   | { type: "NODE_AGENT_MODE"; nodeId: string; simulated: boolean; reason?: string }
@@ -605,6 +687,38 @@ type Action =
   | { type: "ARRIVED"; nodeId: string }
   | { type: "CONFIRM_MOVE"; nodeId: string }
 
+  // ----- hardware area -----
+  /** Set the currently-shown tracking area (filament vs hardware). */
+  | { type: "SET_ACTIVE_AREA"; area: SystemKind }
+  /** Create or replace a hardware part record. */
+  | { type: "UPSERT_PART"; part: HardwarePart }
+  /** Delete a part and clear whatever slot it occupied. */
+  | { type: "REMOVE_PART"; id: string }
+  /** Add pieces to an existing part box (weight follows the new count). */
+  | { type: "HW_STORE_MORE"; partId: string; addCount: number }
+  /**
+   * Take pieces out of a part box. Clamped to what's available; when the box
+   * empties completely the part is removed and its slot is freed.
+   */
+  | { type: "HW_TAKE"; partId: string; takeCount: number }
+  // Hardware take-out queue (assemble first, run as one job). See AppState.hwPickQueue.
+  | { type: "HW_QUEUE_TAKE_ADD"; partId: string }
+  | { type: "HW_QUEUE_TAKE_REMOVE"; partId: string }
+  | { type: "HW_QUEUE_TAKE_CLEAR" }
+  // Hardware categories + color presets (saved lists for the add-part form)
+  | { type: "ADD_HW_CATEGORY"; category: HardwareCategory }
+  | { type: "REMOVE_HW_CATEGORY"; id: string }
+  | { type: "ADD_HW_COLOR"; color: { name: string; hex: string } }
+  | { type: "REMOVE_HW_COLOR"; hex: string }
+  // Hardware orders / carts (qty-based, mirror filament orders)
+  | { type: "ADD_HW_ORDER"; order: HardwareOrder }
+  | { type: "RENAME_HW_ORDER"; id: string; name: string }
+  | { type: "REMOVE_HW_ORDER"; id: string }
+  | { type: "ADD_HW_ORDER_ITEM"; orderId: string; item: HardwareOrderItem }
+  | { type: "REMOVE_HW_ORDER_ITEM"; orderId: string; itemId: string }
+  | { type: "ADD_HW_STORE"; store: OrderStore }
+  | { type: "REMOVE_HW_STORE"; id: string }
+
   | { type: "SET_NODE_RAMP"; nodeId: string; rampPct: number }
   | { type: "SET_NODE_PWM"; nodeId: string; pwmDuty: number }
   // `undefined` = clear the override, letting homing track the move duty again.
@@ -614,7 +728,14 @@ type Action =
   | { type: "START_JOB"; job: ActiveJob }
   /** Queue several jobs to run back-to-back (first runs now, rest wait). */
   | { type: "START_JOBS"; jobs: ActiveJob[] }
-  | { type: "CONFIRM_STOP"; grams?: number }
+  /**
+   * Add one more stop to an operation already in flight (used by the hardware
+   * "+" so parts can be queued mid-run, like the filament tray). If a job of the
+   * same mode is running the item is appended to it; a different mode chains as
+   * its own job; nothing running starts a fresh job.
+   */
+  | { type: "ENQUEUE_JOB_ITEM"; item: QueueItem; mode: QueueMode }
+  | { type: "CONFIRM_STOP"; grams?: number; takeCount?: number }
   /**
    * Correct a mix-up between physically identical spools: the operator scanned a
    * spool other than the one the current stop expected. Swaps which spool id the
@@ -635,6 +756,27 @@ function getNode(state: AppState, nodeId: string): StorageNode | undefined {
 /** Replace one node via an updater, returning new state. */
 function withNode(state: AppState, nodeId: string, fn: (n: StorageNode) => StorageNode): AppState {
   return { ...state, nodes: state.nodes.map((n) => (n.id === nodeId ? fn(n) : n)) }
+}
+
+/** Weight the carousel must balance for a part box: pieces × per-piece grams. */
+export function partWeight(part: HardwarePart): number {
+  return Math.max(0, part.count) * Math.max(0, part.perPieceWeightGrams)
+}
+
+/** Find which node/shelf/slot an occupant id currently sits in, if any. */
+function findOccupantLocation(
+  state: AppState,
+  id: string,
+): { nodeId: string; shelf: number; slot: number } | null {
+  for (const n of state.nodes) {
+    for (let s = 0; s < n.slots.length; s++) {
+      const row = n.slots[s] ?? []
+      for (let slot = 0; slot < row.length; slot++) {
+        if (row[slot] === id) return { nodeId: n.id, shelf: s, slot }
+      }
+    }
+  }
+  return null
 }
 
 function removeSpoolEverywhere(state: AppState, id: string): AppState {
@@ -676,7 +818,13 @@ function beginNodeMoveTo(state: AppState, nodeId: string, target: number, servic
     return state
   }
   const { direction } = shortestRotation(node.machine.currentShelf, target, node.storage.shelves)
-  const needsConfirm = serviced && state.settings.confirmBeforeMove
+  // Each area has its own safety gate. Hardware falls back to the filament flag
+  // for saves made before the per-area setting existed.
+  const confirmSetting =
+    node.system === "hardware"
+      ? (state.settings.confirmBeforeMoveHardware ?? state.settings.confirmBeforeMove)
+      : state.settings.confirmBeforeMove
+  const needsConfirm = serviced && confirmSetting
   return withNode(state, nodeId, (n) => ({
     ...n,
     machine: {
@@ -809,6 +957,7 @@ function coreReducer(state: AppState, action: Action): AppState {
         ip: "127.0.0.1",
         role: "master",
         type: action.nodeType,
+        system: action.system ?? "filament",
         area: action.area,
         shelfMeta: action.shelfMeta,
         storage: action.storage,
@@ -853,12 +1002,17 @@ function coreReducer(state: AppState, action: Action): AppState {
         ip: action.ip ?? "127.0.0.1",
         role: "slave",
         type: action.nodeType,
+        system: action.system ?? "filament",
         area: action.area,
         shelfMeta: action.shelfMeta,
         storage: action.storage,
         driver: action.driver,
         port: action.port,
       })
+      // A real slave linked by code starts "unpaired"; it runs on the simulated
+      // driver until (and after) a real agent phones home, so the app never
+      // tries to reach a fixed IP for it.
+      if (action.pair) node.pairStatus = "unpaired"
       return { ...state, nodes: [...state.nodes, node] }
     }
 
@@ -948,6 +1102,174 @@ function coreReducer(state: AppState, action: Action): AppState {
 
     case "SET_ACTIVE_NODE":
       return getNode(state, action.id) ? { ...state, activeNodeId: action.id } : state
+
+    case "START_PAIRING":
+      return withNode(state, action.id, (n) => ({
+        ...n,
+        pairStatus: "pairing",
+        pairingCode: makePairingCode(),
+        deviceId: undefined,
+      }))
+
+    case "CONFIRM_PAIRING":
+      return withNode(state, action.id, (n) => ({
+        ...n,
+        pairStatus: "paired",
+        pairingCode: undefined,
+        // In the real flow the slave reports its own hardware id; the mock
+        // generates a stable-looking one so the UI has something to show.
+        deviceId: action.deviceId ?? `slave-${Math.random().toString(36).slice(2, 8)}`,
+      }))
+
+    case "UNPAIR_NODE":
+      return withNode(state, action.id, (n) => ({
+        ...n,
+        pairStatus: "unpaired",
+        pairingCode: undefined,
+        deviceId: undefined,
+      }))
+
+    // ----- hardware area -----
+    case "SET_ACTIVE_AREA": {
+      // Focus the new area's first unit so activeNode() always resolves to a
+      // node in the area currently on screen (the two areas share activeNodeId).
+      const firstInArea = state.nodes.find((n) => (n.system === "hardware" ? "hardware" : "filament") === action.area)
+      return {
+        ...state,
+        settings: { ...state.settings, activeArea: action.area },
+        activeNodeId: firstInArea ? firstInArea.id : state.activeNodeId,
+      }
+    }
+
+    case "UPSERT_PART":
+      return { ...state, parts: { ...state.parts, [action.part.id]: action.part } }
+
+    case "REMOVE_PART": {
+      if (!state.parts[action.id]) return state
+      const parts = { ...state.parts }
+      delete parts[action.id]
+      // Also clear whatever slot the box occupied so the unit shows it as free.
+      const nodes = state.nodes.map((n) => ({
+        ...n,
+        slots: n.slots.map((row) => row.map((s) => (s === action.id ? null : s))),
+      }))
+      return { ...state, parts, nodes }
+    }
+
+    case "HW_STORE_MORE": {
+      const part = state.parts[action.partId]
+      if (!part || action.addCount <= 0) return state
+      const count = part.count + Math.floor(action.addCount)
+      return { ...state, parts: { ...state.parts, [action.partId]: { ...part, count } } }
+    }
+
+    case "HW_TAKE": {
+      const part = state.parts[action.partId]
+      if (!part || action.takeCount <= 0) return state
+      const count = Math.max(0, part.count - Math.floor(action.takeCount))
+      if (count <= 0) {
+        // The box is now empty: remove the part and free its slot.
+        const parts = { ...state.parts }
+        delete parts[action.partId]
+        const nodes = state.nodes.map((n) => ({
+          ...n,
+          slots: n.slots.map((row) => row.map((s) => (s === action.partId ? null : s))),
+        }))
+        return { ...state, parts, nodes }
+      }
+      return { ...state, parts: { ...state.parts, [action.partId]: { ...part, count } } }
+    }
+
+    case "HW_QUEUE_TAKE_ADD": {
+      // Ignore unknown parts and no-op duplicate adds so the queue stays clean.
+      if (!state.parts[action.partId] || state.hwPickQueue.includes(action.partId)) return state
+      return { ...state, hwPickQueue: [...state.hwPickQueue, action.partId] }
+    }
+
+    case "HW_QUEUE_TAKE_REMOVE":
+      return { ...state, hwPickQueue: state.hwPickQueue.filter((id) => id !== action.partId) }
+
+    case "HW_QUEUE_TAKE_CLEAR":
+      return { ...state, hwPickQueue: [] }
+
+    case "ADD_HW_CATEGORY": {
+      const name = action.category.name.trim()
+      if (!name) return state
+      const current = state.settings.hardwareCategories ?? []
+      if (current.some((c) => c.name.toLowerCase() === name.toLowerCase())) return state
+      return {
+        ...state,
+        settings: { ...state.settings, hardwareCategories: [...current, { ...action.category, name }] },
+      }
+    }
+
+    case "REMOVE_HW_CATEGORY": {
+      const current = state.settings.hardwareCategories ?? []
+      return {
+        ...state,
+        settings: { ...state.settings, hardwareCategories: current.filter((c) => c.id !== action.id) },
+      }
+    }
+
+    case "ADD_HW_COLOR": {
+      const current = state.settings.hardwareColorPresets ?? []
+      if (current.some((c) => c.hex.toLowerCase() === action.color.hex.toLowerCase())) return state
+      return { ...state, settings: { ...state.settings, hardwareColorPresets: [...current, action.color] } }
+    }
+
+    case "REMOVE_HW_COLOR": {
+      const current = state.settings.hardwareColorPresets ?? []
+      return {
+        ...state,
+        settings: {
+          ...state.settings,
+          hardwareColorPresets: current.filter((c) => c.hex.toLowerCase() !== action.hex.toLowerCase()),
+        },
+      }
+    }
+
+    case "ADD_HW_ORDER":
+      return { ...state, hardwareOrders: [...state.hardwareOrders, action.order] }
+
+    case "RENAME_HW_ORDER":
+      return {
+        ...state,
+        hardwareOrders: state.hardwareOrders.map((o) =>
+          o.id === action.id ? { ...o, name: action.name } : o,
+        ),
+      }
+
+    case "REMOVE_HW_ORDER":
+      return { ...state, hardwareOrders: state.hardwareOrders.filter((o) => o.id !== action.id) }
+
+    case "ADD_HW_ORDER_ITEM":
+      return {
+        ...state,
+        hardwareOrders: state.hardwareOrders.map((o) =>
+          o.id === action.orderId ? { ...o, items: [...o.items, action.item] } : o,
+        ),
+      }
+
+    case "REMOVE_HW_ORDER_ITEM":
+      return {
+        ...state,
+        hardwareOrders: state.hardwareOrders.map((o) =>
+          o.id === action.orderId ? { ...o, items: o.items.filter((it) => it.id !== action.itemId) } : o,
+        ),
+      }
+
+    case "ADD_HW_STORE": {
+      const current = state.settings.hardwareStores ?? []
+      return { ...state, settings: { ...state.settings, hardwareStores: [...current, action.store] } }
+    }
+
+    case "REMOVE_HW_STORE": {
+      const current = state.settings.hardwareStores ?? []
+      return {
+        ...state,
+        settings: { ...state.settings, hardwareStores: current.filter((s) => s.id !== action.id) },
+      }
+    }
 
     // ----- printers -----
     case "ADD_PRINTER": {
@@ -1578,6 +1900,23 @@ function coreReducer(state: AppState, action: Action): AppState {
       return serviceCurrentItem(withJob)
     }
 
+    case "ENQUEUE_JOB_ITEM": {
+      const { item, mode } = action
+      // Nothing running → this becomes a brand-new one-item job (starts motion).
+      if (!state.job) {
+        const withJob = { ...state, job: { mode, items: [item], currentIndex: 0 } }
+        return serviceCurrentItem(withJob)
+      }
+      // Same operation in flight → append behind the current stops. Motion for the
+      // new stop begins automatically once the carousel advances to it, so the
+      // machine state is untouched here.
+      if (state.job.mode === mode) {
+        return { ...state, job: { ...state.job, items: [...state.job.items, item] } }
+      }
+      // A different operation is running → run this one right after, as its own job.
+      return { ...state, pendingJobs: [...state.pendingJobs, { mode, items: [item], currentIndex: 0 }] }
+    }
+
     case "CONFIRM_STOP": {
       const job = state.job
       if (!job) return state
@@ -1587,7 +1926,14 @@ function coreReducer(state: AppState, action: Action): AppState {
 
       let next: AppState = state
 
-      if (job.mode === "pick") {
+      if (job.mode === "pick" && item.occupantKind === "part") {
+        // Hardware take-out. Decrement the box; HW_TAKE itself frees the slot and
+        // deletes the part when it empties, so we don't clear the slot here. The
+        // quantity is normally entered live at this stop (action.takeCount); fall
+        // back to any pre-set partOp count for older single-take flows.
+        const takeCount = action.takeCount ?? (item.partOp?.kind === "take" ? item.partOp.count : 0)
+        next = machineReducer(next, { type: "HW_TAKE", partId: item.spoolId, takeCount })
+      } else if (job.mode === "pick") {
         next = machineReducer(next, {
           type: "SET_STORAGE_SLOT",
           nodeId: item.nodeId,
@@ -1603,6 +1949,20 @@ function coreReducer(state: AppState, action: Action): AppState {
             spoolId: item.spoolId,
           })
         }
+      } else if (job.mode === "store" && item.occupantKind === "part") {
+        // Hardware "store more" into an existing box: grow the count, then make
+        // sure the part id occupies the slot (it already should, but a re-set is
+        // harmless and keeps placement idempotent).
+        if (item.partOp?.kind === "add") {
+          next = machineReducer(next, { type: "HW_STORE_MORE", partId: item.spoolId, addCount: item.partOp.count })
+        }
+        next = machineReducer(next, {
+          type: "SET_STORAGE_SLOT",
+          nodeId: item.nodeId,
+          shelf: item.shelf,
+          slot: item.slot,
+          spoolId: item.spoolId,
+        })
       } else if (job.mode === "store") {
         if (item.printerId != null && item.printerSlot != null) {
           next = machineReducer(next, {
@@ -1634,7 +1994,10 @@ function coreReducer(state: AppState, action: Action): AppState {
           spoolId: item.spoolId,
         })
       } else {
-        if (typeof action.grams === "number") {
+        // "place" mode. A hardware part carries no filament grams to write back
+        // (its count already lives in `state.parts`), so only apply a grams edit
+        // for real spools; both kinds just drop their id into the balanced slot.
+        if (item.occupantKind !== "part" && typeof action.grams === "number") {
           next = machineReducer(next, { type: "UPDATE_SPOOL", id: item.spoolId, changes: { grams: action.grams } })
         }
         next = machineReducer(next, {
@@ -1917,6 +2280,9 @@ function migrate(parsed: any): AppState {
       const driver: NodeDriver = manual ? "simulated" : n.driver === "hardware" ? "hardware" : "simulated"
       return {
         ...n,
+        // Older saves predate the hardware area, so any node without an explicit
+        // system belongs to the filament area.
+        system: n.system === "hardware" ? "hardware" : "filament",
         type,
         driver,
         // A library is an unbounded single row; guarantee it always has at least
@@ -1962,6 +2328,8 @@ function migrate(parsed: any): AppState {
     configured: !!parsed.configured,
     settings,
     spools: parsed.spools ?? {},
+    parts: parsed.parts && typeof parsed.parts === "object" ? parsed.parts : {},
+    hardwareOrders: Array.isArray(parsed.hardwareOrders) ? parsed.hardwareOrders : [],
     nodes,
     activeNodeId,
     // Normalise every printer so mixed-AMS (`ams`) and the legacy uniform
@@ -1982,6 +2350,7 @@ function migrate(parsed: any): AppState {
     storageSnapshots: Array.isArray(parsed.storageSnapshots)
       ? parsed.storageSnapshots.slice(-STORAGE_SNAPSHOT_CAP)
       : [],
+    hwPickQueue: [],
   }
 }
 
