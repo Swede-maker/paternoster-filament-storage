@@ -209,6 +209,15 @@ export function getNodeStats(state: AppState, node: StorageNode): Stats {
   return { totalSlots, usedSlots, emptySlots: totalSlots - usedSlots, totalGrams }
 }
 
+/**
+ * Weight (g) the carousel is carrying right now: the grams of every spool in
+ * its slots. This is the live load the motor-speed weight compensation follows,
+ * so it goes up when spools are stored and down when they are taken out.
+ */
+export function nodeLoadGrams(state: AppState, node: StorageNode): number {
+  return getNodeStats(state, node).totalGrams
+}
+
 /** Every spool currently sitting in storage across ALL nodes. */
 export function storedSpools(state: AppState): StoredEntry[] {
   const out: StoredEntry[] = []

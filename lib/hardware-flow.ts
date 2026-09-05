@@ -62,7 +62,9 @@ function pickHardwareSlot(
 ): { nodeId: string; shelf: number; slot: number } | null {
   const occ = partsOccupancy(state)
   const hwNodes = nodesForSystem(state, "hardware")
-  const preferred = preferredNodeId ? getNode(state, preferredNodeId) : undefined
+  // Only honour a preferred unit that is actually a hardware unit — a filament
+  // unit id (e.g. the active tab) must never become a hardware destination.
+  const preferred = preferredNodeId ? hwNodes.find((n) => n.id === preferredNodeId) : undefined
   const node: StorageNode | undefined = preferred ?? hwNodes[0]
   if (!node) return null
   const localReserved = reserved.filter((r) => r.nodeId === node.id).map((r) => ({ shelf: r.shelf, slot: r.slot }))

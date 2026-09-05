@@ -199,6 +199,48 @@ export function approachDutyFor(node: { pwmDuty?: number; approachDuty?: number 
   return Math.round(Math.max(MIN_PWM_DUTY, Math.min(1, capped)) * 100) / 100
 }
 
+/**
+ * Weight compensation — keeps the carousel's real speed roughly constant as
+ * spools are added or removed.
+ *
+ * The three duty sliders (move, homing, approach) are the operator's BASE
+ * values, tuned for whatever load the carousel had at the time. Every kilogram
+ * added afterwards makes the same duty turn a little slower. Two knobs define
+ * the curve: every `loadCompKg` of load adds `loadCompPct` percent of duty. The
+ * boost is applied to all three duties at the moment they are sent to the Pi,
+ * and it tracks the live load so it falls again when the carousel gets lighter.
+ */
+export const MIN_LOAD_COMP_KG = 0.5
+export const MAX_LOAD_COMP_KG = 10
+export const MIN_LOAD_COMP_PCT = 1
+export const MAX_LOAD_COMP_PCT = 10
+/** Percent per step assumed for nodes saved before the step was adjustable. */
+export const DEFAULT_LOAD_COMP_PCT = 1
+/** Never let compensation push a duty past this (as a fraction). */
+const MAX_BOOSTED_DUTY = 1
+
+/**
+ * Boost in whole percent for a carousel carrying `loadGrams`, or 0 when
+ * compensation is off. Linear: (load / kgPerStep) * pctPerStep, rounded so the
+ * value the operator reads on screen is exactly what is added to the duty.
+ */
+export function loadBoostPctFor(node: { loadCompKg?: number; loadCompPct?: number }, loadGrams: number): number {
+  const kg = node.loadCompKg
+  if (typeof kg !== "number" || kg <= 0 || !Number.isFinite(loadGrams) || loadGrams <= 0) return 0
+  const kgPerStep = Math.max(MIN_LOAD_COMP_KG, Math.min(MAX_LOAD_COMP_KG, kg))
+  const pctPerStep = Math.max(
+    MIN_LOAD_COMP_PCT,
+    Math.min(MAX_LOAD_COMP_PCT, node.loadCompPct ?? DEFAULT_LOAD_COMP_PCT),
+  )
+  return Math.round((loadGrams / 1000 / kgPerStep) * pctPerStep)
+}
+
+/** A base duty (0..1) with the load boost added, capped at 100%. */
+export function boostDuty(baseDuty: number, boostPct: number): number {
+  const boosted = baseDuty + boostPct / 100
+  return Math.round(Math.max(MIN_PWM_DUTY, Math.min(MAX_BOOSTED_DUTY, boosted)) * 100) / 100
+}
+
 /** Default soft START ramp intensity (%) for a new carousel. */
 export const DEFAULT_RAMP_PCT = 40
 /** How much the ends of a move can be slowed at full ramp (2.5x base delay). */

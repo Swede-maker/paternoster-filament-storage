@@ -34,6 +34,7 @@ import type {
   QueueMode,
   PersistedState,
   Printer,
+  DispenseRequest,
   StorageSnapshot,
   PrinterLinkStatus,
   Settings,
@@ -47,6 +48,7 @@ import type {
 import { printerAmsUnits, printerSlotCount, rampStepMs, newId, DEFAULT_RAMP_PCT } from "./filament"
 import { shelfLabel, printerSlotLabel } from "./selectors"
 import { shortestRotation } from "./balance"
+import { pickFilamentDestination } from "./filament-flow"
 import { getSystemVersion, loadSystemState, saveSystemState } from "@/app/actions/system-state"
 
 /**
@@ -67,6 +69,9 @@ const HISTORY_CAP = 1000
 
 /** Cap on archived usage tallies kept, so the synced doc stays small. */
 const USAGE_ARCHIVE_CAP = 500
+
+/** Cap on queued/finished dispense requests kept in the synced doc. */
+const DISPENSE_CAP = 200
 
 /**
  * Cap on daily consumption buckets retained. One row per
@@ -165,7 +170,19 @@ function toPersisted(state: AppState): PersistedState {
       }) => ({
         ...n,
         link: n.driver === "hardware" ? "offline" : "online",
-        machine: { ...n.machine, homed: true, status: "idle", targetShelf: null, direction: null, moveFrom: null },
+        // `fault` is stripped too: it describes what THIS device's link saw, and
+        // syncing it would pop the "position lost" dialog on peers that never
+        // received the fault frame.
+        machine: {
+          ...n.machine,
+          homed: true,
+          status: "idle",
+          targetShelf: null,
+          direction: null,
+          moveFrom: null,
+          fault: null,
+          homingRequest: null,
+        },
       }),
     ),
     activeNodeId: state.activeNodeId,
@@ -173,6 +190,8 @@ function toPersisted(state: AppState): PersistedState {
     // apart in the synced document. Live link status is per-device.
     printers: state.printers.map(normalizePrinter),
     activePrinterId: state.activePrinterId,
+    dispenseRequests: state.dispenseRequests ?? [],
+    apiToken: state.apiToken,
     history: state.history ?? [],
     usage: state.usage ?? defaultUsage(),
     consumptionLog: state.consumptionLog ?? [],
@@ -367,11 +386,30 @@ function mergeCatalog(local: PersistedState, remote: PersistedState, baseline: P
   // rule so a locally-removed part isn't resurrected).
   const parts = mergeRecordByKey(local.parts, remote.parts, baseline?.parts)
   const hardwareOrders = mergeByKey(local.hardwareOrders, remote.hardwareOrders, baseline?.hardwareOrders, (o) => o.id)
+  // Dispense requests are keyed like orders: a request another device (or the
+  // printer API) ADDED since baseline must survive our last-write-wins save,
+  // while a request WE removed (after completion) stays removed. Local wins on
+  // shared keys so our newer status (running/done) is kept. Cap + newest-last.
+  const dispenseRequests = mergeByKey(
+    local.dispenseRequests,
+    remote.dispenseRequests,
+    baseline?.dispenseRequests,
+    (r) => r.id,
+  )
+    .sort((a, b) => a.createdAt - b.createdAt)
+    .slice(-DISPENSE_CAP)
+  // The shared API token is a scalar edited from any device. Use baseline-diff
+  // last-write-wins so a local CHANGE (set, regenerate, or CLEAR to undefined)
+  // wins, while an untouched local value adopts whatever another device set.
+  // A plain `local ?? remote` would resurrect a cleared token from remote.
+  const apiToken = local.apiToken === baseline?.apiToken ? remote.apiToken : local.apiToken
   return {
     ...local,
     spools,
     parts,
     hardwareOrders,
+    dispenseRequests,
+    apiToken,
     history,
     usage,
     consumptionLog,
@@ -546,6 +584,8 @@ function makeInitialState(): AppState {
     activeNodeId: master.id,
     printers: [],
     activePrinterId: null,
+    dispenseRequests: [],
+    apiToken: undefined,
     job: null,
     pendingJobs: [],
     history: [],
@@ -619,11 +659,35 @@ export type Action =
   | { type: "NODE_ARRIVED"; nodeId: string; shelf: number }
   | { type: "NODE_HOMED"; nodeId: string; currentShelf?: number }
   | { type: "NODE_FAULT"; nodeId: string; message: string }
+  /** Operator dismissed the position-lost dialog without homing. */
+  | { type: "ACK_NODE_FAULT"; nodeId: string }
+  /** A real carousel came online un-homed: ask the operator before the first sweep. */
+  | { type: "REQUEST_HOMING"; nodeId: string }
+  /** Operator chose "Not now" in the homing dialog; keep a sidebar reminder. */
+  | { type: "ACK_HOMING_REQUEST"; nodeId: string }
   // Printers
   | { type: "ADD_PRINTER"; printer: Printer }
   | { type: "UPDATE_PRINTER"; id: string; changes: Partial<Printer> }
   | { type: "REMOVE_PRINTER"; id: string }
   | { type: "SET_ACTIVE_PRINTER"; id: string | null }
+  // ----- printer dispense queue + API token -----
+  /** Add a dispense request (from the printer API or a manual test). */
+  | { type: "ENQUEUE_DISPENSE"; request: DispenseRequest }
+  /**
+   * Atomically mark a pending request "running" AND start its guided pick, in a
+   * single commit. Doing both in one action removes any window where a request
+   * is "running" with no job (which a reload-safe, state-derived consumer would
+   * otherwise misread as an orphan).
+   */
+  | { type: "START_DISPENSE"; id: string; item: QueueItem }
+  /** Advance a request's status/fields as PAX runs or fails the pick. */
+  | { type: "UPDATE_DISPENSE"; id: string; changes: Partial<DispenseRequest> }
+  /** Drop a single request from the queue. */
+  | { type: "REMOVE_DISPENSE"; id: string }
+  /** Clear every finished (done/error/canceled) request. */
+  | { type: "CLEAR_DISPENSE_DONE" }
+  /** Set or clear the shared printer-API token. */
+  | { type: "SET_API_TOKEN"; token: string | undefined }
   // Spools
   | { type: "UPSERT_SPOOL"; spool: Spool }
   | { type: "UPDATE_SPOOL"; id: string; changes: Partial<Spool> }
@@ -724,6 +788,22 @@ export type Action =
   // `undefined` = clear the override, letting homing track the move duty again.
   | { type: "SET_NODE_HOMING_PWM"; nodeId: string; homingDuty: number | undefined }
   | { type: "SET_NODE_APPROACH_PWM"; nodeId: string; approachDuty: number | undefined }
+  /** Weight compensation: kg of load per +1% speed (0.5–10). `undefined` = off. */
+  | { type: "SET_NODE_LOAD_COMP"; nodeId: string; loadCompKg: number | undefined }
+  /** Weight compensation: percent of speed added per `loadCompKg` step (1–10). */
+  | { type: "SET_NODE_LOAD_COMP_PCT"; nodeId: string; loadCompPct: number }
+  /**
+   * Move one unit to sit just before `beforeId` (or to the end when null).
+   * Used by the drag-to-reorder tab strips; the order of `state.nodes` IS the
+   * tab order, and it persists like any other node edit.
+   */
+  | { type: "REORDER_NODES"; id: string; beforeId: string | null }
+  /**
+   * At the placing prompt the operator says the offered slot will not fit.
+   * Remember it as rejected for this item, choose another slot (never one
+   * rejected before), and re-drive the carousel there. Filament store/place only.
+   */
+  | { type: "REJECT_STORE_SLOT" }
   // Jobs
   | { type: "START_JOB"; job: ActiveJob }
   /** Queue several jobs to run back-to-back (first runs now, rest wait). */
@@ -936,6 +1016,15 @@ function coreReducer(state: AppState, action: Action): AppState {
           if (!old) return n
           // Mid-motion locally? Keep the live machine so the animation survives.
           const keepMotion = old.machine.status !== "idle"
+          // `homed`, `fault` and `homingRequest` are THIS device's runtime
+          // knowledge of the carousel, never shared truth: `toPersisted` always
+          // writes `homed: true`, so adopting the incoming value would mark a
+          // never-homed hardware unit as homed the moment another tab saved —
+          // silently dismissing the first-time homing request (or a fault) and
+          // letting absolute moves run on a carousel that has no idea where it
+          // is. A genuine home is still heard from the Pi via NODE_HOMED.
+          // Simulated units keep following the shared flag as before.
+          const keepRuntime = n.driver === "hardware" && !keepMotion
           return {
             ...n,
             link: old.link,
@@ -943,7 +1032,17 @@ function coreReducer(state: AppState, action: Action): AppState {
             connSeq: old.connSeq,
             agentSimulated: old.agentSimulated,
             agentSimReason: old.agentSimReason,
-            machine: keepMotion ? old.machine : n.machine,
+            machine: keepMotion
+              ? old.machine
+              : keepRuntime
+                ? {
+                    ...n.machine,
+                    homed: old.machine.homed,
+                    fault: old.machine.fault,
+                    homingRequest: old.machine.homingRequest,
+                    sensor: old.machine.sensor,
+                  }
+                : n.machine,
           }
         }),
       }
@@ -1306,6 +1405,49 @@ function coreReducer(state: AppState, action: Action): AppState {
 
     case "SET_ACTIVE_PRINTER":
       return { ...state, activePrinterId: action.id }
+
+    // ----- printer dispense queue -----
+    case "ENQUEUE_DISPENSE": {
+      // De-dupe by id (a resync could replay one) and cap the list.
+      const without = state.dispenseRequests.filter((r) => r.id !== action.request.id)
+      return { ...state, dispenseRequests: [...without, action.request].slice(-DISPENSE_CAP) }
+    }
+
+    case "START_DISPENSE": {
+      // Never start on top of a running operation.
+      if (state.job) return state
+      const dispenseRequests = state.dispenseRequests.map((r) =>
+        r.id === action.id
+          ? { ...r, status: "running" as const, spoolId: action.item.spoolId, updatedAt: Date.now() }
+          : r,
+      )
+      // Same launch path as START_JOBS so the carousel actually begins moving.
+      const withJob = {
+        ...state,
+        dispenseRequests,
+        job: { mode: "pick" as const, items: [action.item], currentIndex: 0 },
+      }
+      return serviceCurrentItem(withJob)
+    }
+
+    case "UPDATE_DISPENSE": {
+      const dispenseRequests = state.dispenseRequests.map((r) =>
+        r.id === action.id ? { ...r, ...action.changes, updatedAt: Date.now() } : r,
+      )
+      return { ...state, dispenseRequests }
+    }
+
+    case "REMOVE_DISPENSE":
+      return { ...state, dispenseRequests: state.dispenseRequests.filter((r) => r.id !== action.id) }
+
+    case "CLEAR_DISPENSE_DONE":
+      return {
+        ...state,
+        dispenseRequests: state.dispenseRequests.filter((r) => r.status === "pending" || r.status === "running"),
+      }
+
+    case "SET_API_TOKEN":
+      return { ...state, apiToken: action.token || undefined }
 
     // ----- spools -----
     case "UPSERT_SPOOL": {
@@ -1678,6 +1820,11 @@ function coreReducer(state: AppState, action: Action): AppState {
           direction: null,
           moveFrom: null,
           resumeStatus: null,
+          // Homing is the operator's answer to a fault — the dialog closes and
+          // the position will be re-established from the index sensor.
+          fault: null,
+          // ...and to the first-time homing request.
+          homingRequest: null,
         },
       }))
     }
@@ -1690,6 +1837,7 @@ function coreReducer(state: AppState, action: Action): AppState {
           status: "idle",
           homed: true,
           currentShelf: 0,
+          fault: null,
           targetShelf: null,
           direction: null,
           moveFrom: null,
@@ -1804,6 +1952,37 @@ function coreReducer(state: AppState, action: Action): AppState {
       return withNode(state, action.nodeId, (n) => ({ ...n, approachDuty }))
     }
 
+    case "SET_NODE_LOAD_COMP": {
+      const node = getNode(state, action.nodeId)
+      if (!node || node.type === "shelf") return state
+      if (action.loadCompKg === undefined) {
+        return withNode(state, action.nodeId, (n) => ({ ...n, loadCompKg: undefined }))
+      }
+      // 0.5–10 kg in 0.1 kg steps.
+      const loadCompKg = Math.max(0.5, Math.min(10, Math.round(action.loadCompKg * 10) / 10))
+      return withNode(state, action.nodeId, (n) => ({ ...n, loadCompKg }))
+    }
+
+    case "REORDER_NODES": {
+      if (action.id === action.beforeId) return state
+      const moving = state.nodes.find((n) => n.id === action.id)
+      if (!moving) return state
+      const rest = state.nodes.filter((n) => n.id !== action.id)
+      const at = action.beforeId ? rest.findIndex((n) => n.id === action.beforeId) : -1
+      const nodes = at === -1 ? [...rest, moving] : [...rest.slice(0, at), moving, ...rest.slice(at)]
+      // No-op reorders (dropped back where it started) must not dirty the doc.
+      if (nodes.every((n, i) => n.id === state.nodes[i].id)) return state
+      return { ...state, nodes }
+    }
+
+    case "SET_NODE_LOAD_COMP_PCT": {
+      const node = getNode(state, action.nodeId)
+      if (!node || node.type === "shelf") return state
+      // 1–10 % per step, whole percent.
+      const loadCompPct = Math.max(1, Math.min(10, Math.round(action.loadCompPct)))
+      return withNode(state, action.nodeId, (n) => ({ ...n, loadCompPct }))
+    }
+
     // ----- hardware bridge events (from a real Pi agent) -----
     case "NODE_LINK":
       return withNode(state, action.nodeId, (n) =>
@@ -1859,6 +2038,8 @@ function coreReducer(state: AppState, action: Action): AppState {
     }
 
     case "NODE_HOMED":
+      // Also clears a fault: when ANOTHER device homed the carousel, this one
+      // hears the Pi's `homed` frame and its position-lost warning resolves.
       return withNode(state, action.nodeId, (n) => ({
         ...n,
         machine: {
@@ -1868,19 +2049,58 @@ function coreReducer(state: AppState, action: Action): AppState {
           currentShelf: action.currentShelf ?? 0,
           targetShelf: null,
           direction: null,
+          fault: null,
+          // Another device (or the Pi itself) homed it — nothing left to ask.
+          homingRequest: null,
         },
       }))
 
     case "NODE_FAULT":
-      // Hardware fault: drop any job and park the node so the user can re-home.
+      // Hardware fault: the agent has already cut the motor. Drop any job and
+      // park the node with its position UNKNOWN. Recording `fault` is what makes
+      // the "position lost" dialog appear and what blocks the power-up auto-home
+      // from ever treating this un-homed state as a fresh boot. Nothing moves
+      // again until the operator explicitly chooses to home.
       return {
         ...withNode(state, action.nodeId, (n) => ({
           ...n,
-          machine: { ...n.machine, status: "idle", homed: false, targetShelf: null, direction: null },
+          machine: {
+            ...n.machine,
+            status: "idle",
+            homed: false,
+            targetShelf: null,
+            direction: null,
+            moveFrom: null,
+            fault: { message: action.message, at: Date.now(), acknowledged: false },
+          },
         })),
         job: null,
         pendingJobs: [],
       }
+
+    case "ACK_NODE_FAULT":
+      // Operator chose "Not now" in the position-lost dialog. The carousel stays
+      // un-homed (and so cannot run absolute moves); the sidebar keeps a
+      // persistent warning with the Home button until they home it.
+      return withNode(state, action.nodeId, (n) =>
+        n.machine.fault ? { ...n, machine: { ...n.machine, fault: { ...n.machine.fault, acknowledged: true } } } : n,
+      )
+
+    case "REQUEST_HOMING":
+      // Only meaningful for a paternoster that is idle and does not know where
+      // it is; never stack a second request on top of an existing one.
+      return withNode(state, action.nodeId, (n) => {
+        if (n.type === "shelf" || n.type === "library") return n
+        if (n.machine.homed || n.machine.status !== "idle" || n.machine.homingRequest) return n
+        return { ...n, machine: { ...n.machine, homingRequest: { at: Date.now(), acknowledged: false } } }
+      })
+
+    case "ACK_HOMING_REQUEST":
+      return withNode(state, action.nodeId, (n) =>
+        n.machine.homingRequest
+          ? { ...n, machine: { ...n.machine, homingRequest: { ...n.machine.homingRequest, acknowledged: true } } }
+          : n,
+      )
 
     // ----- jobs -----
     case "START_JOB": {
@@ -1915,6 +2135,48 @@ function coreReducer(state: AppState, action: Action): AppState {
       }
       // A different operation is running → run this one right after, as its own job.
       return { ...state, pendingJobs: [...state.pendingJobs, { mode, items: [item], currentIndex: 0 }] }
+    }
+
+    case "REJECT_STORE_SLOT": {
+      const job = state.job
+      if (!job || job.mode === "pick") return state
+      const item = job.items[job.currentIndex]
+      if (!item || item.occupantKind === "part") return state
+      const spool = state.spools[item.spoolId]
+      if (!spool) return state
+
+      const rejected = [...(item.rejectedSlots ?? []), { nodeId: item.nodeId, shelf: item.shelf, slot: item.slot }]
+      // Never land on a slot another queued item is heading for either.
+      const reservedByOthers = job.items
+        .filter((it, i) => i !== job.currentIndex && !it.done)
+        .map((it) => ({ nodeId: it.nodeId, shelf: it.shelf, slot: it.slot }))
+      const dest = pickFilamentDestination(
+        state,
+        item.grams ?? spool.grams,
+        [...rejected, ...reservedByOthers],
+        // Stay in the unit the operator chose unless it has nothing else to offer.
+        item.nodeId,
+        spool.containerId,
+      )
+      // Nowhere else to go: keep the item as is (the UI explains) but still record
+      // the rejection so the message is accurate.
+      const retargeted: QueueItem = dest
+        ? { ...item, nodeId: dest.nodeId, shelf: dest.shelf, slot: dest.slot, rejectedSlots: rejected }
+        : { ...item, rejectedSlots: rejected }
+      const items = job.items.map((it, i) => (i === job.currentIndex ? retargeted : it))
+      const withJob: AppState = { ...state, job: { ...job, items } }
+      if (!dest) return withJob
+
+      // Same shelf on the same unit → just a different slot; the carousel is
+      // already there, so stay at the confirm step. Otherwise rotate to the new
+      // shelf (the normal confirm gate applies).
+      const sameStop = dest.nodeId === item.nodeId && dest.shelf === item.shelf
+      if (sameStop) return withJob
+      const parked = withNode(withJob, item.nodeId, (n) => ({
+        ...n,
+        machine: { ...n.machine, status: "idle", targetShelf: null, direction: null, moveFrom: null },
+      }))
+      return serviceCurrentItem(parked)
     }
 
     case "CONFIRM_STOP": {
@@ -2340,6 +2602,10 @@ function migrate(parsed: any): AppState {
       normalizePrinter({ ...p, link: "offline" }),
     ),
     activePrinterId: parsed.activePrinterId ?? null,
+    dispenseRequests: Array.isArray(parsed.dispenseRequests)
+      ? (parsed.dispenseRequests as DispenseRequest[]).slice(-DISPENSE_CAP)
+      : [],
+    apiToken: typeof parsed.apiToken === "string" && parsed.apiToken ? parsed.apiToken : undefined,
     job: null,
     pendingJobs: [],
     history: Array.isArray(parsed.history) ? parsed.history.slice(0, HISTORY_CAP) : [],
@@ -2591,15 +2857,52 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     for (const n of state.nodes) {
       // Only a paternoster homes — manual shelf/library units have no motor.
       if (n.type === "shelf" || n.type === "library") continue
-      if (n.machine.homed || n.machine.status !== "idle") continue
+
+      // SAFETY: a fault means the carousel stopped because it lost track of its
+      // position. That is never a reason to start moving again on our own —
+      // the operator must confirm in the position-lost dialog. This check comes
+      // FIRST so no other branch below can reach HOME_START for a faulted unit.
+      if (n.machine.fault) {
+        autoHomedRef.current.add(n.id)
+        continue
+      }
+
+      if (n.machine.status !== "idle") continue
+
+      // A unit that is ALREADY homed has nothing to do — and, crucially, is
+      // recorded as handled right now. Previously the record was only written
+      // when this effect actually fired, so a device that opened while the
+      // carousel was already homed never recorded it. The first fault that
+      // device saw then cleared `homed`, and this "power-up" effect fired on a
+      // machine that had just stopped for safety: the carousel homed itself a
+      // moment after losing track. Any later `homed: false` on a recorded node
+      // is a fault, not a boot, and must wait for the operator.
+      if (n.machine.homed) {
+        autoHomedRef.current.add(n.id)
+        continue
+      }
+
+      // Not homed yet. Hardware units can only home once their Pi is online; do
+      // NOT record them here, so a unit that comes online later still gets its
+      // one genuine power-up home.
       if (n.driver === "hardware" && n.link !== "online") continue
-      // ONCE per node per session. `homed` also goes false when a move ends
-      // without the shelf sensor confirming position, and re-firing here turned
-      // that fault into the carousel setting off on a full homing sweep on its
-      // own — surprise motion on a machine with moving shelves, and impossible
-      // to interpret from the outside ("it just starts homing itself").
-      // Power-up homing is still automatic; recovering from a fault is now the
-      // operator's call, via the Home button.
+
+      // A REAL carousel never starts its first sweep unannounced. When someone
+      // has just wired up a unit and connected its Pi, an unexpected full
+      // rotation is exactly the surprise motion we must avoid — so ask first.
+      // The homing dialog then dispatches HOME_START on the operator's say-so.
+      // Asking moves nothing and the reducer ignores a repeat while a request
+      // (answered or not) is already recorded, so this needs no once-per-
+      // session guard — which also means a unit switched from simulated to
+      // Real Pi mid-session still gets asked.
+      if (n.driver === "hardware") {
+        if (!n.machine.homingRequest) dispatch({ type: "REQUEST_HOMING", nodeId: n.id })
+        continue
+      }
+
+      // Simulated units carry no risk and still home themselves — ONCE per node
+      // per session; recovering from anything else is the operator's call via
+      // the Home button.
       if (autoHomedRef.current.has(n.id)) continue
       autoHomedRef.current.add(n.id)
       dispatch({ type: "HOME_START", nodeId: n.id })
