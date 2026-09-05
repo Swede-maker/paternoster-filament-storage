@@ -112,10 +112,50 @@ the app's up/down labels, flip `HOMING_DIRECTION`.
 ```bash
 # 1. Copy this folder to the Pi (anywhere in your home dir), then:
 cd ~/pi-agent
+sudo apt update && sudo apt install -y python3-pip python3-full
 pip3 install -r requirements.txt
+```
 
+```bash
 # 2. Run it (must match the shelves count you set for this unit in the app):
 python3 paternoster_agent.py --name "Paternoster 1" --shelves 9 --port 8765
+```
+
+# IF you wanna install it on your Paternoster with the server on paste this and skip the "Start automaticlly on boot":
+```bash
+cd ~/pax/pi-agent
+sudo apt update && sudo apt install -y python3-pip python3-full
+pip3 install -r requirements.txt --break-system-packages
+```
+
+```bash
+# 2. Run it (must match the shelves count you set for this unit in the app):
+python3 paternoster_agent.py --name "Paternoster 1" --shelves 9 --port 8765
+```
+
+```bash
+# 3. Clean off if you have dubble server running in PM2:
+pm2 delete pax
+pm2 start npm --name "pax" -- start
+pm2 save
+```
+
+```bash
+# 4. Restart the server:
+pm2 restart pax
+```
+
+```bash
+#  If it show "Offline" in the browser under settings try this:
+cd ~/pax/pi-agent
+python3 paternoster_agent.py --name "Paternoster 1" --shelves 9 --port 8765
+```
+
+```bash
+# 5. start the server so it wont die after you close the terminal:
+cd ~/pax/pi-agent
+pm2 start "python3 paternoster_agent.py --name 'Paternoster 1' --shelves 9 --port 8765" --name "paternoster-agent"
+pm2 save
 ```
 
 ### Start automatically on boot
