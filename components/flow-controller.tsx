@@ -95,6 +95,15 @@ interface FlowContextValue {
   inspectRequest: { spool: Spool; loc: NodeLocation } | null
   requestInspect: (spool: Spool, loc: NodeLocation) => void
   consumeInspect: () => void
+  /**
+   * Cross-area bridge for "act on this PRINTER slot" from the Printers area,
+   * which shows the loaded-spool grid but not the pick/take-off dialogs. HomeView
+   * consumes it exactly as a direct slot tap: empty slot → spool browser to pick
+   * into it, loaded slot → take-off dialog.
+   */
+  slotRequest: { printerId: string; slot: number } | null
+  requestSlot: (printerId: string, slot: number) => void
+  consumeSlot: () => void
 }
 
 const FlowContext = createContext<FlowContextValue | null>(null)
@@ -110,6 +119,8 @@ export function FlowProvider({ children }: { children: ReactNode }) {
   const [draft, setDraft] = useState<FlowState>(EMPTY)
   // Pending "act on this spool" request handed off from the inventory tab.
   const [inspectRequest, setInspectRequest] = useState<{ spool: Spool; loc: NodeLocation } | null>(null)
+  // Pending "act on this printer slot" request handed off from the Printers area.
+  const [slotRequest, setSlotRequest] = useState<{ printerId: string; slot: number } | null>(null)
 
   // ----- external dispense queue runner -----
   // Requests arrive from the printer API (written into the shared doc). Any open
@@ -408,8 +419,12 @@ export function FlowProvider({ children }: { children: ReactNode }) {
       inspectRequest,
       requestInspect: (spool, loc) => setInspectRequest({ spool, loc }),
       consumeInspect: () => setInspectRequest(null),
+
+      slotRequest,
+      requestSlot: (printerId, slot) => setSlotRequest({ printerId, slot }),
+      consumeSlot: () => setSlotRequest(null),
     }
-  }, [draft, state, dispatch, inspectRequest])
+  }, [draft, state, dispatch, inspectRequest, slotRequest])
 
   return <FlowContext.Provider value={value}>{children}</FlowContext.Provider>
 }
