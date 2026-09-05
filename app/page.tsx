@@ -144,7 +144,7 @@ function AppShell() {
         }
       >
         {area === "printers" ? (
-          <PrintersView />
+          <PrintersView onGoFilament={() => changeArea("filament")} />
         ) : area === "hardware" ? (
           tab === "orders" ? (
             <HardwareOrdersView />

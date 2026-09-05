@@ -1,9 +1,10 @@
 "use client"
 
 import { useEffect, useState } from "react"
-import { Copy, Check, KeyRound, RefreshCw, Trash2, Plug } from "lucide-react"
+import { Copy, Check, KeyRound, RefreshCw, Trash2, Plug, ChevronDown } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { useStore } from "@/lib/store"
+import { cn } from "@/lib/utils"
 
 /** One copyable code/URL row. */
 function CopyRow({ label, value }: { label: string; value: string }) {
@@ -42,7 +43,7 @@ function CopyRow({ label, value }: { label: string; value: string }) {
  * token. Generating a token immediately protects the endpoints; clearing it
  * reopens them on the trusted LAN.
  */
-export function PrinterApiPanel() {
+export function PrinterApiPanel({ open, onToggle }: { open: boolean; onToggle: () => void }) {
   const { state, dispatch } = useStore()
   const [origin, setOrigin] = useState("")
 
@@ -63,10 +64,20 @@ export function PrinterApiPanel() {
 
   return (
     <section className="rounded-xl border border-border bg-card/60 p-4">
-      <div className="mb-3 flex items-center gap-2">
+      <button
+        type="button"
+        onClick={onToggle}
+        aria-expanded={open}
+        className={cn("flex w-full items-center gap-2 text-left", open && "mb-3")}
+      >
         <Plug className="h-4 w-4 text-primary" />
-        <h3 className="text-sm font-semibold text-foreground">API access for printers</h3>
-      </div>
+        <h3 className="flex-1 text-sm font-semibold text-foreground">API access for printers</h3>
+        <ChevronDown
+          className={cn("h-4 w-4 text-muted-foreground transition-transform", open ? "rotate-180" : "rotate-0")}
+        />
+      </button>
+      {!open ? null : (
+      <>
       <p className="mb-4 text-xs text-muted-foreground text-pretty">
         Point a printer&apos;s macros or plugins at these endpoints to read live spools and request a filament dispense.
         All calls stay on your local network.
@@ -114,6 +125,8 @@ export function PrinterApiPanel() {
           )}
         </div>
       </div>
+      </>
+      )}
     </section>
   )
 }

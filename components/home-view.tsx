@@ -76,6 +76,25 @@ export function HomeView() {
     flow.consumeInspect()
   }, [flow.inspectRequest, state.activeNodeId, dispatch, flow])
 
+  // Consume a printer-slot tap handed off from the Printers area: behave exactly
+  // like tapping that slot on the AMS/toolchanger card here. Resolve the printer
+  // from live state so a stale snapshot can never load onto the wrong slot.
+  useEffect(() => {
+    const req = flow.slotRequest
+    if (!req) return
+    flow.consumeSlot()
+    const printer = state.printers.find((p) => p.id === req.printerId)
+    if (!printer) return
+    dispatch({ type: "SET_ACTIVE_PRINTER", id: printer.id })
+    const loadedId = printer.loaded[req.slot]
+    const spool = loadedId ? state.spools[loadedId] : undefined
+    if (spool) setUnloadTarget({ printer, slot: req.slot, spool })
+    else {
+      setPickTarget({ printer, slot: req.slot })
+      setBrowserOpen(true)
+    }
+  }, [flow.slotRequest, flow, state.printers, state.spools, dispatch])
+
   // Never show a hardware unit as the filament home's main unit: if the shared
   // activeNodeId points at a hardware carousel, fall back to the first filament
   // unit (or the raw active node when no filament unit exists yet).

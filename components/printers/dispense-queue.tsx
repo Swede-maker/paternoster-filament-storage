@@ -1,6 +1,6 @@
 "use client"
 
-import { Loader2, CheckCircle2, XCircle, Clock, Trash2, Inbox } from "lucide-react"
+import { Loader2, CheckCircle2, XCircle, Clock, Trash2, Inbox, ChevronDown } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { useStore } from "@/lib/store"
 import { getNode, shelfLabel } from "@/lib/selectors"
@@ -55,23 +55,41 @@ function Row({ req }: { req: DispenseRequest }) {
  * PAX screen runs each pending request via the normal guided pick (see
  * flow-controller), so statuses advance here in real time.
  */
-export function DispenseQueue() {
+export function DispenseQueue({ open, onToggle }: { open: boolean; onToggle: () => void }) {
   const { state, dispatch } = useStore()
   const requests = [...state.dispenseRequests].sort((a, b) => b.createdAt - a.createdAt)
   const hasFinished = requests.some((r) => r.status === "done" || r.status === "error" || r.status === "canceled")
+  const active = requests.filter((r) => r.status === "pending" || r.status === "running").length
 
   return (
     <section className="rounded-xl border border-border bg-card/60 p-4">
-      <div className="mb-3 flex items-center justify-between gap-2">
-        <h3 className="text-sm font-semibold text-foreground">Dispense queue</h3>
-        {hasFinished && (
+      <div className={cn("flex items-center justify-between gap-2", open && "mb-3")}>
+        <button
+          type="button"
+          onClick={onToggle}
+          aria-expanded={open}
+          className="flex min-w-0 flex-1 items-center gap-2 text-left"
+        >
+          <h3 className="text-sm font-semibold text-foreground">Dispense queue</h3>
+          {/* Keep a hint of activity visible while folded. */}
+          {!open && active > 0 && (
+            <span className="rounded-full bg-primary/15 px-2 py-0.5 text-xs font-medium text-primary">{active}</span>
+          )}
+          <ChevronDown
+            className={cn(
+              "ml-auto h-4 w-4 shrink-0 text-muted-foreground transition-transform",
+              open ? "rotate-180" : "rotate-0",
+            )}
+          />
+        </button>
+        {open && hasFinished && (
           <Button size="sm" variant="ghost" onClick={() => dispatch({ type: "CLEAR_DISPENSE_DONE" })}>
             <Trash2 className="h-4 w-4" /> Clear finished
           </Button>
         )}
       </div>
 
-      {requests.length === 0 ? (
+      {!open ? null : requests.length === 0 ? (
         <div className="flex flex-col items-center justify-center gap-2 rounded-lg border border-dashed border-border bg-background/40 py-8 text-center">
           <Inbox className="h-6 w-6 text-muted-foreground" />
           <p className="text-sm text-muted-foreground text-pretty">

@@ -638,6 +638,34 @@ function BambuLinkRow({ printer, bambu }: { printer: Printer; bambu?: BambuStatu
   )
 }
 
+/**
+ * The loaded-spool grid (single nozzle / toolheads / AMS trays) for one printer,
+ * with live nozzle temperatures. Standalone so the Printers area can show what's
+ * loaded next to the printer's own web UI; slot taps are reported to `onSlot`.
+ */
+export function PrinterLoadedSpools({
+  printer,
+  onSlot,
+  queuedPrinterSlots,
+}: {
+  printer: Printer
+  onSlot: (p: Printer, index: number) => void
+  queuedPrinterSlots?: number[]
+}) {
+  const { state } = useStore()
+  const moonraker = useMoonrakerLive(printer)
+  const prusa = usePrusaLinkLive(printer)
+  return (
+    <PrinterBody
+      printer={printer}
+      spools={state.spools}
+      onSlot={onSlot}
+      queuedPrinterSlots={queuedPrinterSlots}
+      live={moonraker ?? prusa}
+    />
+  )
+}
+
 function PrinterBody({
   printer,
   spools,
