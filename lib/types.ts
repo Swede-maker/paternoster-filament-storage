@@ -252,6 +252,40 @@ export type SpoolPlacement =
 
 export type PrinterKind = "single" | "ams" | "toolchanger"
 
+/** Lifecycle of an external dispense/load request queued via the printer API. */
+export type DispenseStatus = "pending" | "running" | "done" | "error" | "canceled"
+
+/**
+ * A filament-dispense request submitted by an external printer UI through the
+ * PAX printer API. It is written into the shared document as `pending`; an open
+ * PAX screen then runs the normal guided pick and advances the status. The slot
+ * is addressed exactly the way PAX models storage internally — node + shelf +
+ * slot — so it is unambiguous across multiple paternosters.
+ */
+export interface DispenseRequest {
+  id: string
+  /** Which storage node (paternoster/shelf) holds the spool. */
+  nodeId: string
+  /** 0-based shelf index within the node. */
+  shelf: number
+  /** 0-based slot index within the shelf. */
+  slot: number
+  /** Spool id resolved when the request was accepted (audit/display only). */
+  spoolId?: string | null
+  /** Printer that asked for it, when known — for display in the queue. */
+  printerId?: string | null
+  /** Optional free-form note from the requester, e.g. "T0 reload". */
+  note?: string
+  status: DispenseStatus
+  /** Epoch-ms timestamps. */
+  createdAt: number
+  updatedAt: number
+  /** Human-readable reason, populated when `status` is "error". */
+  error?: string
+  /** How the request arrived, for display. Defaults to "api". */
+  source?: "api" | "manual"
+}
+
 /**
  * A single AMS unit attached to a printer. Units can differ in size (e.g. a
  * 4-slot AMS alongside a 1-slot AMS Lite / external spool) and carry a custom
@@ -298,6 +332,12 @@ export interface Printer {
    * for Klipper printers linked over the network.
    */
   port?: number
+  /**
+   * Optional URL of the printer's own web UI (Mainsail / Fluidd / vendor UI) to
+   * embed in PAX's Printers section. When omitted, PAX falls back to
+   * `http://<ip>` so a plain IP is enough to get an embedded view.
+   */
+  webUrl?: string
   /** Optional Moonraker API key (X-Api-Key) when the instance requires one. */
   apiKey?: string
   /**
@@ -387,6 +427,38 @@ export interface Machine {
    * otherwise.
    */
   sensor?: boolean | null
+  /**
+   * Set when the Pi agent reported a fault (e.g. a shelf passed without the
+   * sensor confirming it, or a pulse timeout) and the carousel stopped as a
+   * safety measure. While set, the position is UNKNOWN and the machine must not
+   * move by itself: the app shows a blocking "position lost" dialog and waits
+   * for the operator to explicitly home or dismiss. Cleared when homing starts.
+   * `acknowledged` = the operator dismissed the dialog without homing; the
+   * warning then stays in the sidebar until they home. Runtime-only — never
+   * persisted or synced (a fault on one device's link is not a command to
+   * peers).
+   */
+  fault?: MachineFault | null
+  /**
+   * Set when a REAL carousel needs its first homing sweep (never homed and its
+   * Pi just came online) and the app is waiting for the operator to say go.
+   * Homing spins the carousel — possibly a full revolution — so it must never
+   * start by surprise on a unit that was just wired up. The app shows a
+   * blocking dialog; "Home now" starts the sweep, "Not now" leaves the unit
+   * parked un-homed with a sidebar reminder. Runtime-only, never persisted.
+   * `acknowledged` = dismissed with "Not now".
+   */
+  homingRequest?: { at: number; acknowledged: boolean } | null
+}
+
+/** A safety stop reported by the Pi agent. See {@link Machine.fault}. */
+export interface MachineFault {
+  /** The agent's own message, e.g. "Shelf pulse timeout (8.0s)". */
+  message: string
+  /** Epoch-ms when the fault arrived. */
+  at: number
+  /** Operator dismissed the blocking dialog without homing. */
+  acknowledged: boolean
 }
 
 /**
@@ -435,6 +507,12 @@ export interface QueueItem {
    * whose count is already set on the part when it is created.
    */
   partOp?: { kind: "add" | "take"; count: number }
+  /**
+   * Slots the operator has already turned down for this item at the placing
+   * prompt ("too tight, find another"). Every re-pick excludes all of them, so
+   * the system never offers the same slot twice for the same spool.
+   */
+  rejectedSlots?: { nodeId: string; shelf: number; slot: number }[]
   done: boolean
 }
 
@@ -678,6 +756,25 @@ export interface StorageNode {
    * cruise but a very slow arrival, and one control cannot serve both.
    */
   approachDuty?: number
+  /**
+   * Weight compensation: kilograms of carousel load per +1% of motor speed.
+   * 0.5–10 kg; undefined = off.
+   *
+   * A loaded carousel turns slower at the same PWM duty because the motor has
+   * more mass to drag. This setting adds a boost on top of Motor PWM, Homing PWM
+   * and Approach speed proportional to the weight currently in the carousel
+   * (`loadBoostPctFor`): every `loadCompKg` of load adds `loadCompPct` percent,
+   * so at 3 kg per 2%, 9 kg of spools adds +6% to each. The boost follows the
+   * live load in both directions, so removing spools lowers it again. The
+   * sliders keep showing the operator's base values; the boosted duties are
+   * what actually go to the Pi.
+   */
+  loadCompKg?: number
+  /**
+   * Weight compensation, boost per step in percent (1–10). Defaults to 1 when
+   * unset so nodes saved before this field existed keep their "+1% per step".
+   */
+  loadCompPct?: number
   storage: StorageConfig
   /** shelf -> slot -> spoolId | null */
   slots: (string | null)[][]
@@ -760,6 +857,14 @@ export interface FilamentUsage {
 /** Which tracking area something belongs to. */
 export type SystemKind = "filament" | "hardware"
 
+/**
+ * The top-level dashboard area. Extends the two storage systems with a
+ * self-contained "printers" area (3D-printer management + embedded UIs). Kept
+ * separate from `SystemKind` so node/storage logic — which only knows filament
+ * vs hardware — stays exhaustive and unaffected.
+ */
+export type TopArea = SystemKind | "printers"
+
 /** What a storage slot / queue item holds. */
 export type OccupantKind = "spool" | "part"
 
@@ -839,6 +944,18 @@ export interface AppState {
   activeNodeId: string
   printers: Printer[]
   activePrinterId: string | null
+  /**
+   * Filament-dispense requests queued by external printer UIs (via the printer
+   * API). Shared + synced so any open PAX screen can pick one up and run the
+   * guided pick. Newest last; capped in the reducer.
+   */
+  dispenseRequests: DispenseRequest[]
+  /**
+   * Optional shared token that printer-facing API calls must present in the
+   * `x-pax-token` header. When empty/undefined the endpoints are open on the
+   * LAN. Shared + synced so every device agrees on the same token.
+   */
+  apiToken?: string
   job: ActiveJob | null
   /**
    * Jobs waiting to run after the current `job` finishes. Lets the user assemble
@@ -884,6 +1001,10 @@ export interface PersistedState {
   activeNodeId: string
   printers: Printer[]
   activePrinterId: string | null
+  /** Queued external dispense requests (shared + synced). */
+  dispenseRequests: DispenseRequest[]
+  /** Optional shared API token for printer-facing endpoints (shared + synced). */
+  apiToken?: string
   /** Filament usage/movement log (shared + synced across devices). */
   history: HistoryEvent[]
   /** Lifetime + resettable filament-consumption tracking (shared + synced). */

@@ -15,6 +15,8 @@ import { InventoryView } from "@/components/inventory-view"
 import { StatisticsView } from "@/components/statistics-view"
 import { SettingsView } from "@/components/settings-view"
 import { MotionOverlay } from "@/components/motion-overlay"
+import { PositionLostDialog } from "@/components/position-lost-dialog"
+import { HomingRequiredDialog } from "@/components/homing-required-dialog"
 import { BottomNav, type NavTab } from "@/components/bottom-nav"
 import { AreaSwitcher } from "@/components/area-switcher"
 import { HardwareHomeView } from "@/components/hardware/hardware-home-view"
@@ -22,7 +24,8 @@ import { HardwareInventoryView } from "@/components/hardware/hardware-inventory-
 import { HardwareOrdersView } from "@/components/hardware/hardware-orders-view"
 import { HardwareSettingsView } from "@/components/hardware/hardware-settings-view"
 import { NodeConnection } from "@/components/node-connection"
-import type { SystemKind } from "@/lib/types"
+import { PrintersView } from "@/components/printers/printers-view"
+import type { TopArea } from "@/lib/types"
 
 export default function Page() {
   return (
@@ -62,15 +65,18 @@ function AppShell() {
   // or synced. Keeping it out of the shared document means a background sync
   // reconcile (which can overwrite persisted settings mid-operation) can never
   // yank the user back to the other area while they're working.
-  const [area, setArea] = useState<SystemKind>("filament")
+  const [area, setArea] = useState<TopArea>("filament")
 
   // Switching area is a full context change: focus that area's first storage
   // unit (so activeNode resolves to a node in the shown area) and reset to the
-  // area's Home tab so we never land on a tab that area doesn't have.
-  function changeArea(next: SystemKind) {
+  // area's Home tab so we never land on a tab that area doesn't have. The
+  // printers area has no storage nodes, so it only resets the tab.
+  function changeArea(next: TopArea) {
     if (next === area) return
-    const firstInArea = state.nodes.find((n) => (n.system === "hardware" ? "hardware" : "filament") === next)
-    if (firstInArea) dispatch({ type: "SET_ACTIVE_NODE", id: firstInArea.id })
+    if (next !== "printers") {
+      const firstInArea = state.nodes.find((n) => (n.system === "hardware" ? "hardware" : "filament") === next)
+      if (firstInArea) dispatch({ type: "SET_ACTIVE_NODE", id: firstInArea.id })
+    }
     setArea(next)
     setTab("home")
   }
@@ -132,12 +138,14 @@ function AppShell() {
           get clipped. */}
       <main
         className={
-          tab === "home"
+          tab === "home" && area !== "printers"
             ? "flex min-h-0 flex-1 flex-col overflow-y-auto lg:overflow-hidden"
             : "flex min-h-0 flex-1 flex-col overflow-y-auto"
         }
       >
-        {area === "hardware" ? (
+        {area === "printers" ? (
+          <PrintersView />
+        ) : area === "hardware" ? (
           tab === "orders" ? (
             <HardwareOrdersView />
           ) : tab === "inventory" ? (
@@ -167,6 +175,12 @@ function AppShell() {
       </main>
       <BottomNav tab={tab} onChange={setTab} area={area} />
       <MotionOverlay />
+      {/* Safety: blocks the screen when a carousel stops after losing its
+          position, and waits for the operator to choose to home (or not). */}
+      <PositionLostDialog />
+      {/* Safety: a real carousel that has never been homed asks before its
+          first sweep instead of spinning the moment its Pi connects. */}
+      <HomingRequiredDialog />
     </div>
   )
 }
