@@ -1,9 +1,33 @@
 "use client"
 
-import { ArrowUp, ArrowDown, Home, Loader2, OctagonX, Play, SlidersHorizontal, ChevronDown } from "lucide-react"
+import {
+  ArrowUp,
+  ArrowDown,
+  Home,
+  Loader2,
+  OctagonX,
+  Play,
+  SlidersHorizontal,
+  ChevronDown,
+  AlertTriangle,
+} from "lucide-react"
 import { useStore } from "@/lib/store"
-import { activeNode } from "@/lib/selectors"
-import { DEFAULT_RAMP_PCT, HOMING_DUTY_RATIO, homingDutyFor, moveDutyFor, approachDutyFor } from "@/lib/filament"
+import { activeNode, nodeLoadGrams } from "@/lib/selectors"
+import {
+  DEFAULT_RAMP_PCT,
+  HOMING_DUTY_RATIO,
+  MIN_LOAD_COMP_KG,
+  MAX_LOAD_COMP_KG,
+  MIN_LOAD_COMP_PCT,
+  MAX_LOAD_COMP_PCT,
+  DEFAULT_LOAD_COMP_PCT,
+  homingDutyFor,
+  moveDutyFor,
+  approachDutyFor,
+  loadBoostPctFor,
+  boostDuty,
+  formatGrams,
+} from "@/lib/filament"
 import { Button } from "./ui/button"
 import { cn } from "@/lib/utils"
 import { usePersistentBoolean } from "@/lib/use-persistent"
@@ -45,6 +69,13 @@ export function ManualControl({ node: nodeProp }: { node?: StorageNode } = {}) {
   // Same helper the Pi is configured from, so the slider shows the duty the
   // final approach will actually use — including the default crawl.
   const approachDuty = approachDutyFor(node)
+  // Weight compensation: live load in the carousel and the boost it earns at
+  // the current kg-per-percent setting. Same helpers the Pi is configured from.
+  const loadGrams = nodeLoadGrams(state, node)
+  const loadCompOn = node.loadCompKg !== undefined
+  const loadCompKg = node.loadCompKg ?? 3
+  const loadCompPct = node.loadCompPct ?? DEFAULT_LOAD_COMP_PCT
+  const boostPct = loadBoostPctFor(node, loadGrams)
 
   const statusLabel = (() => {
     switch (status) {
@@ -61,6 +92,7 @@ export function ManualControl({ node: nodeProp }: { node?: StorageNode } = {}) {
       case "stopped":
         return "Emergency stopped"
       default:
+        if (node.machine.fault) return "Position lost — home required"
         return homed ? "Positioning OK" : "Not homed"
     }
   })()
@@ -117,6 +149,68 @@ export function ManualControl({ node: nodeProp }: { node?: StorageNode } = {}) {
             Remove <span className="font-mono">--simulate</span> from the service, or install the Pi 5 pin factory with{" "}
             <span className="font-mono">sudo apt install -y python3-lgpio</span>, then restart the agent.
           </p>
+        </div>
+      )}
+
+      {/* Position lost after a fault and the operator chose "Not now" in the
+          dialog. Keep the warning visible until they home: the carousel is
+          parked with an unknown position and absolute moves are refused. */}
+      {isCarousel && node.machine.fault && !busy && (
+        <div className="mb-3 rounded-xl border-2 border-destructive bg-destructive/10 p-3">
+          <div className="flex items-center gap-2 text-destructive">
+            <OctagonX className="h-5 w-5 shrink-0" />
+            <div className="min-w-0">
+              <p className="text-sm font-bold uppercase tracking-wider">Position lost</p>
+              <p className="text-xs text-destructive/80 text-pretty">
+                Stopped for safety and not moved since. Home the carousel to continue.
+              </p>
+            </div>
+          </div>
+          <p className="mt-2 font-mono text-[11px] leading-relaxed text-muted-foreground break-words">
+            {node.machine.fault.message}
+          </p>
+          <Button
+            size="md"
+            className="mt-3 w-full"
+            disabled={offline}
+            onClick={() => {
+              if (state.job) dispatch({ type: "CANCEL_JOB" })
+              dispatch({ type: "HOME_START", nodeId: node.id })
+            }}
+          >
+            <Home className="h-4 w-4" />
+            Home Carousel
+          </Button>
+        </div>
+      )}
+
+      {/* First-time homing declined with "Not now". The unit is connected but
+          does not know its position, so absolute moves are refused until the
+          operator homes it from here. */}
+      {isCarousel && !node.machine.fault && node.machine.homingRequest?.acknowledged && !homed && !busy && (
+        <div className="mb-3 rounded-xl border-2 border-warning/60 bg-warning/10 p-3">
+          <div className="flex items-center gap-2 text-warning">
+            <AlertTriangle className="h-5 w-5 shrink-0" />
+            <div className="min-w-0">
+              <p className="text-sm font-bold uppercase tracking-wider">Not homed yet</p>
+              <p className="text-xs text-foreground/80 text-pretty">
+                The carousel does not know which shelf is at the window. Clear the shelves, then home it to start
+                using it.
+              </p>
+            </div>
+          </div>
+          <Button
+            size="md"
+            className="mt-3 w-full"
+            disabled={offline}
+            onClick={() => {
+              if (state.job) dispatch({ type: "CANCEL_JOB" })
+              dispatch({ type: "HOME_START", nodeId: node.id })
+            }}
+          >
+            <Home className="h-4 w-4" />
+            Home Carousel
+          </Button>
         </div>
       )}
 
@@ -233,7 +327,7 @@ export function ManualControl({ node: nodeProp }: { node?: StorageNode } = {}) {
 
           {!speedsOpen && (
             <p className="mt-2 text-[10px] leading-relaxed text-muted-foreground">
-              Soft start, motor, homing &amp; approach speeds hidden. Tap to adjust.
+              Soft start, motor, homing, approach &amp; weight compensation hidden. Tap to adjust.
             </p>
           )}
 
@@ -416,6 +510,112 @@ export function ManualControl({ node: nodeProp }: { node?: StorageNode } = {}) {
                   Reset to default
                 </button>{" "}
                 crawl.
+              </>
+            )}
+          </p>
+
+          {/* Weight compensation. The three duty sliders above are BASE values.
+              A fuller carousel turns slower at the same duty, so this adds a
+              boost to all three: every N kg of spools currently in the carousel
+              earns +M% — and it is taken away again as spools are removed. The
+              sliders keep showing the base; the boosted duties are what the Pi
+              receives. */}
+          <div className="mt-4 flex items-center justify-between">
+            <p className="text-xs uppercase tracking-wider text-muted-foreground">Weight compensation</p>
+            <span className="font-mono text-xs text-foreground">
+              {loadCompOn ? `+${loadCompPct}% per ${loadCompKg.toFixed(1)} kg` : "Off"}
+            </span>
+          </div>
+
+          <div className="mt-2 flex items-center justify-between text-[10px] uppercase tracking-wide text-muted-foreground">
+            <span>Every</span>
+            <span className="font-mono text-foreground">{loadCompKg.toFixed(1)} kg</span>
+          </div>
+          <input
+            type="range"
+            aria-label="Weight compensation step: kilograms of load per boost step"
+            min={MIN_LOAD_COMP_KG}
+            max={MAX_LOAD_COMP_KG}
+            step={0.1}
+            value={loadCompKg}
+            disabled={busy || !loadCompOn}
+            onChange={(e) =>
+              dispatch({ type: "SET_NODE_LOAD_COMP", nodeId: node.id, loadCompKg: Number(e.target.value) })
+            }
+            className="mt-1 w-full accent-[var(--color-primary)] disabled:opacity-40"
+          />
+          <div className="flex justify-between text-[10px] uppercase tracking-wide text-muted-foreground">
+            <span>500 g</span>
+            <span>10 kg</span>
+          </div>
+
+          <div className="mt-2 flex items-center justify-between text-[10px] uppercase tracking-wide text-muted-foreground">
+            <span>Adds</span>
+            <span className="font-mono text-foreground">+{loadCompPct}%</span>
+          </div>
+          <input
+            type="range"
+            aria-label="Weight compensation amount: percent of speed added per step"
+            min={MIN_LOAD_COMP_PCT}
+            max={MAX_LOAD_COMP_PCT}
+            step={1}
+            value={loadCompPct}
+            disabled={busy || !loadCompOn}
+            onChange={(e) =>
+              dispatch({ type: "SET_NODE_LOAD_COMP_PCT", nodeId: node.id, loadCompPct: Number(e.target.value) })
+            }
+            className="mt-1 w-full accent-[var(--color-primary)] disabled:opacity-40"
+          />
+          <div className="flex justify-between text-[10px] uppercase tracking-wide text-muted-foreground">
+            <span>1%</span>
+            <span>10%</span>
+          </div>
+          {loadCompOn ? (
+            <div className="mt-2 rounded-lg border border-border bg-card/60 p-2">
+              <div className="flex items-center justify-between text-[11px]">
+                <span className="text-muted-foreground">Load in carousel</span>
+                <span className="font-mono text-foreground">{formatGrams(loadGrams)}</span>
+              </div>
+              <div className="mt-1 flex items-center justify-between text-[11px]">
+                <span className="text-muted-foreground">Speed boost</span>
+                <span className={cn("font-mono", boostPct > 0 ? "text-primary" : "text-foreground")}>
+                  +{boostPct}%
+                </span>
+              </div>
+              <p className="mt-1.5 font-mono text-[10px] leading-relaxed text-muted-foreground">
+                Sent to motor: move {Math.round(boostDuty(moveDutyFor(node), boostPct) * 100)}% · homing{" "}
+                {Math.round(boostDuty(homingDuty, boostPct) * 100)}% · approach{" "}
+                {Math.round(boostDuty(approachDuty, boostPct) * 100)}%
+              </p>
+            </div>
+          ) : null}
+          <p className="mt-1 text-[10px] leading-relaxed text-muted-foreground">
+            {loadCompOn ? (
+              <>
+                Adds +{loadCompPct}% to Motor, Homing and Approach for every {loadCompKg.toFixed(1)} kg of spools
+                in the carousel, and lowers it again as spools are removed.{" "}
+                <button
+                  type="button"
+                  disabled={busy}
+                  onClick={() => dispatch({ type: "SET_NODE_LOAD_COMP", nodeId: node.id, loadCompKg: undefined })}
+                  className="underline underline-offset-2 transition-colors hover:text-foreground disabled:opacity-40"
+                >
+                  Turn off
+                </button>
+                .
+              </>
+            ) : (
+              <>
+                Off — speeds are sent exactly as set above.{" "}
+                <button
+                  type="button"
+                  disabled={busy}
+                  onClick={() => dispatch({ type: "SET_NODE_LOAD_COMP", nodeId: node.id, loadCompKg: 3 })}
+                  className="underline underline-offset-2 transition-colors hover:text-foreground disabled:opacity-40"
+                >
+                  Turn on
+                </button>{" "}
+                to speed the motor up as the carousel gets heavier.
               </>
             )}
           </p>

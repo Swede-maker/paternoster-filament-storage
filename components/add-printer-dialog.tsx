@@ -40,6 +40,9 @@ export function AddPrinterDialog({
   const [ip, setIp] = useState("")
   const [port, setPort] = useState("7125")
   const [apiKey, setApiKey] = useState("")
+  // Optional address of the printer's own web UI (Mainsail/Fluidd/vendor) to
+  // embed in PAX's Printers section. Blank = fall back to http://<ip>.
+  const [webUrl, setWebUrl] = useState("")
   // Bambu Lab link (MQTT): serial + LAN access code, or cloud mode.
   const [serial, setSerial] = useState("")
   const [accessCode, setAccessCode] = useState("")
@@ -60,6 +63,7 @@ export function AddPrinterDialog({
       setIp(editing.ip ?? "")
       setPort(editing.port ? String(editing.port) : editing.firmware === "prusalink" ? "80" : "7125")
       setApiKey(editing.apiKey ?? "")
+      setWebUrl(editing.webUrl ?? "")
       setSerial(editing.serial ?? "")
       setAccessCode(editing.accessCode ?? "")
       setBambuMode(editing.bambuMode ?? "lan")
@@ -83,6 +87,7 @@ export function AddPrinterDialog({
     setIp("")
     setPort("7125")
     setApiKey("")
+    setWebUrl("")
     setSerial("")
     setAccessCode("")
     setBambuMode("lan")
@@ -132,6 +137,8 @@ export function AddPrinterDialog({
       ip: isBambuCloud ? undefined : ip.trim() || undefined,
       port: !isBambu && ip.trim() ? Number.parseInt(port) || (isPrusa ? 80 : 7125) : undefined,
       apiKey: !isBambu && ip.trim() && apiKey.trim() ? apiKey.trim() : undefined,
+      // Web UI address for the embedded Printers view (any firmware).
+      webUrl: webUrl.trim() || undefined,
       serial: isBambu ? bambuSerial : undefined,
       accessCode: isBambu && !isBambuCloud && accessCode.trim() ? accessCode.trim() : undefined,
       bambuMode: (isBambu ? bambuMode : undefined) as "lan" | "cloud" | undefined,
@@ -297,6 +304,21 @@ export function AddPrinterDialog({
                   : isPrusa
                     ? "PrusaLink links to Prusa printers (MINI, MK4, XL…) for live nozzle temperatures and filament usage."
                     : "Klipper links over Moonraker for live nozzle temperatures. Leave the fields blank to skip linking."}
+              </p>
+            </Field>
+
+            <Field label="Web UI address (optional)">
+              <Input
+                value={webUrl}
+                onChange={(e) => setWebUrl(e.target.value)}
+                placeholder="e.g. http://192.168.1.50 or http://mainsail.local"
+                inputMode="url"
+                spellCheck={false}
+              />
+              <p className="mt-1 text-xs text-muted-foreground">
+                The printer&apos;s own interface (Mainsail, Fluidd, or a vendor UI). PAX embeds it in the Printers tab so
+                you don&apos;t switch browser tabs. Leave blank to use <span className="font-mono">http://</span> plus the
+                IP above.
               </p>
             </Field>
 

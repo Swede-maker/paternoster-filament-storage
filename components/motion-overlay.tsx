@@ -1,7 +1,18 @@
 "use client"
 
 import { useEffect, useState } from "react"
-import { Loader2, CheckCircle2, ArrowUpCircle, ArrowDownCircle, MapPin, Layers, QrCode, ScanLine, Plus } from "lucide-react"
+import {
+  Loader2,
+  CheckCircle2,
+  ArrowUpCircle,
+  ArrowDownCircle,
+  MapPin,
+  Layers,
+  QrCode,
+  ScanLine,
+  Plus,
+  Shuffle,
+} from "lucide-react"
 import { useStore } from "@/lib/store"
 import { Button } from "./ui/button"
 import { Input, Field } from "./ui/field"
@@ -398,6 +409,29 @@ export function MotionOverlay() {
             >
               <CheckCircle2 className="h-5 w-5" /> {ambiguous ? "Confirm without scanning" : "Confirm store"}
             </Button>
+            {/* The offered slot may be physically too tight for this spool. Let
+                the operator ask for another one; slots already turned down are
+                remembered on the item so the same one is never offered again. */}
+            {!isPart && (
+              <>
+                <Button
+                  size="md"
+                  variant="outline"
+                  className="mt-2 w-full"
+                  onClick={() => dispatch({ type: "REJECT_STORE_SLOT" })}
+                >
+                  <Shuffle className="h-4 w-4" /> Doesn&apos;t fit — find a different slot
+                </Button>
+                {(item.rejectedSlots?.length ?? 0) > 0 && (
+                  <p className="mt-1.5 text-center text-xs text-muted-foreground text-pretty">
+                    {item.rejectedSlots!.length === 1
+                      ? "1 slot skipped for this spool."
+                      : `${item.rejectedSlots!.length} slots skipped for this spool.`}{" "}
+                    Skipped slots won&apos;t be offered again.
+                  </p>
+                )}
+              </>
+            )}
           </div>
         )}
 

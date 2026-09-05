@@ -1,11 +1,11 @@
 "use client"
 
-import { Boxes, Layers } from "lucide-react"
-import type { SystemKind } from "@/lib/types"
+import { Boxes, Layers, Printer } from "lucide-react"
+import type { TopArea } from "@/lib/types"
 import { cn } from "@/lib/utils"
 
 /**
- * Top-level switcher between the two tracking areas (Filament vs Hardware).
+ * Top-level switcher between the tracking areas (Filament, Hardware, Printers).
  * Each area is its own self-contained world with its own bottom nav; this bar
  * is the only place they meet. Rendered as a segmented control so the active
  * area reads at a glance.
@@ -14,12 +14,13 @@ export function AreaSwitcher({
   area,
   onChange,
 }: {
-  area: SystemKind
-  onChange: (area: SystemKind) => void
+  area: TopArea
+  onChange: (area: TopArea) => void
 }) {
-  const areas: { id: SystemKind; label: string; Icon: typeof Layers }[] = [
+  const areas: { id: TopArea; label: string; Icon: typeof Layers }[] = [
     { id: "filament", label: "Filament", Icon: Layers },
     { id: "hardware", label: "Hardware", Icon: Boxes },
+    { id: "printers", label: "Printers", Icon: Printer },
   ]
   return (
     <div

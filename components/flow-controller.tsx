@@ -1,9 +1,9 @@
 "use client"
 
-import { createContext, useContext, useMemo, useState, type ReactNode } from "react"
+import { createContext, useContext, useEffect, useMemo, useState, type ReactNode } from "react"
 import { useStore } from "@/lib/store"
-import { bestSlotForNode, bestNodeSlot, containerWeight } from "@/lib/balance"
-import { activeNode, orderQueueItems } from "@/lib/selectors"
+import { orderQueueItems } from "@/lib/selectors"
+import { pickFilamentDestination } from "@/lib/filament-flow"
 import { newId } from "@/lib/filament"
 import type { AppState } from "@/lib/types"
 import type { ActiveJob, Printer, QueueItem, Spool } from "@/lib/types"
@@ -99,36 +99,8 @@ interface FlowContextValue {
 
 const FlowContext = createContext<FlowContextValue | null>(null)
 
-/**
- * Choose where a stored/placed spool should go. When the caller names a
- * `preferredNodeId` (the unit the user explicitly picked), we place into that
- * unit using its own fill strategy — balanced for a paternoster, linear-from-slot-1
- * for a dumb shelf. If none is given we fall back to the active tab, and if the
- * chosen unit is full we spill over to the best slot across every linked unit.
- */
-function pickDestination(
-  state: AppState,
-  grams: number,
-  reserved: { nodeId: string; shelf: number; slot: number }[],
-  preferredNodeId?: string,
-  containerId?: string,
-): { nodeId: string; shelf: number; slot: number } | null {
-  const containers = state.settings.containers ?? []
-  // The spool being placed isn't in the grid yet, so fold its container's empty
-  // weight into the search weight — the machine balances around the real mass
-  // (filament + dry box), not just the filament.
-  const weight = grams + containerWeight(containerId, containers)
-  const preferred = preferredNodeId ? state.nodes.find((n) => n.id === preferredNodeId) : undefined
-  const node = preferred ?? activeNode(state)
-  // A library only receives a spool when the user explicitly targets it. If it's
-  // merely the active tab, auto-placement balances across the real storage pool
-  // instead of dumping into the catalog.
-  const canUseLocal = !!preferred || (node.type ?? "paternoster") !== "library"
-  const localReserved = reserved.filter((r) => r.nodeId === node.id).map((r) => ({ shelf: r.shelf, slot: r.slot }))
-  const local = canUseLocal ? bestSlotForNode(node, state.spools, weight, localReserved, containers) : null
-  if (local) return { nodeId: node.id, shelf: local.shelf, slot: local.slot }
-  return bestNodeSlot(state.nodes, state.spools, weight, reserved, containers)
-}
+// Filament-only slot chooser, shared with the store's "different slot" re-pick.
+const pickDestination = pickFilamentDestination
 
 /** Empty draft state: both queues empty, showing the place-in tab. */
 const EMPTY: FlowState = { inItems: [], outItems: [], view: "in" }
@@ -138,6 +110,79 @@ export function FlowProvider({ children }: { children: ReactNode }) {
   const [draft, setDraft] = useState<FlowState>(EMPTY)
   // Pending "act on this spool" request handed off from the inventory tab.
   const [inspectRequest, setInspectRequest] = useState<{ spool: Spool; loc: NodeLocation } | null>(null)
+
+  // ----- external dispense queue runner -----
+  // Requests arrive from the printer API (written into the shared doc). Any open
+  // PAX screen runs them, and the whole lifecycle is derived from SHARED STATE
+  // only — no refs — so it survives reloads and works across devices:
+  //
+  //   pending  -> START_DISPENSE (atomic: running + job)  -> running
+  //   running  + target slot now empty                    -> done
+  //   running  + no job + slot still full                 -> error (interrupted)
+  //
+  // Marking a request "running" persists, so it doubles as a cross-device mutex:
+  // a second screen sees one already running and won't start another.
+
+  // Start the oldest pending request when the machine is free and nothing else
+  // is mid-dispense.
+  useEffect(() => {
+    if (state.job) return
+    if (state.dispenseRequests.some((r) => r.status === "running")) return
+    const pending = state.dispenseRequests.find((r) => r.status === "pending")
+    if (!pending) return
+
+    const node = state.nodes.find((n) => n.id === pending.nodeId)
+    const spoolId = node?.slots[pending.shelf]?.[pending.slot] ?? null
+    const spool = spoolId ? state.spools[spoolId] : null
+    if (!node || !spoolId || !spool) {
+      dispatch({
+        type: "UPDATE_DISPENSE",
+        id: pending.id,
+        changes: { status: "error", error: "That slot is now empty — nothing to dispense." },
+      })
+      return
+    }
+
+    // SAFETY: never start motion on a carousel that has lost its position. An
+    // external request must not be the thing that makes a stopped machine move
+    // again; the operator has to home it (via the position-lost dialog) first.
+    // Fail the request so the printer can resubmit afterwards.
+    if (node.machine.fault || !node.machine.homed) {
+      dispatch({
+        type: "UPDATE_DISPENSE",
+        id: pending.id,
+        changes: { status: "error", error: "Carousel position is unknown — home it in PAX, then resubmit." },
+      })
+      return
+    }
+
+    // A dispense is a retrieve-to-hand: rotate to the slot and take the spool
+    // out. The printer's own load sequence pulls it in from there. Atomic start
+    // guarantees there's never a "running" render without a live job.
+    const item: QueueItem = { spoolId, nodeId: pending.nodeId, shelf: pending.shelf, slot: pending.slot, done: false }
+    dispatch({ type: "START_DISPENSE", id: pending.id, item })
+  }, [state.job, state.dispenseRequests, state.nodes, state.spools, dispatch])
+
+  // Resolve the running request from shared state. Because the start is atomic,
+  // any "running" request seen WITHOUT a live job has lost its operation (the
+  // running screen reloaded, or the operator cancelled) — recover by erroring so
+  // the printer can resubmit rather than hanging forever.
+  useEffect(() => {
+    if (state.job) return // an operation is live; wait for it to finish
+    const running = state.dispenseRequests.find((r) => r.status === "running")
+    if (!running) return
+
+    const node = state.nodes.find((n) => n.id === running.nodeId)
+    const slotSpool = node?.slots[running.shelf]?.[running.slot] ?? null
+    const emptied = running.spoolId ? slotSpool !== running.spoolId : slotSpool == null
+    dispatch({
+      type: "UPDATE_DISPENSE",
+      id: running.id,
+      changes: emptied
+        ? { status: "done" }
+        : { status: "error", error: "Operation ended before the spool was taken out — resubmit to retry." },
+    })
+  }, [state.job, state.dispenseRequests, state.nodes, dispatch])
 
   const value = useMemo<FlowContextValue>(() => {
     const { inItems, outItems, view } = draft

@@ -1,10 +1,10 @@
 "use client"
 
-import { Home, Settings, ShoppingCart, History, Droplets, Boxes, BarChart3, ScanLine } from "lucide-react"
+import { Home, Settings, ShoppingCart, History, Droplets, Boxes, BarChart3, ScanLine, Printer } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { useStore } from "@/lib/store"
 import { dueReminders, lowStockParts } from "@/lib/selectors"
-import type { SystemKind } from "@/lib/types"
+import type { TopArea } from "@/lib/types"
 
 export type NavTab = "home" | "scan" | "orders" | "history" | "drying" | "inventory" | "statistics" | "settings"
 
@@ -15,8 +15,9 @@ export function BottomNav({
 }: {
   tab: NavTab
   onChange: (t: NavTab) => void
-  /** Which area's tab set to render. Hardware drops printers/scan/drying/stats. */
-  area?: SystemKind
+  /** Which area's tab set to render. Hardware drops printers/scan/drying/stats;
+      the printers area is self-contained and shows a single Home entry. */
+  area?: TopArea
 }) {
   const { state } = useStore()
 
@@ -48,7 +49,11 @@ export function BottomNav({
     { id: "settings", label: "Settings", icon: Settings },
   ]
 
-  const items = area === "hardware" ? hardwareItems : filamentItems
+  // Printers is a self-contained section with its own in-view navigation, so the
+  // footer only carries a single Home entry for consistency (status + version).
+  const printerItems: typeof filamentItems = [{ id: "home", label: "Printers", icon: Printer }]
+
+  const items = area === "hardware" ? hardwareItems : area === "printers" ? printerItems : filamentItems
 
   // The system is "online" once every linked node is homed and none is homing.
   const anyHoming = state.nodes.some((n) => n.machine.status === "homing")

@@ -212,9 +212,10 @@ export function ScanView() {
                 const spool = state.spools[view.spoolId]
                 if (!spool) return
                 const weight = spool.grams + containerWeight(spool.containerId, containers)
-                const place = bestNodeSlot(state.nodes, state.spools, weight, [], containers)
+                // Filament units only — a spool must never auto-place into a hardware rack.
+                const place = bestNodeSlot(nodesForSystem(state, "filament"), state.spools, weight, [], containers)
                 if (!place) {
-                  go({ v: "result", kind: "error", text: "Every storage unit is full. Free a slot or add a unit, then try again." })
+                  go({ v: "result", kind: "error", text: "Every filament unit is full. Free a slot or add a unit, then try again." })
                   return
                 }
                 dispatch({ type: "SET_STORAGE_SLOT", ...place, spoolId: view.spoolId })
@@ -369,9 +370,9 @@ export function ScanView() {
                 onClick={() => {
                   const weight = spool.grams + containerWeight(spool.containerId, containers)
                   // Reserve the spool's own current slot so it isn't "found" as free.
-                  const place2 = bestNodeSlot(state.nodes, state.spools, weight, [], containers)
+                  const place2 = bestNodeSlot(nodesForSystem(state, "filament"), state.spools, weight, [], containers)
                   if (!place2) {
-                    go({ v: "result", kind: "error", text: "Every storage unit is full." })
+                    go({ v: "result", kind: "error", text: "Every filament unit is full." })
                     return
                   }
                   relocateToStorage(spool.id, place2.nodeId, place2.shelf, place2.slot)
