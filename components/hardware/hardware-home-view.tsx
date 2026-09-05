@@ -4,6 +4,7 @@ import { useMemo, useState } from "react"
 import { Boxes, Package, Server, Plus, Search, Scale, Loader2, MapPin, AlertTriangle, X } from "lucide-react"
 import { useStore } from "@/lib/store"
 import { cn } from "@/lib/utils"
+import { ReorderableTabs } from "@/components/reorderable-tabs"
 import { formatGrams } from "@/lib/filament"
 import {
   activeNode,
@@ -202,41 +203,35 @@ export function HardwareHomeView() {
 
       {/* Unit switcher */}
       {nodes.length > 1 && (
-        <div className="flex flex-wrap items-center gap-2" role="tablist" aria-label="Hardware units">
-          {nodes.map((n) => {
-            const active = n.id === node.id
+        <ReorderableTabs
+          aria-label="Hardware units"
+          onReorder={(id, beforeId) => dispatch({ type: "REORDER_NODES", id, beforeId })}
+          tabs={nodes.map((n) => {
             const nt = n.type ?? "paternoster"
             const busy = nt === "paternoster" && n.machine.status === "moving"
             const Icon = nt === "library" ? Boxes : nt === "shelf" ? Package : Server
-            return (
-              <button
-                key={n.id}
-                type="button"
-                role="tab"
-                aria-selected={active}
-                onClick={() => dispatch({ type: "SET_ACTIVE_NODE", id: n.id })}
-                className={cn(
-                  "flex items-center gap-2 rounded-lg border px-3 py-1.5 text-sm transition-colors",
-                  active
-                    ? "border-primary bg-primary/10 text-foreground"
-                    : "border-border bg-background/50 text-muted-foreground hover:border-primary/50",
-                )}
-              >
-                <Icon className="h-4 w-4" />
-                <span className="font-medium">{n.name}</span>
-                {n.area ? (
-                  <span className="inline-flex items-center gap-0.5 text-[10px] text-muted-foreground">
-                    <MapPin className="h-3 w-3" />
-                    {n.area}
-                  </span>
-                ) : (
-                  <span className="text-[10px] uppercase tracking-wide text-muted-foreground">{nt}</span>
-                )}
-                {busy && <Loader2 className="h-3.5 w-3.5 animate-spin text-primary" />}
-              </button>
-            )
+            return {
+              id: n.id,
+              active: n.id === node.id,
+              onSelect: () => dispatch({ type: "SET_ACTIVE_NODE", id: n.id }),
+              children: (
+                <>
+                  <Icon className="h-4 w-4" />
+                  <span className="font-medium">{n.name}</span>
+                  {n.area ? (
+                    <span className="inline-flex items-center gap-0.5 text-[10px] text-muted-foreground">
+                      <MapPin className="h-3 w-3" />
+                      {n.area}
+                    </span>
+                  ) : (
+                    <span className="text-[10px] uppercase tracking-wide text-muted-foreground">{nt}</span>
+                  )}
+                  {busy && <Loader2 className="h-3.5 w-3.5 animate-spin text-primary" />}
+                </>
+              ),
+            }
           })}
-        </div>
+        />
       )}
 
       {/* Add action */}

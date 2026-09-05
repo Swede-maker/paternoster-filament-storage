@@ -7,6 +7,7 @@ import { useFlow, type NodeLocation } from "./flow-controller"
 import { Button } from "./ui/button"
 import { ResizableSidebar } from "./resizable-sidebar"
 import { StatsBar } from "./stats-bar"
+import { ReorderableTabs } from "./reorderable-tabs"
 import { CarouselView } from "./carousel-view"
 import { ShelfStorageView } from "./shelf-storage-view"
 import { LibraryView } from "./library-view"
@@ -268,45 +269,39 @@ export function HomeView() {
         {/* Node switcher — filament units only, so hardware carousels never
             leak into the filament tab strip. Only shown when >1 filament unit. */}
         {filamentNodes.length > 1 && (
-          <div className="flex flex-wrap items-center gap-2" role="tablist" aria-label="Storage units">
-            {filamentNodes.map((n) => {
-              const active = n.id === state.activeNodeId
+          <ReorderableTabs
+            aria-label="Storage units"
+            onReorder={(id, beforeId) => dispatch({ type: "REORDER_NODES", id, beforeId })}
+            tabs={filamentNodes.map((n) => {
               const nodeType = n.type ?? "paternoster"
               const nodeIsShelf = nodeType === "shelf"
               const nodeIsLibrary = nodeType === "library"
               const busy = nodeType === "paternoster" && n.machine.status === "moving"
               const Icon = nodeIsLibrary ? Boxes : nodeIsShelf ? Package : Server
-              return (
-                <button
-                  key={n.id}
-                  type="button"
-                  role="tab"
-                  aria-selected={active}
-                  onClick={() => dispatch({ type: "SET_ACTIVE_NODE", id: n.id })}
-                  className={
-                    "flex items-center gap-2 rounded-lg border px-3 py-1.5 text-sm transition-colors " +
-                    (active
-                      ? "border-primary bg-primary/10 text-foreground"
-                      : "border-border bg-background/50 text-muted-foreground hover:border-primary/50")
-                  }
-                >
-                  <Icon className="h-4 w-4" />
-                  <span className="font-medium">{n.name}</span>
-                  {n.area ? (
-                    <span className="inline-flex items-center gap-0.5 text-[10px] text-muted-foreground">
-                      <MapPin className="h-3 w-3" />
-                      {n.area}
-                    </span>
-                  ) : (
-                    <span className="text-[10px] uppercase tracking-wide text-muted-foreground">
-                      {nodeIsLibrary ? "library" : nodeIsShelf ? "shelf" : n.role}
-                    </span>
-                  )}
-                  {busy && <Loader2 className="h-3.5 w-3.5 animate-spin text-primary" />}
-                </button>
-              )
+              return {
+                id: n.id,
+                active: n.id === state.activeNodeId,
+                onSelect: () => dispatch({ type: "SET_ACTIVE_NODE", id: n.id }),
+                children: (
+                  <>
+                    <Icon className="h-4 w-4" />
+                    <span className="font-medium">{n.name}</span>
+                    {n.area ? (
+                      <span className="inline-flex items-center gap-0.5 text-[10px] text-muted-foreground">
+                        <MapPin className="h-3 w-3" />
+                        {n.area}
+                      </span>
+                    ) : (
+                      <span className="text-[10px] uppercase tracking-wide text-muted-foreground">
+                        {nodeIsLibrary ? "library" : nodeIsShelf ? "shelf" : n.role}
+                      </span>
+                    )}
+                    {busy && <Loader2 className="h-3.5 w-3.5 animate-spin text-primary" />}
+                  </>
+                ),
+              }
             })}
-          </div>
+          />
         )}
 
         {/* Place-new action. A big "+" button appears on every unit type. On a

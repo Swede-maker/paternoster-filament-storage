@@ -4,7 +4,15 @@ import { useEffect, useRef } from "react"
 import { useStore } from "@/lib/store"
 import type { StorageNode } from "@/lib/types"
 import { parseEvent, type NodeCommand } from "@/lib/node-protocol"
-import { moveDutyFor, homingDutyFor, approachDutyFor, DEFAULT_RAMP_PCT } from "@/lib/filament"
+import {
+  moveDutyFor,
+  homingDutyFor,
+  approachDutyFor,
+  loadBoostPctFor,
+  boostDuty,
+  DEFAULT_RAMP_PCT,
+} from "@/lib/filament"
+import { nodeLoadGrams } from "@/lib/selectors"
 
 /**
  * Owns the live connection to hardware nodes' Pi agents — via the app server.
@@ -44,6 +52,10 @@ export function NodeConnection() {
   // state otherwise).
   const nodesRef = useRef<StorageNode[]>(state.nodes)
   nodesRef.current = state.nodes
+  // Whole-state ref for the config push: the weight compensation needs the
+  // spools (for grams) as well as the nodes.
+  const stateRef = useRef(state)
+  stateRef.current = state
 
   // --- Reconcile the set of open streams with the hardware nodes. ---
   const connectionSig = state.nodes
@@ -325,27 +337,35 @@ export function NodeConnection() {
   // this effect never re-fires on connect. Reading `n.link` — which is dispatched
   // to the store right beside that mutation — makes connect/disconnect a real
   // state change that recomputes the signature.
+  //
+  // The duties sent are the slider values PLUS the weight-compensation boost for
+  // the carousel's current load, so the signature includes the boost: storing or
+  // removing a spool changes the load, which changes the effective duty, which
+  // must reach the Pi before the next move.
   const configSig = state.nodes
     .filter((n) => n.driver === "hardware")
-    .map((n) =>
-      [
+    .map((n) => {
+      const boost = loadBoostPctFor(n, nodeLoadGrams(state, n))
+      return [
         n.id,
         n.link,
         n.storage.shelves,
-        moveDutyFor(n),
-        homingDutyFor(n),
-        approachDutyFor(n),
+        boostDuty(moveDutyFor(n), boost),
+        boostDuty(homingDutyFor(n), boost),
+        boostDuty(approachDutyFor(n), boost),
         n.rampPct ?? DEFAULT_RAMP_PCT,
-      ].join(":"),
-    )
+      ].join(":")
+    })
     .join("|")
 
   useEffect(() => {
     // Debounced: dragging a slider fires a change per pixel, and each one would
     // otherwise be a POST to the Pi.
     const timer = setTimeout(() => {
-      for (const node of nodesRef.current) {
+      const snapshot = stateRef.current
+      for (const node of snapshot.nodes) {
         if (node.driver !== "hardware") continue
+        const boost = loadBoostPctFor(node, nodeLoadGrams(snapshot, node))
         // No ref-based online gate here either. The relay remembers motion
         // settings and replays them when the Pi reconnects, so sending while the
         // link is down is harmless (the route answers "Pi not connected") and
@@ -359,9 +379,9 @@ export function NodeConnection() {
             command: {
               type: "config",
               shelves: node.storage.shelves,
-              moveSpeed: moveDutyFor(node),
-              homingSpeed: homingDutyFor(node),
-              approachSpeed: approachDutyFor(node),
+              moveSpeed: boostDuty(moveDutyFor(node), boost),
+              homingSpeed: boostDuty(homingDutyFor(node), boost),
+              approachSpeed: boostDuty(approachDutyFor(node), boost),
               rampPct: node.rampPct ?? DEFAULT_RAMP_PCT,
             },
           }),

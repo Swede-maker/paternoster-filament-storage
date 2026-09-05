@@ -6,7 +6,7 @@ import { useFlow, type QueueView, type PendingItem } from "./flow-controller"
 import { useStore } from "@/lib/store"
 import { Button } from "./ui/button"
 import { SpoolDisc, discColor2 } from "./spool"
-import { printerSlotLabel, getNode, shelfLabel, orderQueueItems } from "@/lib/selectors"
+import { printerSlotLabel, getNode, shelfLabel, orderQueueItems, nodesForSystem } from "@/lib/selectors"
 import { nodeFreeSlots } from "@/lib/balance"
 import { isLightColor, spoolFill } from "@/lib/filament"
 import { cn } from "@/lib/utils"
@@ -20,6 +20,10 @@ import { cn } from "@/lib/utils"
 export function QueueTray({ onAddMore }: { onAddMore: (view: QueueView) => void }) {
   const { flow, inItems, outItems, view, setView, cancel, run, reassignItemNode } = useFlow()
   const { state } = useStore()
+  // A spool can only be redirected into a FILAMENT unit. Hardware racks share the
+  // same node list but must never be offered here — a spool queued into one would
+  // then be driven to a hardware shelf at confirm time.
+  const filamentNodes = nodesForSystem(state, "filament")
   // Storage units a queued spool can be redirected into: a library is unbounded,
   // fixed grids need a free slot (the item's own current unit always qualifies).
   const nodeHasRoom = (nodeId: string, currentNodeId: string) => {
@@ -103,6 +107,7 @@ export function QueueTray({ onAddMore }: { onAddMore: (view: QueueView) => void 
                     nodeHasRoom={nodeHasRoom}
                     reassignItemNode={reassignItemNode}
                     nodes={state.nodes}
+                    destinationNodes={filamentNodes}
                     printers={state.printers}
                     getWhere={(item) => describeLocation(state, item)}
                   />
@@ -183,6 +188,7 @@ function QueueCard({
   nodeHasRoom,
   reassignItemNode,
   nodes,
+  destinationNodes,
   printers,
   getWhere,
 }: {
@@ -191,7 +197,10 @@ function QueueCard({
   view: QueueView
   nodeHasRoom: (nodeId: string, currentNodeId: string) => boolean
   reassignItemNode: (spoolId: string, nodeId: string) => void
+  /** Every unit — used only to label where a moved spool is coming FROM. */
   nodes: ReturnType<typeof useStore>["state"]["nodes"]
+  /** Units this spool may be redirected INTO (filament units only). */
+  destinationNodes: ReturnType<typeof useStore>["state"]["nodes"]
   printers: ReturnType<typeof useStore>["state"]["printers"]
   getWhere: (it: PendingItem) => string
 }) {
@@ -221,14 +230,14 @@ function QueueCard({
         {it.spool.material}
       </span>
       <span className="font-mono text-[10px] text-muted-foreground">{route}</span>
-      {view === "in" && nodes.length > 1 && (
+      {view === "in" && destinationNodes.length > 1 && (
         <select
           value={it.nodeId}
           onChange={(e) => reassignItemNode(it.spool.id, e.target.value)}
           aria-label={`Storage unit for ${it.spool.material} ${it.spool.colorName}`}
           className="mt-0.5 max-w-[104px] rounded-md border border-border bg-background px-1.5 py-1 text-[10px] text-foreground focus:border-primary focus:outline-none"
         >
-          {nodes.map((n) => (
+          {destinationNodes.map((n) => (
             <option key={n.id} value={n.id} disabled={!nodeHasRoom(n.id, it.nodeId)}>
               {n.name}
             </option>
