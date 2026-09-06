@@ -127,6 +127,11 @@ export interface HelloEvent {
   shelves?: number
   firmware?: string
   /**
+   * Present from pax-agent-1.1 on. Its absence is how the app tells that the
+   * agent predates paxnet and will silently ignore every `net.*` command.
+   */
+  role?: NetRole
+  /**
    * True when the agent is faking motion instead of driving GPIO — either from
    * `--simulate` or because gpiozero failed to initialise. Critically, such an
    * agent still connects and reports perfect motion, so without this flag a

@@ -136,6 +136,22 @@ export function NodeConnection() {
               simulated: ev.simulated === true,
               reason: ev.simReason ?? undefined,
             })
+            // An agent without `role` predates paxnet: it will never send a
+            // net.status and drops net.* on the floor. Say so instead of
+            // leaving the network panel on "waiting" forever.
+            if (ev.role === undefined) {
+              dispatch({
+                type: "NODE_NET_STATUS",
+                nodeId,
+                status: {
+                  type: "net.status",
+                  role: "master",
+                  mode: "unknown",
+                  error: `This Pi runs an older agent (${ev.firmware ?? "unversioned"}) without network support. Re-run pi-agent/install.sh on it to enable Wi-Fi management, hotspot fallback and slave provisioning.`,
+                  at: Date.now(),
+                },
+              })
+            }
             break
           // A `state` frame is the agent's opening summary on connect. It must
           // NOT be treated like a `pos` frame: the agent keeps position purely
@@ -182,9 +198,21 @@ export function NodeConnection() {
               conn.gotoTarget = null
               conn.homeSent = false
             }
-            dispatch({ type: "NODE_FAULT", nodeId, message: ev.message })
-            break
-        }
+              dispatch({ type: "NODE_FAULT", nodeId, message: ev.message })
+              break
+            case "net.status":
+              dispatch({ type: "NODE_NET_STATUS", nodeId, status: ev })
+              break
+            case "net.slaves":
+              dispatch({ type: "NODE_NET_SLAVES", nodeId, slaves: ev.slaves })
+              break
+            case "net.result":
+              dispatch({ type: "NODE_NET_RESULT", nodeId, result: ev })
+              break
+            case "net.scan":
+              // Answered synchronously through POST /api/net/scan; nothing to store.
+              break
+          }
       })
 
       // SSE dropped (network blip). EventSource auto-reconnects; show "checking"
