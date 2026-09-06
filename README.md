@@ -39,6 +39,12 @@ Re-run it any time to update; your data and hotspot password are kept.
 Everything below is the manual route for a PC or home server, or if you want to
 see what the script does.
 
+If you want to set your own password erase 'SET-YOUR-PASSWORD' and write yours there:
+
+```bash
+cd ~/pax/pi-agent
+sudo bash install.sh --role master --ap-psk 'SET-YOUR-PASSWORD'
+```
 ---
 
 ## 1. Requirements
