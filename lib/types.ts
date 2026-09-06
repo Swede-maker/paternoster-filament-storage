@@ -1,5 +1,7 @@
 // Core domain types for the PAX paternoster filament storage system.
 
+import type { NetResultEvent, NetSlave, NetStatusEvent } from "@/lib/node-protocol"
+
 /**
  * Filament material type. Common presets are listed in `MATERIALS`
  * (see lib/filament), but any custom string is allowed so users can
@@ -719,6 +721,19 @@ export interface StorageNode {
   agentSimulated?: boolean
   /** Agent-reported cause of simulation, e.g. the gpiozero pin-factory error. */
   agentSimReason?: string
+  /**
+   * Live Wi-Fi / hotspot picture of this node's Pi (`net.status` frames from
+   * paxnet). Runtime-only, never persisted or synced: it describes the radio
+   * of the Pi THIS device's relay is talking to right now.
+   */
+  net?: NetStatusEvent | null
+  /** Master only: slaves that have registered with it (`net.slaves`). */
+  netSlaves?: NetSlave[]
+  /**
+   * Most recent `net.result` for this node, for the network panel to show
+   * "Connected to X" / "Wrong password" / "Pushed to 2 slaves". Runtime-only.
+   */
+  netResult?: NetResultEvent | null
   /**
    * Soft START ramp intensity, 0–100%. 0 = no easing; higher values ease the
    * carousel in at the start of a rotation. It deliberately does NOT soften the

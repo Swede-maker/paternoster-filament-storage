@@ -45,6 +45,7 @@ import type {
   TagBinding,
   RfidReader,
 } from "./types"
+import type { NetResultEvent, NetSlave, NetStatusEvent } from "./node-protocol"
 import { printerAmsUnits, printerSlotCount, rampStepMs, newId, DEFAULT_RAMP_PCT } from "./filament"
 import { shelfLabel, printerSlotLabel } from "./selectors"
 import { shortestRotation } from "./balance"
@@ -166,6 +167,10 @@ function toPersisted(state: AppState): PersistedState {
         linkError: _linkError,
         agentSimulated: _agentSimulated,
         agentSimReason: _agentSimReason,
+        // Network picture is per-relay runtime knowledge too.
+        net: _net,
+        netSlaves: _netSlaves,
+        netResult: _netResult,
         ...n
       }) => ({
         ...n,
@@ -659,6 +664,12 @@ export type Action =
   | { type: "NODE_ARRIVED"; nodeId: string; shelf: number }
   | { type: "NODE_HOMED"; nodeId: string; currentShelf?: number }
   | { type: "NODE_FAULT"; nodeId: string; message: string }
+  /** Wi-Fi / hotspot picture from the Pi (`net.status`). */
+  | { type: "NODE_NET_STATUS"; nodeId: string; status: NetStatusEvent }
+  /** Master only: registered slaves (`net.slaves`). */
+  | { type: "NODE_NET_SLAVES"; nodeId: string; slaves: NetSlave[] }
+  /** Outcome of a net.* op (`net.result`); `null` clears the banner. */
+  | { type: "NODE_NET_RESULT"; nodeId: string; result: NetResultEvent | null }
   /** Operator dismissed the position-lost dialog without homing. */
   | { type: "ACK_NODE_FAULT"; nodeId: string }
   /** A real carousel came online un-homed: ask the operator before the first sweep. */
@@ -1032,6 +1043,9 @@ function coreReducer(state: AppState, action: Action): AppState {
             connSeq: old.connSeq,
             agentSimulated: old.agentSimulated,
             agentSimReason: old.agentSimReason,
+            net: old.net,
+            netSlaves: old.netSlaves,
+            netResult: old.netResult,
             machine: keepMotion
               ? old.machine
               : keepRuntime
@@ -2011,6 +2025,15 @@ function coreReducer(state: AppState, action: Action): AppState {
         agentSimulated: action.simulated,
         agentSimReason: action.simulated ? action.reason : undefined,
       }))
+
+    case "NODE_NET_STATUS":
+      return withNode(state, action.nodeId, (n) => ({ ...n, net: action.status }))
+
+    case "NODE_NET_SLAVES":
+      return withNode(state, action.nodeId, (n) => ({ ...n, netSlaves: action.slaves }))
+
+    case "NODE_NET_RESULT":
+      return withNode(state, action.nodeId, (n) => ({ ...n, netResult: action.result }))
 
     case "NODE_POS":
       // Live position update as the carousel passes each shelf sensor.

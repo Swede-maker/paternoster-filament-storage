@@ -61,7 +61,60 @@ export interface ConfigCommand {
   approachSpeed?: number
 }
 
-export type NodeCommand = HelloCommand | HomeCommand | GotoCommand | StopCommand | ConfigCommand
+// ---- Networking (Wi-Fi / hotspot / slave provisioning) --------------------
+// Handled by `paxnet.py` on the Pi. Only meaningful for `driver: "hardware"`
+// nodes running Raspberry Pi OS Bookworm+ (NetworkManager).
+
+/** Ask for a fresh `net.status` (and `net.slaves` on a master). */
+export interface NetStatusCommand {
+  type: "net.status"
+}
+/** Rescan Wi-Fi; answered by a `net.scan` event. */
+export interface NetScanCommand {
+  type: "net.scan"
+}
+/** Save the router as `pax-router` and connect. A master pushes the same
+ * credentials to all registered slaves BEFORE switching itself. */
+export interface NetJoinCommand {
+  type: "net.join"
+  ssid: string
+  /** Empty string for an open network. */
+  psk: string
+}
+/** Pin the mode: auto = fallback logic, router = never fall back, ap = force hotspot (master only). */
+export interface NetModeCommand {
+  type: "net.mode"
+  mode: NetPin
+}
+/** Delete the saved router profile. */
+export interface NetForgetCommand {
+  type: "net.forget"
+}
+/** Master only: re-push the saved router credentials to every registered slave. */
+export interface NetProvisionSlavesCommand {
+  type: "net.provision-slaves"
+}
+
+export type NetCommand =
+  | NetStatusCommand
+  | NetScanCommand
+  | NetJoinCommand
+  | NetModeCommand
+  | NetForgetCommand
+  | NetProvisionSlavesCommand
+
+export type NodeCommand = HelloCommand | HomeCommand | GotoCommand | StopCommand | ConfigCommand | NetCommand
+
+export type NetPin = "auto" | "router" | "ap"
+export type NetRole = "master" | "slave"
+/**
+ * router     on the workshop router
+ * ap         (master) serving its standalone hotspot
+ * master-ap  (slave) camped on the master's hotspot
+ * offline    radio up, nothing connected
+ * unknown    paxnet could not answer (nmcli missing, etc.)
+ */
+export type NetMode = "router" | "ap" | "master-ap" | "offline" | "unknown"
 
 // ---------------------------------------------------------------------------
 // Pi -> App (events)
@@ -140,7 +193,87 @@ export interface FaultEvent {
   message: string
 }
 
-export type NodeEvent = HelloEvent | StateEvent | PosEvent | ArrivedEvent | HomedEvent | SensorEvent | FaultEvent
+/** Snapshot of the Pi's network situation; sent on connect and on every change. */
+export interface NetStatusEvent {
+  type: "net.status"
+  role: NetRole
+  /** The operator's pin (what was asked for). */
+  pin?: NetPin
+  /** What is actually happening right now. */
+  mode: NetMode
+  ssid?: string | null
+  /** 0–100, STA modes only. */
+  signal?: number | null
+  ip?: string | null
+  gateway?: string | null
+  hostname?: string
+  /** The hotspot SSID this unit serves (master) or falls back to (slave). */
+  apSsid?: string
+  routerSaved?: boolean
+  /** Present when paxnet could not answer. */
+  error?: string
+  at?: number
+}
+
+export interface WifiNetwork {
+  ssid: string
+  /** 0–100 */
+  signal: number
+  /** e.g. "WPA2", "WPA1 WPA2", "open" */
+  security: string
+  inUse: boolean
+}
+
+export interface NetScanEvent {
+  type: "net.scan"
+  networks: WifiNetwork[]
+}
+
+/**
+ * Outcome of a net.* operation. Some `op`s are advisory pre-announcements the
+ * Pi sends right before it does something that will drop this very
+ * connection: `join-starting` (leaving the hotspot for the router) and
+ * `ap-starting` (leaving the router for the hotspot).
+ */
+export interface NetResultEvent {
+  type: "net.result"
+  op: string
+  ok: boolean
+  error?: string
+  ssid?: string
+  apSsid?: string
+  mode?: NetPin
+  /** provision-slaves */
+  acked?: string[]
+  failed?: string[]
+}
+
+export interface NetSlave {
+  hostname: string
+  mac?: string | null
+  online: boolean
+  mode?: NetMode | null
+  ssid?: string | null
+  ip?: string | null
+}
+
+/** Master only: the slaves that have registered with it. */
+export interface NetSlavesEvent {
+  type: "net.slaves"
+  slaves: NetSlave[]
+}
+
+export type NetEvent = NetStatusEvent | NetScanEvent | NetResultEvent | NetSlavesEvent
+
+export type NodeEvent =
+  | HelloEvent
+  | StateEvent
+  | PosEvent
+  | ArrivedEvent
+  | HomedEvent
+  | SensorEvent
+  | FaultEvent
+  | NetEvent
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -177,6 +310,10 @@ export function parseEvent(data: string): NodeEvent | null {
     case "homed":
     case "sensor":
     case "fault":
+    case "net.status":
+    case "net.scan":
+    case "net.result":
+    case "net.slaves":
       return msg as NodeEvent
     default:
       return null
