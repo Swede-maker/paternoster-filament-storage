@@ -21,8 +21,11 @@
 
 [Unit]
 Description=PAX paternoster GPIO agent
-After=network-online.target
-Wants=network-online.target
+# paxnet drives nmcli from inside the agent, so NetworkManager must be up
+# first. network-online.target is deliberately NOT a hard dependency: the whole
+# point of the fallback watchdog is to start even when there is no network.
+After=NetworkManager.service network.target
+Wants=NetworkManager.service
 
 [Service]
 Type=simple
