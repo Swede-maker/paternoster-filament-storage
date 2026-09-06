@@ -34,6 +34,17 @@ import threading
 import time
 from typing import Callable, Optional
 
+# Wi-Fi / hotspot management (NetworkManager). Optional: the agent must keep
+# driving the motor even if paxnet.py is missing or nmcli is not installed —
+# the `net.*` commands then answer with a clear error instead of crashing.
+try:
+    import paxnet  # noqa: E402
+except Exception as _paxnet_exc:  # pragma: no cover
+    paxnet = None
+    _PAXNET_IMPORT_ERROR = repr(_paxnet_exc)
+else:
+    _PAXNET_IMPORT_ERROR = None
+
 # --------------------------------------------------------------------------
 # Pin configuration (BCM numbering). Adjust to match your wiring.
 # --------------------------------------------------------------------------
@@ -1952,6 +1963,12 @@ async def serve(args) -> None:
 
     carousel = Carousel(hw, shelves, broadcast)
 
+    # ------------------------------------------------------------------
+    # Networking (paxnet): fallback watchdog + net.* command family
+    # ------------------------------------------------------------------
+    net = NetService(args, broadcast, loop)
+    net.start()
+
     async def handler(ws) -> None:
         clients.add(ws)
         try:
@@ -1968,6 +1985,12 @@ async def serve(args) -> None:
             _sensor = carousel.sensor_snapshot()
             if _sensor is not None:
                 await ws.send(json.dumps(_sensor))
+            # Same idea for the network picture: a tab that opens while we are
+            # already sitting in AP mode should see it without waiting for the
+            # watchdog's next flip.
+            _net = net.cached_status()
+            if _net is not None:
+                await ws.send(json.dumps(_net))
             async for raw in ws:
                 try:
                     msg = json.loads(raw)
@@ -1994,7 +2017,14 @@ async def serve(args) -> None:
                         approach_speed=msg.get("approachSpeed"),
                     )
                 elif t == "hello":
-                    await ws.send(json.dumps({"type": "hello", "name": args.name, "shelves": carousel.shelves, "simulated": sim_reason is not None, "simReason": sim_reason}))
+                    await ws.send(json.dumps({"type": "hello", "name": args.name, "shelves": carousel.shelves, "firmware": "pax-agent-1.1", "role": args.role, "simulated": sim_reason is not None, "simReason": sim_reason}))
+                elif t == "net.ack":
+                    # A slave confirming it stored the pushed credentials.
+                    net.note_ack(msg)
+                elif isinstance(t, str) and t.startswith("net."):
+                    # nmcli calls block for seconds; keep the motor loop and
+                    # other sockets responsive by running them off-loop.
+                    asyncio.ensure_future(net.handle(ws, msg))
         except ConnectionClosed:
             # Routine, not an error: the app drops the socket when its last
             # viewer leaves, and a dev-server restart drops it abruptly (which
@@ -2004,14 +2034,356 @@ async def serve(args) -> None:
             pass
         finally:
             clients.discard(ws)
+            net.forget_socket(ws)
 
     print(f"[agent] '{args.name}' listening on ws://0.0.0.0:{args.port}/", flush=True)
     async with websockets.serve(handler, "0.0.0.0", args.port):
         try:
             await asyncio.Future()  # run forever
         finally:
+            net.stop()
             carousel.shutdown()
             hw.cleanup()
+
+
+# ==========================================================================
+# Networking service: wraps paxnet for the agent
+# ==========================================================================
+class NetService:
+    """
+    Glue between the WebSocket protocol and paxnet.
+
+    Master
+      * runs the fallback Watchdog (router → standalone AP after 45 s)
+      * answers net.status / net.scan / net.join / net.mode / net.forget
+      * keeps a registry of slaves that have connected to it and pushes new
+        router credentials to all of them BEFORE switching itself
+        (net.provision-slaves, and implicitly on every net.join)
+
+    Slave
+      * runs the Watchdog too (router → master's hotspot)
+      * answers net.status / net.join (creds pushed by the master)
+      * keeps an OUTBOUND client to ws://<master>:8765 registering itself
+        (`net.register`) so the master knows it exists — this is how a
+        slave that only knows the master's hotspot gets adopted at a new
+        location without anyone typing on it.
+
+    All nmcli work runs in a worker thread via run_in_executor; results are
+    broadcast as `net.result {op, ok, error?}` plus a fresh `net.status`.
+    """
+
+    def __init__(self, args, broadcast: Callable[[dict], None], loop) -> None:
+        self.args = args
+        self.broadcast = broadcast
+        self.loop = loop
+        self.cfg = None
+        self.watchdog = None
+        self._last_status: Optional[dict] = None
+        # hostname -> {"ws": websocket, "mac": str, "hostname": str, "seen": float}
+        self.slaves: dict[str, dict] = {}
+        self._slave_client_task = None
+        self._disabled_reason: Optional[str] = None
+        if paxnet is None:
+            self._disabled_reason = f"paxnet unavailable: {_PAXNET_IMPORT_ERROR}"
+        elif getattr(args, "no_net", False):
+            self._disabled_reason = "started with --no-net"
+
+    # ------------------------------------------------------------ lifecycle
+    def start(self) -> None:
+        if self._disabled_reason:
+            print(f"[agent] networking disabled ({self._disabled_reason})", flush=True)
+            return
+        try:
+            self.cfg = paxnet.Config()
+            self.cfg.role = self.args.role or self.cfg.role
+        except Exception as exc:
+            self._disabled_reason = f"paxnet config: {exc!r}"
+            print(f"[agent] networking disabled ({self._disabled_reason})", flush=True)
+            return
+        self.watchdog = paxnet.Watchdog(self.cfg, on_change=self._on_status_change)
+        self.watchdog.start()
+        if self.cfg.role == "slave":
+            self._slave_client_task = asyncio.ensure_future(self._slave_client())
+        print(f"[agent] networking: role={self.cfg.role} hotspot={self.cfg.ap_ssid}", flush=True)
+
+    def stop(self) -> None:
+        if self.watchdog:
+            self.watchdog.stop()
+        if self._slave_client_task:
+            self._slave_client_task.cancel()
+
+    def cached_status(self) -> Optional[dict]:
+        return self._last_status
+
+    def _on_status_change(self, st: dict) -> None:
+        self._last_status = st
+        self.broadcast(st)
+
+    # ------------------------------------------------------------ helpers
+    async def _run(self, fn, *a):
+        return await self.loop.run_in_executor(None, fn, *a)
+
+    async def _send(self, ws, payload: dict) -> None:
+        try:
+            await ws.send(json.dumps(payload))
+        except Exception:
+            pass
+
+    async def _result(self, ws, op: str, ok: bool, error: Optional[str] = None, **extra) -> None:
+        payload = {"type": "net.result", "op": op, "ok": ok, **extra}
+        if error:
+            payload["error"] = error
+        # Results go to everyone: another tab that is watching the panel
+        # should see the connect finish too.
+        self.broadcast(payload)
+        await self._push_status()
+
+    async def _push_status(self) -> None:
+        try:
+            st = await self._run(paxnet.status, self.cfg)
+        except Exception as exc:
+            st = {"type": "net.status", "role": self.cfg.role if self.cfg else "master", "mode": "unknown",
+                  "error": str(exc), "at": int(time.time() * 1000)}
+        self._last_status = st
+        self.broadcast(st)
+
+    def _slaves_payload(self) -> dict:
+        now = time.time()
+        return {
+            "type": "net.slaves",
+            "slaves": [
+                {
+                    "hostname": s["hostname"],
+                    "mac": s.get("mac"),
+                    "online": (now - s["seen"]) < 90 and s.get("ws") is not None,
+                    "mode": s.get("mode"),
+                    "ssid": s.get("ssid"),
+                    "ip": s.get("ip"),
+                }
+                for s in self.slaves.values()
+            ],
+        }
+
+    # ------------------------------------------------------------ commands
+    async def handle(self, ws, msg: dict) -> None:
+        t = msg.get("type", "")
+        op = t[4:]  # strip "net."
+        if self._disabled_reason:
+            await self._send(ws, {"type": "net.result", "op": op, "ok": False, "error": self._disabled_reason})
+            return
+        cfg = self.cfg
+        try:
+            if op == "status":
+                await self._push_status()
+                if cfg.role == "master":
+                    self.broadcast(self._slaves_payload())
+
+            elif op == "scan":
+                nets = await self._run(paxnet.scan, cfg.iface)
+                await self._send(ws, {"type": "net.scan", "networks": nets})
+
+            elif op == "join":
+                ssid = str(msg.get("ssid", ""))
+                psk = str(msg.get("psk", "") or "")
+                paxnet.validate_creds(ssid, psk)
+                # A master with the pin on "ap" would be yanked straight back to
+                # the hotspot by the watchdog: joining implies auto.
+                if cfg.mode == "ap":
+                    cfg.mode = "auto"
+                    await self._run(cfg.save)
+                if cfg.role == "master":
+                    # Slaves first. Once *we* leave the hotspot they can no
+                    # longer hear us, so the order is not negotiable.
+                    pushed = await self._provision_slaves(ssid, psk)
+                    self.broadcast({"type": "net.result", "op": "provision-slaves", "ok": True, **pushed})
+                    # Anyone on the hotspot right now is about to lose us.
+                    self.broadcast({"type": "net.result", "op": "join-starting", "ok": True, "ssid": ssid})
+                    await asyncio.sleep(0.5)  # let the frames flush
+                elif msg.get("fromMaster"):
+                    # Master pushed creds. Also refresh our copy of its hotspot
+                    # so a master reinstall with a new psk does not orphan us.
+                    ap_ssid, ap_psk = msg.get("apSsid"), msg.get("apPsk")
+                    if ap_ssid and ap_psk:
+                        cfg.ap_ssid, cfg.ap_psk = str(ap_ssid), str(ap_psk)
+                        await self._run(cfg.save)
+                        await self._run(paxnet.ensure_master_ap_profile, cfg)
+                    # Only SAVE; the master switches first, we follow when its
+                    # hotspot vanishes (NM autoconnect picks pax-router by
+                    # priority). Switching now would drop the very socket the
+                    # master is waiting on for our ack.
+                    await self._run(paxnet.save_router_profile, ssid, psk, cfg.iface)
+                    await self._send(ws, {"type": "net.ack", "op": "join", "ok": True, "hostname": paxnet.hostname()})
+                    if self.watchdog:
+                        self.watchdog.kick()
+                    return
+                await self._run(paxnet.join, ssid, psk, cfg.iface)
+                if self.watchdog:
+                    self.watchdog.in_fallback = False
+                    self.watchdog.kick()
+                await self._result(ws, "join", True, ssid=ssid)
+
+            elif op == "mode":
+                mode = str(msg.get("mode", "auto"))
+                if mode not in paxnet.VALID_MODES:
+                    raise paxnet.NetError(f"mode must be one of {paxnet.VALID_MODES}")
+                if cfg.role != "master" and mode == "ap":
+                    raise paxnet.NetError("only the master can run a hotspot")
+                cfg.mode = mode
+                await self._run(cfg.save)
+                if mode == "ap":
+                    self.broadcast({"type": "net.result", "op": "ap-starting", "ok": True, "apSsid": cfg.ap_ssid})
+                    await asyncio.sleep(0.5)
+                    await self._run(paxnet.ap_up, cfg)
+                elif mode == "router":
+                    if cfg.role == "master":
+                        await self._run(paxnet.ap_down, cfg)
+                    await self._run(paxnet.router_up, cfg.iface)
+                if self.watchdog:
+                    self.watchdog.kick()
+                await self._result(ws, "mode", True, mode=mode)
+
+            elif op == "forget":
+                await self._run(paxnet.forget_router)
+                if self.watchdog:
+                    self.watchdog.kick()
+                await self._result(ws, "forget", True)
+
+            elif op == "provision-slaves":
+                if cfg.role != "master":
+                    raise paxnet.NetError("only the master provisions slaves")
+                ssid = await self._run(paxnet.saved_router_ssid)
+                psk = await self._run(paxnet.saved_router_psk)
+                if not ssid:
+                    raise paxnet.NetError("no router saved on the master yet")
+                pushed = await self._provision_slaves(ssid, psk or "")
+                await self._result(ws, "provision-slaves", True, **pushed)
+                self.broadcast(self._slaves_payload())
+
+            elif op == "register":
+                # A slave introducing itself over its outbound client socket.
+                host = str(msg.get("hostname") or "slave")
+                self.slaves[host] = {
+                    "ws": ws, "hostname": host, "mac": msg.get("mac"), "seen": time.time(),
+                    "mode": msg.get("mode"), "ssid": msg.get("ssid"), "ip": msg.get("ip"),
+                }
+                await self._send(ws, {"type": "net.registered", "master": paxnet.hostname(),
+                                      "apSsid": cfg.ap_ssid, "apPsk": cfg.ap_psk})
+                self.broadcast(self._slaves_payload())
+
+            elif op == "slaves":
+                self.broadcast(self._slaves_payload())
+
+            else:
+                await self._send(ws, {"type": "net.result", "op": op, "ok": False, "error": f"unknown net op '{op}'"})
+        except Exception as exc:
+            err = str(exc) if isinstance(exc, paxnet.NetError) else repr(exc)
+            print(f"[agent] net.{op} failed: {err}", flush=True)
+            await self._result(ws, op, False, err)
+
+    # ------------------------------------------------------------ master → slaves
+    async def _provision_slaves(self, ssid: str, psk: str) -> dict:
+        """Push router creds (+ our hotspot creds) to every registered slave and
+        wait up to 5 s for each ack. Returns counts for the UI."""
+        cfg = self.cfg
+        payload = json.dumps({
+            "type": "net.join", "fromMaster": True, "ssid": ssid, "psk": psk,
+            "apSsid": cfg.ap_ssid, "apPsk": cfg.ap_psk,
+        })
+        acked, failed = [], []
+
+        async def one(host: str, entry: dict) -> None:
+            ws = entry.get("ws")
+            if ws is None:
+                failed.append(host)
+                return
+            try:
+                await ws.send(payload)
+                # Wait for the ack on the same socket; the recv loop for slave
+                # sockets lives in handler(), so listen via a future the loop
+                # resolves in _note_ack.
+                fut = self.loop.create_future()
+                entry["ack"] = fut
+                await asyncio.wait_for(fut, timeout=5)
+                acked.append(host)
+            except Exception:
+                failed.append(host)
+            finally:
+                entry.pop("ack", None)
+
+        await asyncio.gather(*(one(h, e) for h, e in list(self.slaves.items())))
+        print(f"[agent] provisioned slaves: ok={acked} failed={failed}", flush=True)
+        return {"acked": acked, "failed": failed}
+
+    def forget_socket(self, ws) -> None:
+        """A registered slave's socket closed: mark it offline (keep the row so
+        the UI still lists it — it will re-register on reconnect)."""
+        changed = False
+        for entry in self.slaves.values():
+            if entry.get("ws") is ws:
+                entry["ws"] = None
+                changed = True
+        if changed:
+            self.broadcast(self._slaves_payload())
+
+    def note_ack(self, msg: dict) -> None:
+        host = msg.get("hostname")
+        entry = self.slaves.get(host) if host else None
+        if entry and (fut := entry.get("ack")) and not fut.done():
+            fut.set_result(True)
+        if entry:
+            entry["seen"] = time.time()
+
+    # ------------------------------------------------------------ slave → master
+    async def _slave_client(self) -> None:
+        """Keep an outbound socket to the master open and re-register on every
+        (re)connect. Hostname resolution goes through mDNS, so this works on
+        the router *and* on the master's hotspot without config changes."""
+        import websockets
+        cfg = self.cfg
+        url = f"ws://{cfg.master_host}:{self.args.port}/"
+        backoff = 3
+        while True:
+            try:
+                async with websockets.connect(url, open_timeout=10, ping_interval=20) as ws:
+                    backoff = 3
+                    st = await self._run(paxnet.status, cfg)
+                    await ws.send(json.dumps({
+                        "type": "net.register", "hostname": paxnet.hostname(),
+                        "mac": _wifi_mac(cfg.iface), "mode": st.get("mode"),
+                        "ssid": st.get("ssid"), "ip": st.get("ip"),
+                    }))
+                    print(f"[agent] registered with master at {url}", flush=True)
+                    async for raw in ws:
+                        try:
+                            msg = json.loads(raw)
+                        except Exception:
+                            continue
+                        t = msg.get("type", "")
+                        if t == "net.registered":
+                            # Adopt the master's hotspot creds if we lack them.
+                            ap_ssid, ap_psk = msg.get("apSsid"), msg.get("apPsk")
+                            if ap_ssid and ap_psk and (cfg.ap_ssid != ap_ssid or cfg.ap_psk != ap_psk):
+                                cfg.ap_ssid, cfg.ap_psk = ap_ssid, ap_psk
+                                await self._run(cfg.save)
+                                try:
+                                    await self._run(paxnet.ensure_master_ap_profile, cfg)
+                                except Exception as exc:
+                                    print(f"[agent] master-ap profile: {exc}", flush=True)
+                        elif isinstance(t, str) and t.startswith("net."):
+                            await self.handle(ws, msg)
+            except asyncio.CancelledError:
+                return
+            except Exception as exc:
+                print(f"[agent] master link down ({exc.__class__.__name__}); retry in {backoff}s", flush=True)
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 60)
+
+
+def _wifi_mac(iface: str) -> Optional[str]:
+    try:
+        return open(f"/sys/class/net/{iface}/address").read().strip()
+    except Exception:
+        return None
 
 
 def main() -> None:
@@ -2019,6 +2391,13 @@ def main() -> None:
     p.add_argument("--name", default="Paternoster", help="Human-readable unit name")
     p.add_argument("--port", type=int, default=8765, help="WebSocket port (match the app)")
     p.add_argument("--shelves", type=int, default=9, help="Number of shelves on this carousel")
+    p.add_argument(
+        "--role",
+        choices=("master", "slave"),
+        default=None,
+        help="master: runs the fallback hotspot and provisions slaves; slave: follows the master (default: from /etc/paxnet.conf)",
+    )
+    p.add_argument("--no-net", action="store_true", help="Disable Wi-Fi/hotspot management entirely")
     p.add_argument("--simulate", action="store_true", help="Run without real GPIO (fake motion)")
     p.add_argument(
         "--strict-gpio",

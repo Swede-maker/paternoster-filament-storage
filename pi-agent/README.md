@@ -112,50 +112,10 @@ the app's up/down labels, flip `HOMING_DIRECTION`.
 ```bash
 # 1. Copy this folder to the Pi (anywhere in your home dir), then:
 cd ~/pi-agent
-sudo apt update && sudo apt install -y python3-pip python3-full
 pip3 install -r requirements.txt
-```
 
-```bash
 # 2. Run it (must match the shelves count you set for this unit in the app):
 python3 paternoster_agent.py --name "Paternoster 1" --shelves 9 --port 8765
-```
-
-# IF you wanna install it on your Paternoster with the server on paste this and skip the "Start automaticlly on boot":
-```bash
-cd ~/pax/pi-agent
-sudo apt update && sudo apt install -y python3-pip python3-full
-pip3 install -r requirements.txt --break-system-packages
-```
-
-```bash
-# 2. Run it (must match the shelves count you set for this unit in the app):
-python3 paternoster_agent.py --name "Paternoster 1" --shelves 9 --port 8765
-```
-
-```bash
-# 3. Clean off if you have dubble server running in PM2:
-pm2 delete pax
-pm2 start npm --name "pax" -- start
-pm2 save
-```
-
-```bash
-# 4. Restart the server:
-pm2 restart pax
-```
-
-```bash
-#  If it show "Offline" in the browser under settings try this:
-cd ~/pax/pi-agent
-python3 paternoster_agent.py --name "Paternoster 1" --shelves 9 --port 8765
-```
-
-```bash
-# 5. start the server so it wont die after you close the terminal:
-cd ~/pax/pi-agent
-pm2 start "python3 paternoster_agent.py --name 'Paternoster 1' --shelves 9 --port 8765" --name "paternoster-agent"
-pm2 save
 ```
 
 ### Start automatically on boot
@@ -649,6 +609,115 @@ sudo systemctl status paternoster-agent
 sudo ss -ltnp | grep 8765     # want 0.0.0.0:8765, not 127.0.0.1:8765
 ```
 
+## Networking: router mode, hotspot fallback, slave provisioning
+
+`paxnet.py` runs inside the agent and manages the Pi's Wi-Fi through
+NetworkManager (`nmcli`). It needs **Raspberry Pi OS Bookworm or newer**; on a
+dhcpcd-based image `install.sh` stops with a clear error, or run it with
+`--no-net` for a wired bench setup.
+
+### Roles
+
+| | Master (Pi 4/5, runs the web app) | Slave (Pi Zero 2 W) |
+| --- | --- | --- |
+| Install | `sudo ./install.sh --role master --hostname pax-master` | `sudo ./install.sh --role slave --hostname pax-slave-1 --master pax-master.local --ap-ssid PAX-Setup-XXXX --ap-psk <pw>` |
+| Router profile | `pax-router` (autoconnect, priority 100) | same |
+| Fallback | Brings up its own hotspot `pax-ap` (SSID `PAX-Setup-XXXX`, gateway `10.42.0.1`) | Joins the master's hotspot via `pax-master-ap` (autoconnect, priority 10) |
+| Reachable as | `http://pax-master.local` (or `http://10.42.0.1` on the hotspot) | `ws://pax-slave-1.local:8765` |
+| Extra | Keeps a registry of slaves and pushes router credentials to them | Keeps an outbound socket to the master and registers itself |
+
+The installer sets the hostname, enables Avahi (mDNS) so `pax-*.local` resolves
+on any network, generates the hotspot password once (reinstalling never rotates
+it), writes `/etc/paxnet.conf`, and drops a sudoers rule so the agent may run
+`nmcli` without becoming root. Address nodes in the app by hostname, not IP, and
+a move to a network with different addresses needs no edits.
+
+### The fallback timeline (`mode = auto`)
+
+```
+boot ─▶ NM autoconnects pax-router ─▶ gateway reachable?  yes ─▶ stay, re-check every 5 s
+                                                          │
+                                        45 s with no gateway
+                                                          ▼
+                        master: nmcli con up pax-ap      slave: NM autoconnects pax-master-ap
+                        broadcast net.status {mode:"ap"}
+                                                          │
+                                  every 60 s: try pax-router again
+                                                          │
+                                      router back? ─▶ drop hotspot, resume
+```
+
+The same loop runs if the router disappears mid-session (loss timeout 45 s).
+The mode pin in Settings → Network changes the rules:
+
+| Pin | Behaviour |
+| --- | --- |
+| **Auto** | The timeline above. Default. |
+| **Local router** | Never falls back. Hotspot stays down even with no router. Use when a nearby PAX hotspot would confuse people. |
+| **Standalone AP** | Master only. Hotspot always on, router never tried. Use at a show or a shop with no Wi-Fi. |
+
+### Moving the system to a new workshop
+
+Nothing needs a keyboard or a re-flash. Power everything on and:
+
+1. **Master boots**, cannot find the old router, after 45 s starts
+   `PAX-Setup-XXXX`.
+2. **Slaves boot**, cannot find the old router, NetworkManager joins
+   `PAX-Setup-XXXX` on its own. Each slave's agent connects to
+   `ws://pax-master.local:8765` and registers (`net.register`). The master now
+   lists them under *Slave units following this master*.
+3. On a phone, join `PAX-Setup-XXXX` with the password from the install
+   printout (or scan the QR in Settings → Network → Standalone hotspot), and
+   open `http://10.42.0.1`.
+4. **Settings → Network → Scan for Wi-Fi networks**, pick the new router, type
+   its password, **Save & connect**.
+5. The master first pushes the SSID/password to every registered slave
+   (`net.join {fromMaster:true}`) and waits for their acks (5 s each). They
+   only *store* the profile; they do not switch yet because the socket they
+   are being asked on would die.
+6. The master drops the hotspot and joins the router. The hotspot vanishing
+   makes each slave's NetworkManager fall through to `pax-router`, which is
+   now saved with the new credentials, so they follow within seconds.
+7. Reconnect the phone to the workshop Wi-Fi and open
+   `http://pax-master.local`. Every node is back online at its `.local` name.
+
+If a slave was powered off during step 5, plug it in later: it lands on the
+master's hotspot only if the master is still serving one, so instead the
+master reappears in *Slave units* as offline. Press **Re-push credentials**
+once it registers (it will, over whatever link it has), or simply leave it:
+the next time the master falls back to AP mode both sides meet there again.
+
+### Slave first contact without hotspot credentials
+
+`--ap-ssid/--ap-psk` are optional on the slave installer **if the slave is on
+the same router as the master at install time**. On its first registration
+the master replies `net.registered {apSsid, apPsk}`; the slave stores them in
+`/etc/paxnet.conf` and creates `pax-master-ap`. From then on it has the
+fallback network. Check with:
+
+```bash
+sudo python3 /path/to/pi-agent/paxnet.py status
+nmcli -f NAME,AUTOCONNECT,AUTOCONNECT-PRIORITY con show | grep pax-
+```
+
+### Debugging paxnet
+
+```bash
+python3 paxnet.py status          # what the agent would broadcast as net.status
+python3 paxnet.py scan            # what the app's scanner shows
+journalctl -u paternoster-agent -f | grep -e paxnet -e '\[agent\] net'
+sudo cat /etc/paxnet.conf         # role / pin / hotspot creds / master host
+```
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| Panel says *nmcli not found* / mode `unknown` | Not NetworkManager | Bookworm image, or `raspi-config → Advanced → Network Config → NetworkManager` |
+| `net.join` fails with *sudo: a password is required* | Sudoers rule missing | Re-run `install.sh` (writes `/etc/sudoers.d/paxnet`) |
+| Master boots straight into hotspot every time | `pax-ap` has autoconnect on, or pin is `ap` | `nmcli con modify pax-ap connection.autoconnect no`; set pin to Auto |
+| Slave never appears in the slaves table | Cannot resolve `pax-master.local` | Both need `avahi-daemon` running; try `ping pax-master.local` from the slave |
+| Slave ignored pushed creds | Slave was on the master's hotspot but the ack timed out | Panel shows it under *failed*; press **Re-push credentials** |
+| Phone joins the hotspot but the app will not load | App not running on the master | The web app must be hosted on the master Pi for AP mode to be useful |
+
 ## Wire protocol
 
 The agent and app exchange newline-free JSON messages. This mirrors
@@ -663,6 +732,21 @@ The agent and app exchange newline-free JSON messages. This mirrors
 | `{"type":"home"}`                    | Start homing                     |
 | `{"type":"goto","shelf":N}`          | Rotate to shelf N (0-based)      |
 | `{"type":"stop"}`                    | Emergency stop                   |
+| `{"type":"net.status"}`              | Ask for a fresh `net.status` (+ `net.slaves` on a master) |
+| `{"type":"net.scan"}`                | Rescan Wi-Fi → `net.scan`        |
+| `{"type":"net.join","ssid":S,"psk":P}` | Save router + connect. Master pushes to slaves first. `psk:""` for an open network |
+| `{"type":"net.mode","mode":"auto"\|"router"\|"ap"}` | Pin the mode (`ap` master only) |
+| `{"type":"net.forget"}`              | Delete the saved router profile  |
+| `{"type":"net.provision-slaves"}`    | Master: re-push saved router creds to all registered slaves |
+
+**Pi ↔ Pi (slave's outbound socket to the master)**
+
+| Message | Meaning |
+| --- | --- |
+| slave → master `{"type":"net.register","hostname":H,"mac":M,"mode":...,"ssid":...,"ip":...}` | Slave introduces itself on (re)connect |
+| master → slave `{"type":"net.registered","master":H,"apSsid":S,"apPsk":P}` | Ack; slave stores the hotspot creds |
+| master → slave `{"type":"net.join","fromMaster":true,"ssid":S,"psk":P,"apSsid":..,"apPsk":..}` | Store these router creds (do not switch yet) |
+| slave → master `{"type":"net.ack","op":"join","ok":true,"hostname":H}` | Stored |
 
 **Pi → App**
 
@@ -674,6 +758,10 @@ The agent and app exchange newline-free JSON messages. This mirrors
 | `{"type":"arrived","shelf":N}`                      | Stopped at shelf N              |
 | `{"type":"homed","shelf":0}`                        | Homing finished                 |
 | `{"type":"fault","message":...}`                    | Jam / timeout / sensor error    |
+| `{"type":"net.status","role":..,"pin":..,"mode":"router"\|"ap"\|"master-ap"\|"offline"\|"unknown","ssid":..,"signal":..,"ip":..,"gateway":..,"hostname":..,"apSsid":..,"routerSaved":b}` | Network picture; sent on connect and on every change |
+| `{"type":"net.scan","networks":[{"ssid","signal","security","inUse"}]}` | Scan result |
+| `{"type":"net.result","op":..,"ok":b,"error"?:..}`  | Outcome of a `net.*` op. `op:"join-starting"` / `"ap-starting"` are sent right before the Pi switches networks and drops this socket |
+| `{"type":"net.slaves","slaves":[{"hostname","mac","online","mode","ssid","ip"}]}` | Master only: registered slaves |
 
 Shelf indexes are **0-based** on the wire (shelf 0 = the index-sensor position),
 matching the app's internal representation.
