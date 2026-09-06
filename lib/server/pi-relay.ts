@@ -96,6 +96,13 @@ interface Relay {
    * this on every open keeps the hardware matching the UI.
    */
   motion: { moveSpeed?: number; homingSpeed?: number; rampPct?: number; approachSpeed?: number }
+  /**
+   * Last `net.status` / `net.slaves` frames, replayed to new subscribers for
+   * the same reason as `lastState`: the agent only volunteers them on connect
+   * and on change, and the relay socket outlives a browser refresh.
+   */
+  lastNetStatus: string | null
+  lastNetSlaves: string | null
   closing: boolean
 }
 
@@ -248,6 +255,77 @@ function rememberState(relay: Relay, text: string): void {
   relay.lastState = JSON.stringify(snap)
 }
 
+function rememberNet(relay: Relay, text: string): void {
+  // Cheap pre-check before parsing every motor frame.
+  if (!text.includes('"net.')) return
+  let ev: { type?: string }
+  try {
+    ev = JSON.parse(text)
+  } catch {
+    return
+  }
+  if (ev?.type === "net.status") relay.lastNetStatus = text
+  else if (ev?.type === "net.slaves") relay.lastNetSlaves = text
+}
+
+/**
+ * One-shot request/response over the relay: send `cmd`, resolve with the first
+ * event whose `type` is in `expect` (or reject on timeout / not connected).
+ *
+ * Used by the /api/net routes, where the browser wants an answer in the HTTP
+ * response (a scan list, a status) rather than watching the SSE stream for it.
+ * Events are still broadcast to every subscriber as usual — this just also
+ * hands the first matching one back to the caller.
+ */
+export function sendAndAwait<T = unknown>(
+  ip: string,
+  port: number,
+  cmd: NodeCommand,
+  expect: readonly string[],
+  timeoutMs: number,
+): Promise<T> {
+  const relay = registry.get(keyFor(ip, port))
+  if (!relay || !relay.ws || relay.ws.readyState !== WebSocket.OPEN) {
+    return Promise.reject(new Error("Pi not connected"))
+  }
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      relay.listeners.delete(listener)
+      reject(new Error(`Timed out waiting for ${expect.join("/")}`))
+    }, timeoutMs)
+    const listener: Listener = (frame) => {
+      if (frame.kind !== "event") return
+      let ev: { type?: string; op?: string }
+      try {
+        ev = JSON.parse(frame.data)
+      } catch {
+        return
+      }
+      if (!ev?.type || !expect.includes(ev.type)) return
+      // A `net.result` for a *different* op (e.g. the watchdog announcing a
+      // mode flip) must not satisfy this request.
+      if (ev.type === "net.result" && cmd.type.startsWith("net.") && ev.op && ev.op !== cmd.type.slice(4)) return
+      clearTimeout(timer)
+      relay.listeners.delete(listener)
+      resolve(ev as T)
+    }
+    relay.listeners.add(listener)
+    try {
+      relay.ws!.send(encodeCommand(cmd))
+    } catch (err) {
+      clearTimeout(timer)
+      relay.listeners.delete(listener)
+      reject(err instanceof Error ? err : new Error("send failed"))
+    }
+  })
+}
+
+/** Last cached network frames for a relay, if any (no round-trip). */
+export function cachedNet(ip: string, port: number): { status: string | null; slaves: string | null } {
+  const relay = registry.get(keyFor(ip, port))
+  return { status: relay?.lastNetStatus ?? null, slaves: relay?.lastNetSlaves ?? null }
+}
+
 function startHeartbeat(relay: Relay) {
   stopHeartbeat(relay)
   relay.heartbeat = setInterval(() => {
@@ -322,6 +400,7 @@ function openSocket(relay: Relay) {
     relay.pingSentAt = null
     const text = data.toString()
     rememberState(relay, text)
+    rememberNet(relay, text)
     broadcast(relay, { kind: "event", data: text })
   })
 
@@ -329,6 +408,9 @@ function openSocket(relay: Relay) {
     stopHeartbeat(relay)
     relay.ws = null
     relay.lastState = null
+    // Deliberately keep lastNetStatus: when the Pi drops the socket because it
+    // is switching networks, the last picture ("joining X") is the most useful
+    // thing a browser can be shown while we reconnect.
     setLink(relay, "offline")
     if (!relay.closing) scheduleReconnect(relay)
   })
@@ -376,6 +458,8 @@ function getOrCreate(ip: string, port: number, shelves: number): Relay {
       lastError: null,
       lastBroadcastReason: undefined,
       motion: {},
+      lastNetStatus: null,
+      lastNetSlaves: null,
       closing: false,
     }
     registry.set(key, relay)
@@ -410,6 +494,8 @@ export function subscribe(ip: string, port: number, shelves: number, listener: L
     ...(relay.link === "offline" && relay.lastError ? { reason: relay.lastError } : {}),
   })
   if (relay.lastState) listener({ kind: "event", data: relay.lastState })
+  if (relay.lastNetStatus) listener({ kind: "event", data: relay.lastNetStatus })
+  if (relay.lastNetSlaves) listener({ kind: "event", data: relay.lastNetSlaves })
 
   return () => {
     relay.listeners.delete(listener)
