@@ -182,9 +182,21 @@ export function NodeConnection() {
               conn.gotoTarget = null
               conn.homeSent = false
             }
-            dispatch({ type: "NODE_FAULT", nodeId, message: ev.message })
-            break
-        }
+              dispatch({ type: "NODE_FAULT", nodeId, message: ev.message })
+              break
+            case "net.status":
+              dispatch({ type: "NODE_NET_STATUS", nodeId, status: ev })
+              break
+            case "net.slaves":
+              dispatch({ type: "NODE_NET_SLAVES", nodeId, slaves: ev.slaves })
+              break
+            case "net.result":
+              dispatch({ type: "NODE_NET_RESULT", nodeId, result: ev })
+              break
+            case "net.scan":
+              // Answered synchronously through POST /api/net/scan; nothing to store.
+              break
+          }
       })
 
       // SSE dropped (network blip). EventSource auto-reconnects; show "checking"

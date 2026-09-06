@@ -23,12 +23,14 @@ import {
   Loader2,
   Check,
   RotateCcw,
+  Wifi,
 } from "lucide-react"
 import { Dialog } from "../ui/dialog"
 import { useStore } from "@/lib/store"
 import { useTheme } from "@/lib/use-theme"
 import { cn } from "@/lib/utils"
-import { nodeSlotCount, nodesForSystem, getHardwareStats } from "@/lib/selectors"
+import { nodeSlotCount, nodesForSystem, getHardwareStats, masterNode } from "@/lib/selectors"
+import { NetworkPanel } from "../network/network-panel"
 import { newId } from "@/lib/filament"
 import { HARDWARE_COLORS } from "@/lib/hardware"
 import type { StorageNode } from "@/lib/types"
@@ -53,6 +55,8 @@ export function HardwareSettingsView() {
   const { state, dispatch } = useStore()
   const stats = getHardwareStats(state)
   const hwNodes = nodesForSystem(state, "hardware")
+  const master = masterNode(state)
+  const hardwareMaster = master?.driver === "hardware" ? master : null
 
   return (
     <div className="mx-auto w-full max-w-2xl space-y-4 overflow-y-auto p-4 scrollbar-thin">
@@ -90,6 +94,17 @@ export function HardwareSettingsView() {
           <Stat label="Used" value={stats.usedSlots} />
         </dl>
       </Section>
+
+      {/* Network — the master Pi's Wi-Fi, hotspot fallback and slave provisioning */}
+      {hardwareMaster && (
+        <Section icon={<Wifi className="h-5 w-5 text-primary" />} title="Network">
+          <p className="text-sm text-muted-foreground text-pretty">
+            Wi-Fi for the master Raspberry Pi and every slave that follows it. Pick the workshop router here; if the
+            router ever disappears, the master opens its own hotspot so you can still reach this app from a phone.
+          </p>
+          <NetworkPanel node={hardwareMaster} />
+        </Section>
+      )}
 
       {/* Categories */}
       <Section icon={<Tags className="h-5 w-5 text-primary" />} title="Categories">
