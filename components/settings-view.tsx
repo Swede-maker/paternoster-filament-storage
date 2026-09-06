@@ -27,11 +27,13 @@ import {
   Printer as PrinterIcon,
   Link2Off,
   Package as PackageIcon,
+  Wifi,
 } from "lucide-react"
 import { useStore } from "@/lib/store"
 import { useTheme } from "@/lib/use-theme"
 import { cn } from "@/lib/utils"
-import { getStats, nodeSlotCount, nodesForSystem, shelfLabel } from "@/lib/selectors"
+import { getStats, masterNode, nodeSlotCount, nodesForSystem, shelfLabel } from "@/lib/selectors"
+import { NetworkPanel } from "./network/network-panel"
 import { newId, formatGrams } from "@/lib/filament"
 import { newQrTagId, qrPayload, allBindings, describeTarget } from "@/lib/tags"
 import { QrPrintButton } from "./qr-print-button"
@@ -61,6 +63,9 @@ export function SettingsView() {
 
   const nameDirty = name !== state.settings.systemName
   const weightDirty = weight != null && weight !== state.settings.defaultSpoolWeight
+
+  const master = masterNode(state)
+  const hardwareMaster = master?.driver === "hardware" ? master : null
 
   return (
     <div className="mx-auto w-full max-w-2xl space-y-4 overflow-y-auto p-4 scrollbar-thin">
@@ -196,6 +201,17 @@ export function SettingsView() {
           <Stat label="Printers" value={state.printers.length} />
         </dl>
       </Section>
+
+      {/* Network — only meaningful once a real master Pi exists */}
+      {hardwareMaster && (
+        <Section icon={<Wifi className="h-5 w-5 text-primary" />} title="Network">
+          <p className="text-sm text-muted-foreground text-pretty">
+            Wi-Fi for the master Raspberry Pi and every slave that follows it. Pick the workshop router here; if the
+            router ever disappears, the master opens its own hotspot so you can still reach this app from a phone.
+          </p>
+          <NetworkPanel node={hardwareMaster} />
+        </Section>
+      )}
 
       {/* RFID / QR tags */}
       <Section icon={<Nfc className="h-5 w-5 text-primary" />} title="RFID / QR tags">
