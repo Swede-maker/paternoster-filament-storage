@@ -14,6 +14,29 @@ when no phone or computer has the app open. See [Background filament tracking](#
 
 ---
 
+## 0. Raspberry Pi: one-command install
+
+On a fresh Raspberry Pi OS (Bookworm or newer, Wi-Fi already set up by the imager), run:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Swede-maker/paternoster-filament-storage/main/setup.sh | sudo bash
+```
+
+It asks **what this Pi is** — `1` master (web app + carousel + hotspot fallback) or
+`2` slave (carousel only) — and **how many shelves** the carousel has, then installs
+everything: Node, the app as a service on port 80, the carousel agent, `.local`
+hostnames, the fallback hotspot and slave provisioning. A slave is additionally asked
+for its number and, optionally, the master's hotspot password.
+
+When it finishes the master prints its address (`http://pax-master.local`) and the
+hotspot password — write that down. Run the same command on each slave and answer `2`.
+Re-run it any time to update; your data and hotspot password are kept.
+
+Everything below is the manual route for a PC or home server, or if you want to
+see what the script does.
+
+---
+
 ## 1. Requirements
 
 Install these once on the machine that will run the app (a PC, a home server, or a
@@ -22,12 +45,9 @@ Raspberry Pi 4/5):
 - **Node.js 20 or newer** — https://nodejs.org (LTS is fine)
 - **pnpm** — the package manager. After installing Node, run:
   ```bash
-  sudo npm install -g pnpm
+  npm install -g pnpm
   ```
 - **git** — https://git-scm.com
-  ```bash
-  sudo apt-get update && sudo apt-get install -y git
-  ```
 - A **C/C++ build toolchain** (needed to compile the SQLite module):
   - **Raspberry Pi / Debian / Ubuntu:** `sudo apt-get install -y build-essential python3`
   - **macOS:** `xcode-select --install`
@@ -37,9 +57,11 @@ Raspberry Pi 4/5):
 
 ## 2. Download and install
 
+Replace `YOUR-USERNAME/YOUR-REPO` with your GitHub repository.
+
 ```bash
 # 1. Download the code
-git clone https://github.com/Swede-maker/paternoster-filament-storage.git pax
+git clone https://github.com/YOUR-USERNAME/YOUR-REPO.git pax
 cd pax
 
 # 2. Install dependencies (also compiles the SQLite module automatically)
