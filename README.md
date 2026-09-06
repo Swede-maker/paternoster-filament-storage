@@ -22,6 +22,10 @@ On a fresh Raspberry Pi OS (Bookworm or newer, Wi-Fi already set up by the image
 curl -fsSL https://raw.githubusercontent.com/Swede-maker/paternoster-filament-storage/main/setup.sh | sudo bash
 ```
 
+```bash
+# when the terminal ask for the repo
+https://github.com/Swede-maker/paternoster-filament-storage.git
+```
 It asks **what this Pi is** — `1` master (web app + carousel + hotspot fallback) or
 `2` slave (carousel only) — and **how many shelves** the carousel has, then installs
 everything: Node, the app as a service on port 80, the carousel agent, `.local`
