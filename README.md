@@ -57,11 +57,9 @@ Raspberry Pi 4/5):
 
 ## 2. Download and install
 
-Replace `YOUR-USERNAME/YOUR-REPO` with your GitHub repository.
-
 ```bash
 # 1. Download the code
-git clone https://github.com/YOUR-USERNAME/YOUR-REPO.git pax
+git clone https://github.com/Swede-maker/paternoster-filament-storage.git pax
 cd pax
 
 # 2. Install dependencies (also compiles the SQLite module automatically)
