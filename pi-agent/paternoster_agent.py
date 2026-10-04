@@ -264,6 +264,32 @@ SENSOR_POLL_SECONDS = 0.05
 # comes from counted pulses rather than from elapsed time.
 SHELF_SETTLE_AT_MOVE_SPEED = 0.20
 SHELF_SETTLE_MAX = 1.5
+# ---------------------------------------------------------------------------
+# Distance-based shelf-edge filter (Carousel._do_goto).
+#
+# The time lockout above only knows "how long ago"; it cannot tell a slow swing
+# from a slow shelf. A DISTANCE test can. On the servo build the pulse odometer
+# says exactly how far the chain has moved since the last counted edge, so an
+# edge that arrives inside BOUNCE_PITCH_FRACTION of a shelf pitch is the same
+# shelf rocking back into the window, never the next one — regardless of ramp or
+# speed. The DC build has no odometer, so it falls back to the same test in TIME,
+# against the pitch interval just measured in this move (BOUNCE_TIME_FRACTION,
+# deliberately looser because the first interval of a move includes the ramp).
+BOUNCE_PITCH_FRACTION = 0.5
+BOUNCE_TIME_FRACTION = 0.35
+# The FIRST edge of a move. A stop that lands exactly as the flag reaches the
+# sensor can leave the shelf a hair short of the window, or rocking back out of
+# it; the next move then drags that same flag in and the carousel believes it
+# gained a shelf it never travelled. Any edge within this fraction of a pitch of
+# the starting point is that parked shelf, not a new one.
+START_REENTRY_PITCH_FRACTION = 0.3
+# Pulse positioning (servo): deceleration leg before the target as a fraction of
+# a shelf pitch, and how often the duty is re-issued along it.
+PULSE_DECEL_PITCH_FRACTION = 0.5
+PULSE_DUTY_UPDATE_S = 0.02
+# The calibration revolution may take a while on a slow chain: allowance for the
+# full turn, as a multiple of HOME_TIMEOUT (already drive-scaled).
+CALIBRATE_TIMEOUT_SCALE = 3.0
 
 
 def shelf_settle_for(duty: float) -> float:
@@ -948,6 +974,41 @@ class ServoHardware(RealHardware):
         self._motor_lock = threading.Lock()
         self._pulsing = False
         self._forward: Optional[bool] = None
+        # Pulse ODOMETER. The pulse train is a PWM carrier at a set frequency,
+        # so nothing counts the individual pulses; instead every segment of
+        # constant frequency is integrated (hz × seconds, signed by direction)
+        # the moment it ends. The drive steps once per pulse, so this IS the
+        # commanded position, good to well under a percent — and the index flag
+        # re-syncs the remainder on every pass (see Carousel._do_goto_pulses).
+        self._odo_lock = threading.Lock()
+        self._odo_pulses = 0.0
+        self._odo_hz = 0
+        self._odo_sign = 0
+        self._odo_t0 = time.monotonic()
+
+    def _odo_close_segment(self) -> None:
+        """Bank the segment that is ending. Caller holds `_odo_lock`."""
+        now = time.monotonic()
+        if self._odo_hz > 0 and self._odo_sign != 0:
+            self._odo_pulses += self._odo_sign * self._odo_hz * (now - self._odo_t0)
+        self._odo_t0 = now
+
+    def _odo_segment(self, hz: int, sign: int) -> None:
+        """Start a new constant-frequency segment (hz=0 or sign=0 = stopped)."""
+        with self._odo_lock:
+            self._odo_close_segment()
+            self._odo_hz = hz
+            self._odo_sign = sign
+
+    def pulse_position(self) -> float:
+        """Signed pulses sent since start-up: forward() counts up, backward() down."""
+        with self._odo_lock:
+            self._odo_close_segment()
+            return self._odo_pulses
+
+    def pulse_rate(self, speed: float) -> float:
+        """Pulses per second the carrier runs at for a 0..1 speed."""
+        return float(self._hz_for(speed))
 
     @property
     def held(self) -> bool:
@@ -967,6 +1028,7 @@ class ServoHardware(RealHardware):
     def release(self) -> None:
         """De-energise both servos so the carousel can be moved by hand."""
         with self._motor_lock:
+            self._odo_segment(0, 0)
             for p in self.pul:
                 p.value = 0
             self._pulsing = False
@@ -992,6 +1054,7 @@ class ServoHardware(RealHardware):
             if not self._pulsing or self._forward != forward:
                 # Never flip DIR under a running pulse train: stop, set the
                 # direction, give it the setup time the drive asks for, resume.
+                self._odo_segment(0, 0)
                 for p in self.pul:
                     p.value = 0
                 a, b = self._dir_levels(forward)
@@ -1002,6 +1065,7 @@ class ServoHardware(RealHardware):
                 p.frequency = hz
             for p in self.pul:
                 p.value = 0.5
+            self._odo_segment(hz, 1 if forward else -1)
             self._pulsing = True
             self._forward = forward
 
@@ -1013,6 +1077,7 @@ class ServoHardware(RealHardware):
 
     def stop(self) -> None:
         with self._motor_lock:
+            self._odo_segment(0, 0)
             for p in self.pul:
                 p.value = 0
             self._pulsing = False
@@ -1043,6 +1108,7 @@ class ServoHardware(RealHardware):
         forward = direction == "down"
         half = 0.5 / SERVO_JOG_PPS
         with self._motor_lock:
+            self._odo_segment(0, 0)
             for p in self.pul:
                 p.value = 0
             self._pulsing = False
@@ -1051,6 +1117,7 @@ class ServoHardware(RealHardware):
             self.dir[1].value = b
             time.sleep(SERVO_DIR_SETUP_S)
             self._jog_abort = False
+            sent = 0
             for _ in range(pulses):
                 if self._jog_abort:
                     break
@@ -1060,6 +1127,13 @@ class ServoHardware(RealHardware):
                 for i in targets:
                     self.pul[i].value = 0
                 time.sleep(half)
+                sent += 1
+            # Only a jog of BOTH chains moves the carousel; nudging one side
+            # levels a shelf without changing where the carousel is.
+            if motor == "both" and sent:
+                with self._odo_lock:
+                    self._odo_close_segment()
+                    self._odo_pulses += (1 if forward else -1) * sent
 
     def set_servo_params(
         self, pulses_per_rev=None, max_pps=None, mirror_b=None, ignore_alarm=None, **_: object
@@ -1250,6 +1324,23 @@ class SimHardware:
         if mirror_b is not None:
             self.mirror_b = bool(mirror_b)
 
+    def __getattr__(self, name: str):
+        # The odometer exists only on the servo drive. In DC mode the attribute
+        # is absent, exactly as on RealHardware, so the Carousel's
+        # `getattr(hw, "pulse_position", None)` probe takes the DC path.
+        if name in ("pulse_position", "pulse_rate") and self.__dict__.get("motor_mode") == "servo":
+            return self._sim_pulse_position if name == "pulse_position" else self._sim_pulse_rate
+        raise AttributeError(name)
+
+    def _sim_pulse_position(self) -> float:
+        # Toy model: one motor revolution per shelf pitch, so a carousel
+        # revolution calibrates to shelves × pulses_per_rev.
+        with self._lock:
+            return self._pos * self.pulses_per_rev
+
+    def _sim_pulse_rate(self, speed: float) -> float:
+        return max(1.0, (speed / 0.4) * self.pulses_per_rev)
+
     @property
     def held(self) -> bool:
         return self._held
@@ -1394,6 +1485,28 @@ class Carousel:
         self.hold_timeout_s = SERVO_HOLD_TIMEOUT_S
         self._idle_since: Optional[float] = None
 
+        # How a `goto` finds its shelf. "sensor": count shelf-flag edges (the
+        # only option on DC). "pulses": servo only — drive a calibrated number
+        # of pulses per shelf from the home datum, re-synchronised on every pass
+        # of the index flag. Needs a calibration run first.
+        self.position_mode = "sensor"
+        # Result of the last calibration run (also restored from disk / the
+        # app): pulses per carousel revolution, index window width in pulses.
+        self.calibration_info: Optional[dict] = None
+        self.carousel_pulses: Optional[int] = None
+        self.index_window_pulses: Optional[int] = None
+        # Odometer reading at the index rising edge that defined shelf 0, and
+        # the travel direction that edge was taken in. None until homed.
+        self._home_origin: Optional[float] = None
+        self._home_edge_direction: Optional[str] = None
+        # Shelf pitch in pulses learned from the shelf sensor during ordinary
+        # sensor-mode moves (servo only, when not calibrated) so the distance
+        # bounce filter has a yardstick before the first calibration.
+        self._learned_pitch_pulses: Optional[float] = None
+        self.last_sync_drift: Optional[int] = None
+        # Set by the server to persist a fresh calibration.
+        self.on_calibration: Optional[Callable[[dict], None]] = None
+
         self._cmd: Optional[tuple] = None
         self._abort = threading.Event()
         self._wake = threading.Event()
@@ -1417,6 +1530,86 @@ class Carousel:
 
     def request_goto(self, shelf: int) -> None:
         self._set_command(("goto", shelf % self.shelves))
+
+    def request_calibrate(self) -> None:
+        self._set_command(("calibrate",))
+
+    def set_position_mode(self, mode) -> bool:
+        if mode not in ("sensor", "pulses") or mode == self.position_mode:
+            return False
+        self.position_mode = mode
+        print(f"[agent] positioning = {mode}", flush=True)
+        return True
+
+    def restore_calibration(self, info) -> bool:
+        """
+        Adopt a calibration saved earlier (agent's own disk, or the app's copy
+        after a re-install). A measurement this agent made itself always wins:
+        only taken when nothing is known yet.
+        """
+        if self.carousel_pulses is not None or not isinstance(info, dict):
+            return False
+        try:
+            ppr = int(info.get("pulsesPerRev") or 0)
+        except (TypeError, ValueError):
+            return False
+        if ppr <= 0:
+            return False
+        win = info.get("indexWindowPulses")
+        self.carousel_pulses = ppr
+        self.index_window_pulses = int(win) if isinstance(win, (int, float)) and win > 0 else None
+        self.calibration_info = {
+            "type": "calibration",
+            "ok": True,
+            "pulsesPerRev": ppr,
+            "indexWindowPulses": self.index_window_pulses,
+            "shelfFlagsSeen": info.get("shelfFlagsSeen"),
+            "shelves": info.get("shelves"),
+            "message": info.get("message") or f"Calibration restored: {ppr} pulses per revolution.",
+            "restored": True,
+        }
+        print(f"[agent] calibration restored: {ppr} pulses/rev, index window {self.index_window_pulses}", flush=True)
+        return True
+
+    def calibration_frame(self) -> Optional[dict]:
+        if not self.calibration_info:
+            return None
+        frame = dict(self.calibration_info)
+        frame["pulsesPerShelf"] = round(self.carousel_pulses / self.shelves) if self.carousel_pulses else None
+        frame["lastDriftPulses"] = self.last_sync_drift
+        return frame
+
+    # ---- pulse odometer helpers (servo only; None on the DC bridges) ----
+    def _odometer(self) -> Optional[float]:
+        fn = getattr(self.hw, "pulse_position", None)
+        if not callable(fn):
+            return None
+        try:
+            return float(fn())
+        except Exception:
+            return None
+
+    def _pulse_rate(self, duty: float) -> float:
+        fn = getattr(self.hw, "pulse_rate", None)
+        if callable(fn):
+            try:
+                return max(1.0, float(fn(duty)))
+            except Exception:
+                pass
+        return max(1.0, duty * SERVO_MAX_PPS)
+
+    def _pitch_pulses(self) -> Optional[float]:
+        """Shelf pitch in pulses: calibrated if available, else learned from the sensor."""
+        if self.carousel_pulses and self.shelves > 0:
+            return self.carousel_pulses / self.shelves
+        return self._learned_pitch_pulses
+
+    def _pulse_mode_blocker(self) -> Optional[str]:
+        if self._odometer() is None:
+            return "this drive has no pulse counter"
+        if not self.carousel_pulses:
+            return "not calibrated yet, run Calibrate first"
+        return None
 
     def request_stop(self) -> None:
         self._abort.set()
@@ -1894,7 +2087,14 @@ class Carousel:
         self._wake.set()
 
     def snapshot(self) -> dict:
-        return {"type": "state", "status": self.status, "shelf": self.current_shelf, "homed": self.homed}
+        return {
+            "type": "state",
+            "status": self.status,
+            "shelf": self.current_shelf,
+            "homed": self.homed,
+            "positionMode": self.position_mode,
+            "calibrated": self.carousel_pulses is not None,
+        }
 
     def sensor_snapshot(self) -> Optional[dict]:
         """
@@ -2002,6 +2202,8 @@ class Carousel:
                     self._do_home()
                 elif cmd[0] == "goto":
                     self._do_goto(cmd[1])
+                elif cmd[0] == "calibrate":
+                    self._do_calibrate()
                 elif cmd[0] == "jog":
                     self._do_jog(cmd[1], cmd[2], cmd[3], cmd[4] if len(cmd) > 4 else None)
             except Exception as exc:  # pragma: no cover - hardware faults
@@ -2127,6 +2329,10 @@ class Carousel:
         found = self._await_stepping(
             self.hw.take_index_pulse, HOME_TIMEOUT * self._timeout_scale(), _home_ramp_step
         )
+        # Read the odometer BEFORE stopping: this is the datum every pulse-mode
+        # position is measured from, and the index edge was taken in
+        # `home_direction` — the same edge calibration measured.
+        edge_pos = self._odometer()
         self.hw.stop()
         if self._abort.is_set():
             self.status = "idle"
@@ -2158,6 +2364,9 @@ class Carousel:
         self.current_shelf = 0
         self.homed = True
         self.status = "idle"
+        if edge_pos is not None:
+            self._home_origin = edge_pos
+            self._home_edge_direction = home_direction
         self.emit({"type": "homed", "shelf": 0})
 
     def _track_coast(self, step: int, seen_inactive: bool) -> None:
@@ -2199,6 +2408,329 @@ class Carousel:
             # between two samples while the carousel is still at speed.
             time.sleep(0.001)
 
+    # ======================================================================
+    # Pulse positioning (servo drive)
+    # ======================================================================
+    def _calibration_failed(self, message: str) -> None:
+        self.hw.stop()
+        self.status = "idle"
+        self.emit(self.snapshot())
+        aborted = self._abort.is_set()
+        if not aborted:
+            self.emit({"type": "fault", "message": message})
+        self.emit({"type": "calibration", "ok": False,
+                   "message": "Calibration stopped." if aborted else message})
+
+    def _do_calibrate(self) -> None:
+        """
+        Measure the carousel in pulses, in ONE continuous run at homing speed:
+
+          1. find the index rising edge — that is home, zero the odometer there
+             (the carousel does not stop; stopping and restarting would add the
+             start-up slack to the measurement);
+          2. keep going: note where the index flag LEAVES the window (its width
+             in pulses, needed to re-sync when passing home the other way) and
+             every shelf-flag edge seen on the way round;
+          3. the next index rising edge closes the revolution: pulses per
+             revolution. Stop there — we are at home, so the run ends homed.
+
+        Both index edges are taken at the same speed in the same direction, so
+        sensor latency cancels out of the difference.
+        """
+        if self._odometer() is None:
+            self.emit({"type": "calibration", "ok": False,
+                       "message": "Calibration needs the servo drive: the DC bridges have no pulse counter."})
+            return
+        self.status = "calibrating"
+        self.emit(self.snapshot())
+        self.hw.reset_pulses()
+
+        direction = "up" if HOMING_DIRECTION == "down" else "down"
+        sign = 1 if direction == "down" else -1
+        target = self.homing_speed
+        ramp = self._ramp_seconds()
+        floor = min(MIN_DUTY, target)
+        self._energise(direction, floor if ramp > 0 else target)
+        t0 = time.monotonic()
+
+        def ramp_step() -> None:
+            if ramp <= 0:
+                return
+            frac = min(1.0, (time.monotonic() - t0) / ramp)
+            self._energise(direction, floor + (target - floor) * frac)
+
+        scale = self._timeout_scale()
+        if self.hw.index_active():
+            self._await_stepping(self.hw.index_clear, INDEX_CLEAR_TIMEOUT, ramp_step)
+            self.hw.reset_pulses()
+        if not self._await_stepping(self.hw.take_index_pulse, HOME_TIMEOUT * scale, ramp_step):
+            self._calibration_failed("Calibration: index sensor not found on the first pass.")
+            return
+
+        origin = self._odometer()
+        self._home_origin = origin
+        self._home_edge_direction = direction
+        self.current_shelf = 0
+        self.homed = True
+        self.emit({"type": "homed", "shelf": 0})
+        self.hw.reset_pulses()
+
+        shelf_edges: list[float] = []
+        index_window: Optional[float] = None
+        index_was_active = True
+        seen_inactive = not self.hw.shelf_active()
+        deadline = time.monotonic() + HOME_TIMEOUT * scale * CALIBRATE_TIMEOUT_SCALE
+        rev_raw: Optional[float] = None
+
+        while True:
+            if self._abort.is_set():
+                self._calibration_failed("Calibration stopped.")
+                return
+            if time.monotonic() > deadline:
+                self._calibration_failed(
+                    "Calibration timed out: the index sensor was not seen again after a full revolution.")
+                return
+            ramp_step()
+            pos = self._odometer()
+            travelled = (pos - origin) * sign
+
+            idx_active = self.hw.index_active()
+            if index_was_active and not idx_active and index_window is None:
+                index_window = travelled
+            index_was_active = idx_active
+
+            pulsed = self.hw.take_shelf_pulse(0.0)
+            active = self.hw.shelf_active()
+            if seen_inactive and (pulsed or active):
+                seen_inactive = False
+                shelf_edges.append(travelled)
+            elif not active:
+                seen_inactive = True
+
+            if self.hw.take_index_pulse(0.0):
+                # Only a rising edge that follows the window being cleared, and
+                # is far beyond the window's own width, closes the revolution;
+                # anything else is the home flag bouncing at the sensor.
+                if index_window is not None and travelled > max(100.0, 20.0 * index_window):
+                    rev_raw = travelled
+                    break
+            time.sleep(0.001)
+
+        self.hw.stop()
+        rev = int(round(abs(rev_raw)))
+        if rev <= 0:
+            self._calibration_failed("Calibration measured zero travel; is the servo drive pulsing?")
+            return
+        window = int(round(abs(index_window))) if index_window else None
+        pitch = rev / max(1, self.shelves)
+
+        # Merge shelf edges that sit within a quarter pitch of each other (the
+        # same flag seen twice by a bouncing chain), wrapping round the loop.
+        merged: list[float] = []
+        for e in sorted(x % rev for x in shelf_edges):
+            if merged and (e - merged[-1]) < 0.25 * pitch:
+                continue
+            merged.append(e)
+        if len(merged) > 1 and (merged[0] + rev - merged[-1]) < 0.25 * pitch:
+            merged.pop()
+        flags_seen = len(merged)
+
+        message = (f"Calibrated: {rev} pulses per revolution, {round(pitch)} per shelf "
+                   f"({self.shelves} shelves). Saw {flags_seen} shelf flag{'s' if flags_seen != 1 else ''}.")
+        if flags_seen != self.shelves:
+            message += (f" Expected {self.shelves}: check the shelf count in the app, "
+                        f"or a shelf flag the sensor misses / sees twice.")
+
+        self.carousel_pulses = rev
+        self.index_window_pulses = window
+        # Home again: the datum is the edge just taken, not the stop a
+        # millisecond later.
+        self._home_origin = origin + sign * rev_raw
+        self.current_shelf = 0
+        self.homed = True
+        self.status = "idle"
+        self.calibration_info = {
+            "type": "calibration",
+            "ok": True,
+            "pulsesPerRev": rev,
+            "indexWindowPulses": window,
+            "shelfFlagsSeen": flags_seen,
+            "shelves": self.shelves,
+            "message": message,
+        }
+        print(f"[agent] {message} index window {window} pulses", flush=True)
+        if self.on_calibration is not None:
+            try:
+                self.on_calibration(self.calibration_info)
+            except Exception as exc:
+                print(f"[agent] could not persist calibration: {exc}", flush=True)
+        self.emit(self.calibration_frame())
+        self.emit({"type": "homed", "shelf": 0})
+        self.emit(self.snapshot())
+
+    def _do_goto_pulses(self, target: int) -> None:
+        """
+        Drive a calibrated DISTANCE to the target instead of counting shelf
+        flags. Position comes from the pulse odometer referenced to the home
+        datum; the shelf sensor plays no part in the stop.
+
+        The index flag is still watched. Every time it passes the sensor the
+        odometer is corrected to the datum ON THE FLY — the move keeps going and
+        simply re-aims at the target on the corrected grid — so an odometer that
+        is off by a fraction of a percent, or a calibration that is a few pulses
+        short, can never accumulate into a shelf of error. The correction is
+        reported as a `sync` event so the drift can be watched from the app.
+        """
+        rev = float(self.carousel_pulses)
+        pitch = rev / self.shelves
+        up_steps = (self.current_shelf - target) % self.shelves
+        down_steps = (target - self.current_shelf) % self.shelves
+        if up_steps <= down_steps:
+            direction, steps = "up", up_steps
+        else:
+            direction, steps = "down", down_steps
+        step = -1 if direction == "up" else 1
+        sign = 1 if direction == "down" else -1  # odometer counts up on forward() = "down"
+        start_shelf = self.current_shelf
+
+        self.status = "moving"
+        self.emit(self.snapshot())
+        self.hw.reset_pulses()
+        start = self._odometer()
+        absolute = self.homed and self._home_origin is not None
+
+        def grid_remaining(pos: float) -> float:
+            """Pulses still to go to the target on the home-referenced grid."""
+            pos_abs = pos - self._home_origin
+            left = ((target * pitch - pos_abs) * sign) % rev
+            # Parked a hair PAST the target (drift, or a previous stop that ran
+            # a few pulses long) must not send the carousel the long way round.
+            return left - rev if left > rev - 0.25 * pitch else left
+
+        if absolute:
+            distance = grid_remaining(start)
+        else:
+            # Unhomed: a relative move of whole pitches; no datum to re-sync to.
+            distance = steps * pitch
+
+        if distance <= 0:
+            self.status = "idle"
+            self.current_shelf = target
+            self.emit({"type": "arrived", "shelf": target,
+                       "onSensor": bool(self.hw.shelf_active()), "positionMode": "pulses"})
+            return
+
+        cruise = self.move_speed
+        approach = min(self.approach_speed, cruise)
+        decel_pulses = min(PULSE_DECEL_PITCH_FRACTION * pitch, distance / 2)
+        ramp_seconds = self._ramp_seconds()
+        floor = min(MIN_DUTY, cruise)
+        duty = cruise if ramp_seconds <= 0 else floor
+        budget = (3.0 * distance / self._pulse_rate(cruise)
+                  + decel_pulses / self._pulse_rate(approach)
+                  + ramp_seconds + 3.0)
+
+        self._energise(direction, duty)
+        t0 = time.monotonic()
+        last_duty_update = t0
+        last_index_pos: Optional[float] = None
+        shown_shelf = self.current_shelf
+        POLL = 0.001
+
+        while True:
+            now = time.monotonic()
+            pos = self._odometer()
+            travelled = (pos - start) * sign
+
+            if self._abort.is_set():
+                self.hw.stop()
+                if absolute:
+                    self.current_shelf = int(round((pos - self._home_origin) / pitch)) % self.shelves
+                else:
+                    self.current_shelf = (start_shelf + int(round(travelled / pitch)) * step) % self.shelves
+                self.status = "idle"
+                self.emit(self.snapshot())
+                return
+
+            # Stop within one poll's worth of pulses of the target.
+            if distance - travelled <= self._pulse_rate(duty) * 1.5 * POLL:
+                self.hw.stop()
+                break
+
+            # HOME PASS: re-synchronise without stopping.
+            if self.hw.take_index_pulse(0.0):
+                if last_index_pos is None or abs(pos - last_index_pos) > START_REENTRY_PITCH_FRACTION * pitch:
+                    last_index_pos = pos
+                    if absolute:
+                        # Calibration measured the rising edge travelling in the
+                        # homing direction; coming the other way the edge is the
+                        # far side of the window, one window-width along.
+                        if direction == self._home_edge_direction or not self.index_window_pulses:
+                            expected = 0.0
+                        else:
+                            home_sign = 1 if self._home_edge_direction == "down" else -1
+                            expected = home_sign * float(self.index_window_pulses)
+                        measured = (pos - self._home_origin) % rev
+                        drift = (measured - expected) % rev
+                        if drift > rev / 2:
+                            drift -= rev
+                        self._home_origin += drift
+                        distance = travelled + grid_remaining(pos)
+                        self.last_sync_drift = int(round(drift))
+                        print(f"[agent] home pass: odometer drift {drift:+.0f} pulses, corrected", flush=True)
+                        self.emit({"type": "sync", "driftPulses": self.last_sync_drift,
+                                   "pulsesPerShelf": round(pitch)})
+                        if abs(drift) > 0.5 * pitch:
+                            self.emit({"type": "fault",
+                                       "message": f"Position drifted {drift:+.0f} pulses (more than half a shelf) "
+                                                  f"since the last home pass — corrected, but check for chain slip "
+                                                  f"or re-run calibration."})
+
+            # DUTY PROFILE: soft start by time, then a straight-line slowdown over
+            # the last fraction of a pitch, ending at the arrival duty. A servo
+            # holds where the pulses stop, so there is no coast to allow for.
+            if now - last_duty_update >= PULSE_DUTY_UPDATE_S:
+                if ramp_seconds > 0:
+                    frac = min(1.0, (now - t0) / ramp_seconds)
+                    up = floor + (cruise - floor) * frac
+                else:
+                    up = cruise
+                left = distance - travelled
+                if decel_pulses > 0 and left < decel_pulses:
+                    down = approach + (cruise - approach) * max(0.0, left / decel_pulses)
+                else:
+                    down = cruise
+                want = max(SLIDER_MIN_DUTY, min(up, down))
+                if abs(want - duty) >= 0.005:
+                    duty = want
+                    self._energise(direction, duty)
+                last_duty_update = now
+
+            if absolute:
+                cur = int(round((pos - self._home_origin) / pitch)) % self.shelves
+            else:
+                cur = (start_shelf + int(round(travelled / pitch)) * step) % self.shelves
+            if cur != shown_shelf:
+                shown_shelf = cur
+                self.current_shelf = cur
+                self.emit({"type": "pos", "shelf": cur})
+
+            if now - t0 > budget:
+                self.hw.stop()
+                self.status = "idle"
+                self.emit({"type": "fault",
+                           "message": "Pulse move overran its time budget: the servos are not following the "
+                                      "pulse train (alarm, released, or stalled)."})
+                self.emit(self.snapshot())
+                return
+            time.sleep(POLL)
+
+        self.status = "idle"
+        self.current_shelf = target
+        self.emit({"type": "arrived", "shelf": target,
+                   "onSensor": bool(self.hw.shelf_active()),
+                   "positionMode": "pulses"})
+
     def _do_goto(self, target: int) -> None:
         # An un-homed carousel is still allowed to move. Refusing here meant a
         # failed home (e.g. a miswired index sensor) left the machine completely
@@ -2210,6 +2742,14 @@ class Carousel:
         if target == self.current_shelf and self.homed:
             self.emit({"type": "arrived", "shelf": target})
             return
+
+        if self.position_mode == "pulses":
+            blocker = self._pulse_mode_blocker()
+            if blocker is None:
+                self._do_goto_pulses(target)
+                return
+            self.emit({"type": "fault",
+                       "message": f"Pulse positioning unavailable ({blocker}); using the shelf sensor for this move."})
 
         self.status = "moving"
         self.emit(self.snapshot())
@@ -2416,6 +2956,14 @@ class Carousel:
             PULSE_TIMEOUT * self._timeout_scale() * (MOVE_SPEED / max(0.01, cruise)) + self._ramp_seconds()
         )
         last_trigger = time.monotonic()
+        # The runaway guard is reset by ANY sensor activity, including edges the
+        # distance filter rejects — a bouncing sensor is a live sensor.
+        last_activity = last_trigger
+        # Distance filter state: odometer at the move start / last counted edge
+        # (servo), and the pitch interval last measured in this move (DC).
+        last_odo = self._odometer()
+        last_pitch_time: Optional[float] = None
+        rejected_edges = 0
 
         while True:
             if self._abort.is_set():
@@ -2555,12 +3103,46 @@ class Carousel:
                 # this state had no preceding gap, so it is a re-entry, not a shelf.
                 triggered = False
 
+            if triggered:
+                # DISTANCE FILTER. The EMPTY->OCCUPIED rule above proves the window
+                # was empty in between, but a chain that bounces empties the
+                # window and refills it with the SAME shelf, and a stop that landed
+                # exactly on the flag's edge leaves that shelf a hair outside the
+                # window ready to be dragged straight back in by the next move.
+                # Both look like a perfectly formed new edge. What gives them away
+                # is distance: a real shelf is a whole pitch away, a bounce or a
+                # re-entry is a few millimetres. Servo: measured in pulses by the
+                # odometer, so ramps and speed do not matter. DC: fraction of the
+                # pitch time measured earlier in this same move.
+                now_t = time.monotonic()
+                odo_now = self._odometer()
+                pitch_pulses = self._pitch_pulses()
+                reject = None
+                if odo_now is not None and pitch_pulses and last_odo is not None:
+                    travelled = abs(odo_now - last_odo)
+                    frac = START_REENTRY_PITCH_FRACTION if counted == 0 else BOUNCE_PITCH_FRACTION
+                    if travelled < frac * pitch_pulses:
+                        reject = f"{travelled:.0f} of {pitch_pulses:.0f} pulses since the last count"
+                elif counted > 0 and last_pitch_time is not None:
+                    since = now_t - last_trigger
+                    if since < BOUNCE_TIME_FRACTION * last_pitch_time:
+                        reject = f"{since:.2f}s after the last count (pitch {last_pitch_time:.2f}s)"
+                if reject is not None:
+                    triggered = False
+                    # The flag is in the window now; it has to leave again before
+                    # anything can count.
+                    seen_inactive = False
+                    last_activity = now_t
+                    rejected_edges += 1
+                    print(f"[agent] shelf edge ignored as bounce/re-entry: {reject}", flush=True)
+
             if triggered and ignore_parked_flag:
                 # The flag we set off from, sliding back into the window. Not a
                 # shelf gained. Reset the runaway guard, since the sensor is
                 # plainly alive and reporting.
                 ignore_parked_flag = False
                 last_trigger = time.monotonic()
+                last_activity = last_trigger
                 time.sleep(POLL)
                 continue
 
@@ -2570,8 +3152,16 @@ class Carousel:
                 # previous shelf (or the move start for the first count). Used to
                 # size the deceleration so it fits inside the final leg.
                 pitch_time = now - last_trigger
+                odo_now = self._odometer()
+                if counted > 0:
+                    # Shelf-to-shelf: a real pitch, in time and (servo) in pulses.
+                    last_pitch_time = pitch_time
+                    if odo_now is not None and last_odo is not None and not self.carousel_pulses:
+                        self._learned_pitch_pulses = abs(odo_now - last_odo)
+                last_odo = odo_now
                 counted += 1
                 last_trigger = now
+                last_activity = now
 
                 if counted >= steps:
                     # THIS IS THE TARGET. Cut power immediately, before any
@@ -2614,7 +3204,7 @@ class Carousel:
             # As an `elif` it was unreachable in the one case it exists for: a
             # dead sensor reads inactive forever, so the first branch always won
             # and the guard never ran.
-            if time.monotonic() - last_trigger > silence_limit:
+            if time.monotonic() - last_activity > silence_limit:
                 # Total sensor silence. Kill the motor.
                 self.hw.stop()
                 self.status = "idle"
@@ -2668,7 +3258,9 @@ class Carousel:
         # motor: the trigger already told us where we are.
         self.emit({"type": "arrived",
                    "shelf": self.current_shelf,
-                   "onSensor": bool(self.hw.shelf_active())})
+                   "onSensor": bool(self.hw.shelf_active()),
+                   "positionMode": "sensor",
+                   "rejectedEdges": rejected_edges})
 
 
 # ==========================================================================
@@ -2772,13 +3364,30 @@ async def serve(args) -> None:
 
     carousel = Carousel(hw, shelves, broadcast)
     carousel.set_hold_timeout(hold_timeout_s)
+    carousel.set_position_mode(motor_conf.get("positionMode"))
+    carousel.restore_calibration(motor_conf.get("calibration"))
+
+    def persist_motor_conf(mode: Optional[str] = None) -> None:
+        """Write everything the agent must know before the app reconnects."""
+        save_motor_conf({
+            "mode": mode if mode in ("dc", "servo") else rt["mode"],
+            "pulsesPerRev": servo_params["pulses_per_rev"],
+            "maxPps": servo_params["max_pps"],
+            "mirrorB": servo_params["mirror_b"],
+            "ignoreAlarm": bool(servo_params["ignore_alarm"]),
+            "holdTimeoutS": carousel.hold_timeout_s,
+            "positionMode": carousel.position_mode,
+            "calibration": carousel.calibration_info,
+        })
+
+    carousel.on_calibration = lambda _info: persist_motor_conf()
 
     def hello_frame() -> dict:
         return {
             "type": "hello",
             "name": args.name,
             "shelves": carousel.shelves,
-            "firmware": "pax-agent-1.4",
+            "firmware": "pax-agent-1.5",
             "role": args.role,
             "simulated": rt["sim_reason"] is not None,
             "simReason": rt["sim_reason"],
@@ -2840,6 +3449,9 @@ async def serve(args) -> None:
             _servo = carousel.servo_snapshot()
             if _servo is not None:
                 await ws.send(json.dumps(_servo))
+            _cal = carousel.calibration_frame()
+            if _cal is not None:
+                await ws.send(json.dumps(_cal))
             # Same idea for the network picture: a tab that opens while we are
             # already sitting in AP mode should see it without waiting for the
             # watchdog's next flip.
@@ -2889,15 +3501,17 @@ async def serve(args) -> None:
                     hold = msg.get("servoHoldTimeoutS")
                     if isinstance(hold, (int, float)):
                         carousel.set_hold_timeout(hold)
-                    if want in ("dc", "servo") or hold is not None or any(v is not None for v in servo_fields.values()):
-                        save_motor_conf({
-                            "mode": want if want in ("dc", "servo") else rt["mode"],
-                            "pulsesPerRev": servo_params["pulses_per_rev"],
-                            "maxPps": servo_params["max_pps"],
-                            "mirrorB": servo_params["mirror_b"],
-                            "ignoreAlarm": bool(servo_params["ignore_alarm"]),
-                            "holdTimeoutS": carousel.hold_timeout_s,
-                        })
+                    # Positioning: sensor counting vs calibrated pulses, and the
+                    # app's copy of the calibration (restores it after a
+                    # re-install; ignored when this agent has its own).
+                    mode_changed = carousel.set_position_mode(msg.get("positionMode"))
+                    cal_restored = carousel.restore_calibration({
+                        "pulsesPerRev": msg.get("servoCarouselPulses"),
+                        "indexWindowPulses": msg.get("servoIndexWindowPulses"),
+                    })
+                    if (want in ("dc", "servo") or hold is not None or mode_changed or cal_restored
+                            or any(v is not None for v in servo_fields.values())):
+                        persist_motor_conf(want)
                     if want in ("dc", "servo") and want != rt["mode"]:
                         switch_motor_mode(want)
                     carousel.set_servo(**servo_fields)
@@ -2907,6 +3521,12 @@ async def serve(args) -> None:
                         snap = carousel.servo_snapshot()
                         if snap:
                             broadcast(snap)
+                    if mode_changed:
+                        broadcast(carousel.snapshot())
+                    if cal_restored:
+                        broadcast(carousel.calibration_frame())
+                elif t == "calibrate":
+                    carousel.request_calibrate()
                 elif t == "release":
                     carousel.request_release()
                 elif t == "hold":

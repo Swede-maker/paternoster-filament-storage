@@ -127,6 +127,40 @@ instead of the two BTS7960 bridges:
   or on the **Release** button; any move or jog powers the drives up again
   first and re-homes.
 
+#### Positioning by pulses instead of the shelf sensor (pax-agent-1.5+)
+
+The pulse train is also an **odometer**: the agent integrates pulses × time for
+every segment it sends, so it always knows how far the chain has moved. That
+enables two things:
+
+- **Bounce / re-entry filter (always on, both drives).** A shelf edge that
+  arrives less than half a shelf pitch after the previous counted edge is the
+  same shelf rocking in the window, and the first edge of a move within 0.3 of a
+  pitch of the start is the shelf you were parked beside — e.g. after a stop
+  that landed exactly on the flag edge and the chain rocked back off the sensor.
+  Both are ignored (logged as `shelf edge ignored as bounce/re-entry`). On the
+  servo the distance is measured in pulses; on DC it falls back to a fraction of
+  the pitch *time* measured earlier in the same move.
+- **Calibrate** (*Settings → Motor drive → Positioning*): one continuous run at
+  homing speed. The agent homes on the index flag (zeroing the odometer without
+  stopping), measures the index window width and counts shelf flags on the way
+  round, and stops on the next index edge. The result is **pulses per
+  revolution**; divided by the shelf count it gives pulses per shelf. It is
+  saved in `motor.json` and mirrored to the app, which hands it back if the Pi
+  is ever re-installed.
+- **Servo pulses** positioning: a `goto` drives the calibrated distance from the
+  home datum with a smooth slowdown onto the target, and the shelf sensor is only
+  reported, never used to stop. Every time the home flag passes the index sensor
+  the odometer is **corrected on the fly** (a `sync` frame carries the drift in
+  pulses; more than half a shelf also raises a fault), so a calibration that is
+  a few pulses short can never accumulate into a shelf of error. Coming the
+  other way, the index edge is the far side of the window, which is why the
+  window width is measured too.
+
+Changing the shelf count in the app does not need a re-run: the pitch is
+recomputed from the same revolution. Re-run after mechanical changes (sprocket,
+chain, shelves added or removed).
+
 #### What you need
 
 | Part | Qty | Notes |
