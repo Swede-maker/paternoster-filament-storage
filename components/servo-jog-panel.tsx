@@ -19,6 +19,7 @@ import {
 import type { JogCommand, ServoMotorId } from "@/lib/node-protocol"
 import type { StorageNode } from "@/lib/types"
 import { cn } from "@/lib/utils"
+import { Button } from "@/components/ui/button"
 
 /** Quick-pick jog sizes in pulses (servo). 40 @ 4000 ppr = 3.6°, 1000 = a quarter turn. */
 const SERVO_PRESETS = [10, 40, 100, 400, 1000]
@@ -232,9 +233,10 @@ export function ServoJogPanel({ node }: { node: StorageNode }) {
 
       {hardware && online && !agentReady && (
         <p className="mt-2 text-xs leading-relaxed text-warning text-pretty">
-          The Pi agent has not confirmed the {servo ? "servo" : "DC"} drive yet. It switches as soon as it is idle and
-          receives this unit&apos;s settings; if it never does, re-run{" "}
-          <span className="font-mono">pi-agent/install.sh</span> (needs pax-agent-1.3+).
+            The Pi agent has not confirmed the {servo ? "servo" : "DC"} drive yet. It switches as soon as it is idle and
+            receives this unit&apos;s settings. If this stays, the agent on the Pi is an older version — update it with{" "}
+            <span className="font-semibold text-foreground">Settings → Update</span>, or run the one-line installer over
+            SSH once.
         </p>
       )}
 
@@ -370,11 +372,30 @@ export function ServoJogPanel({ node }: { node: StorageNode }) {
       </div>
 
       {(alarmA || alarmB) && (
-        <p className="mt-2 text-xs leading-relaxed text-destructive text-pretty">
-          {alarmA && alarmB ? "Both drives" : alarmA ? "Motor A's drive" : "Motor B's drive"} reports an alarm
-          (over-current, over-voltage or position-following error). The pulse train is stopped. Clear the jam, then
-          power-cycle the servo — the ALM output only resets on re-power.
-        </p>
+        <div className="mt-2 flex flex-col gap-2">
+          <p className="text-xs leading-relaxed text-destructive text-pretty">
+            {alarmA && alarmB ? "Both drives" : alarmA ? "Motor A's drive" : "Motor B's drive"} reports an alarm
+            (over-current, over-voltage or position-following error). The pulse train is stopped. Clear the jam, then
+            power-cycle the servo — the ALM output only resets on re-power.
+          </p>
+          {alarmA && alarmB && (
+            <div className="flex items-center justify-between gap-3 rounded-lg border border-border bg-secondary/30 px-3 py-2">
+              <p className="text-xs leading-relaxed text-muted-foreground text-pretty">
+                Both at once right after wiring usually means ALM+/ALM− are not connected yet — the inputs read
+                &quot;alarm&quot; when open.
+              </p>
+              <Button
+                type="button"
+                size="sm"
+                variant="outline"
+                className="shrink-0 bg-transparent"
+                onClick={() => dispatch({ type: "UPDATE_NODE", id: node.id, changes: { servoIgnoreAlarm: true } })}
+              >
+                Ignore alarms
+              </Button>
+            </div>
+          )}
+        </div>
       )}
       {error && <p className="mt-2 text-xs text-destructive">{error}</p>}
     </div>

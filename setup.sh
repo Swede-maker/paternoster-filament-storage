@@ -558,6 +558,7 @@ number=$NUMBER
 master_host=$MASTER_HOST
 hostname=$HOSTNAME_NEW
 app_dir=$APP_DIR
+data_dir=$DATA_DIR
 branch=$PAX_BRANCH
 installed_at=$(date -Iseconds)
 EOF

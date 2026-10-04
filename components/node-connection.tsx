@@ -14,6 +14,7 @@ import {
   servoPulsesPerRevFor,
   servoMaxPpsFor,
   servoMirrorBFor,
+  servoIgnoreAlarmFor,
   servoHoldTimeoutFor,
 } from "@/lib/filament"
 import { nodeLoadGrams } from "@/lib/selectors"
@@ -394,6 +395,7 @@ export function NodeConnection() {
         servoPulsesPerRevFor(n),
         servoMaxPpsFor(n),
         servoMirrorBFor(n),
+        servoIgnoreAlarmFor(n),
         servoHoldTimeoutFor(n),
       ].join(":")
     })
@@ -430,6 +432,7 @@ export function NodeConnection() {
               servoPulsesPerRev: servoPulsesPerRevFor(node),
               servoMaxPps: servoMaxPpsFor(node),
               servoMirrorB: servoMirrorBFor(node),
+              servoIgnoreAlarm: servoIgnoreAlarmFor(node),
               servoHoldTimeoutS: servoHoldTimeoutFor(node),
             },
           }),
