@@ -187,6 +187,15 @@ export function NodeConnection() {
             // Servo drive status: ALM lines, agent-side tuning, jog progress.
             dispatch({ type: "NODE_SERVO", nodeId, servo: ev })
             break
+          case "calibration":
+            // Pulse calibration report: fresh run, or the agent's stored one
+            // on connect. A run ends homed, so the `homed` frame that
+            // accompanies a success clears the command state.
+            dispatch({ type: "NODE_CALIBRATION", nodeId, calibration: ev })
+            break
+          case "sync":
+            dispatch({ type: "NODE_SYNC", nodeId, driftPulses: ev.driftPulses })
+            break
           case "arrived":
             if (conn) {
               conn.commandActive = false
@@ -397,6 +406,9 @@ export function NodeConnection() {
         servoMirrorBFor(n),
         servoIgnoreAlarmFor(n),
         servoHoldTimeoutFor(n),
+        n.positionMode ?? "sensor",
+        n.servoCarouselPulses ?? 0,
+        n.servoIndexWindowPulses ?? 0,
       ].join(":")
     })
     .join("|")
@@ -434,6 +446,10 @@ export function NodeConnection() {
               servoMirrorB: servoMirrorBFor(node),
               servoIgnoreAlarm: servoIgnoreAlarmFor(node),
               servoHoldTimeoutS: servoHoldTimeoutFor(node),
+              positionMode: node.positionMode ?? "sensor",
+              // Our copy of the calibration, for an agent that lost its own.
+              ...(node.servoCarouselPulses ? { servoCarouselPulses: node.servoCarouselPulses } : {}),
+              ...(node.servoIndexWindowPulses ? { servoIndexWindowPulses: node.servoIndexWindowPulses } : {}),
             },
           }),
         }).catch(() => {

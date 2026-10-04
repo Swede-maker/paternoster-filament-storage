@@ -24,6 +24,7 @@ import type { StorageNode } from "@/lib/types"
 import { cn } from "@/lib/utils"
 import { Field, Input, Checkbox } from "./ui/field"
 import { MotorDrivePicker } from "./motor-drive-picker"
+import { ServoPositioning } from "./servo-positioning"
 
 /** iSV57T DIP S1–S3 table (manual §4.1). "Pr0.08" = all OFF, software value. */
 const DIP_PULSES = [1600, 2000, 3200, 4000, 5000, 6400, 8000]
@@ -185,6 +186,8 @@ export function MotorDriveEditor({ node }: { node: StorageNode }) {
           </div>
         </div>
       )}
+
+      {mode === "servo" && <ServoPositioning node={node} />}
 
       {mode === "servo" && (
         <div className="mt-3">
