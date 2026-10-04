@@ -115,18 +115,39 @@ fi
 # GPIO 12/13 carry PWM0/PWM1. Routing them to the PWM peripheral lets the agent
 # generate the servo pulse train in hardware (any rate up to the drive's
 # 300 kHz, no jitter) instead of timing edges in software (a few kHz, tops).
-# Harmless for DC builds: GPIO 12/13 are unused there. Needs a reboot to apply.
+#
+# SERVO BUILDS ONLY. The DC driver uses the very same GPIO 12/13 as BTS7960
+# RPWM/LPWM through lgpio, and once the overlay owns them every claim fails
+# with "GPIO busy". So the overlay follows the drive choice: added for servo,
+# removed for DC. Needs a reboot to apply either way.
 BOOT_CONF=/boot/firmware/config.txt
 [[ -f "$BOOT_CONF" ]] || BOOT_CONF=/boot/config.txt
 PWM_OVERLAY="dtoverlay=pwm-2chan,pin=12,func=4,pin2=13,func2=4"
+MOTOR_CONF=/var/lib/pax-agent/motor.json
 NEED_REBOOT=0
+# Effective drive: --motor now, else what the agent has persisted.
+EFFECTIVE_MOTOR="$MOTOR"
+if [[ -z "$EFFECTIVE_MOTOR" && -f "$MOTOR_CONF" ]]; then
+  EFFECTIVE_MOTOR=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("mode",""))' "$MOTOR_CONF" 2>/dev/null || true)
+fi
 if [[ -f "$BOOT_CONF" ]]; then
-  if grep -q "^dtoverlay=pwm" "$BOOT_CONF"; then
-    echo "[install] hardware PWM overlay already present in $BOOT_CONF"
-  else
-    printf '\n# PAX: hardware PWM on GPIO 12/13 for the servo PUL signals\n%s\n' "$PWM_OVERLAY" >> "$BOOT_CONF"
-    echo "[install] enabled hardware PWM overlay in $BOOT_CONF (reboot to apply)"
+  HAS_OVERLAY=0
+  grep -q "^dtoverlay=pwm" "$BOOT_CONF" && HAS_OVERLAY=1
+  if [[ "$EFFECTIVE_MOTOR" == "servo" ]]; then
+    if [[ $HAS_OVERLAY -eq 1 ]]; then
+      echo "[install] hardware PWM overlay already present in $BOOT_CONF"
+    else
+      printf '\n# PAX: hardware PWM on GPIO 12/13 for the servo PUL signals\n%s\n' "$PWM_OVERLAY" >> "$BOOT_CONF"
+      echo "[install] enabled hardware PWM overlay in $BOOT_CONF (reboot to apply)"
+      NEED_REBOOT=1
+    fi
+  elif [[ "$EFFECTIVE_MOTOR" == "dc" && $HAS_OVERLAY -eq 1 ]]; then
+    sed -i -e '/^# PAX: hardware PWM on GPIO 12\/13/d' -e '/^dtoverlay=pwm/d' "$BOOT_CONF"
+    echo "[install] removed hardware PWM overlay from $BOOT_CONF: DC drive needs GPIO 12/13 (reboot to apply)"
     NEED_REBOOT=1
+  elif [[ -z "$EFFECTIVE_MOTOR" ]]; then
+    echo "[install] motor drive not chosen yet (no --motor, no $MOTOR_CONF); leaving $BOOT_CONF alone."
+    echo "[install] For a servo build re-run with --motor servo to enable hardware PWM."
   fi
 fi
 # Raspberry Pi OS ships a udev rule handing /sys/class/pwm to the gpio group;
@@ -147,7 +168,6 @@ fi
 # Seed the agent's persisted drive choice so the right backend comes up on
 # first boot. Only `mode` changes; pulses/rev, pulse rate, mirror and the
 # hold timeout the app may already have tuned are kept.
-MOTOR_CONF=/var/lib/pax-agent/motor.json
 if [[ -n "$MOTOR" ]]; then
   mkdir -p "$(dirname "$MOTOR_CONF")"
   python3 - "$MOTOR_CONF" "$MOTOR" <<'PY'
@@ -363,6 +383,11 @@ fi
 # just be skipped and the stale-process protection silently lost.
 if ! command -v fuser >/dev/null 2>&1; then
   apt-get install -y -qq psmisc >/dev/null 2>&1 || echo "[install] warning: could not install psmisc (fuser)"
+fi
+# `gpioinfo` lets the agent report WHO holds a busy GPIO line ("pwm", another
+# process) instead of the bare "GPIO busy" lgpio gives.
+if ! command -v gpioinfo >/dev/null 2>&1; then
+  apt-get install -y -qq gpiod >/dev/null 2>&1 || echo "[install] warning: could not install gpiod (gpioinfo)"
 fi
 
 # The unit's ExecStartPre runs this as root on every start: stops a stray

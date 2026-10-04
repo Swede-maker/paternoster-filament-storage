@@ -54,6 +54,12 @@ import threading
 import time
 from typing import Callable, Optional
 
+# gpiozero picks its pin factory the first time a device is created, from this
+# variable. On a Pi 5 the only factory that works is lgpio (RPi.GPIO and pigpio
+# do not know the RP1 chip); on a Pi 4 lgpio works too. Set it here, before any
+# `from gpiozero import ...` below, unless the operator chose one explicitly.
+os.environ.setdefault("GPIOZERO_PIN_FACTORY", "lgpio")
+
 # Wi-Fi / hotspot management (NetworkManager). Optional: the agent must keep
 # driving the motor even if paxnet.py is missing or nmcli is not installed —
 # the `net.*` commands then answer with a clear error instead of crashing.
@@ -174,6 +180,9 @@ SERVO_MIN_PPS = 200
 # few kHz the edges jitter and the drive loses pulses). Hardware PWM has no
 # such limit short of the drive's own 300 kHz.
 SERVO_SOFT_PWM_MAX_PPS = 5000
+# Reported in `hello` and printed at start-up so the journal shows which
+# agent is actually running after an update.
+AGENT_VERSION = "pax-agent-1.5"
 # Only used in error messages.
 RUN_USER_HINT = os.environ.get("USER") or os.environ.get("LOGNAME") or "the service user"
 # Idle frequency programmed into the PWM channel while it is switched off.
@@ -510,15 +519,36 @@ class RealHardware:
 
         if mirror_b is not None:
             self.mirror_b = bool(mirror_b)
-        self._init_motor()
-        # An NPN (sinking) sensor pulls the line to GND when it detects a shelf,
-        # so we pull the pin up and let gpiozero treat LOW as active. A PNP
-        # (sourcing) sensor is the mirror image: pull down, HIGH is active.
-        # gpiozero derives `is_active` from pull_up, so the rest of this class
-        # stays level-agnostic and only this flag has to change.
-        pull_up = SENSOR_TYPE.upper() == "NPN"
-        self.shelf = DigitalInputDevice(PIN_SHELF_SENSOR, pull_up=pull_up, bounce_time=SENSOR_BOUNCE)
-        self.index = DigitalInputDevice(PIN_INDEX_SENSOR, pull_up=pull_up, bounce_time=SENSOR_BOUNCE)
+        try:
+            self._init_motor()
+            # An NPN (sinking) sensor pulls the line to GND when it detects a shelf,
+            # so we pull the pin up and let gpiozero treat LOW as active. A PNP
+            # (sourcing) sensor is the mirror image: pull down, HIGH is active.
+            # gpiozero derives `is_active` from pull_up, so the rest of this class
+            # stays level-agnostic and only this flag has to change.
+            pull_up = SENSOR_TYPE.upper() == "NPN"
+            self.shelf = _claim(
+                "shelf sensor", DigitalInputDevice, PIN_SHELF_SENSOR, pull_up=pull_up, bounce_time=SENSOR_BOUNCE
+            )
+            self.index = _claim(
+                "index sensor", DigitalInputDevice, PIN_INDEX_SENSOR, pull_up=pull_up, bounce_time=SENSOR_BOUNCE
+            )
+        except Exception:
+            # Release whatever was claimed before the failing line so a retry
+            # (or the simulation fallback) does not inherit half-held pins.
+            self._release_partial()
+            raise
+
+    def _release_partial(self) -> None:
+        for name in ("shelf", "index", "motors", "enables", "pul", "dir", "alm", "ena"):
+            obj = getattr(self, name, None)
+            if obj is None:
+                continue
+            for dev in obj if isinstance(obj, (tuple, list)) else (obj,):
+                try:
+                    dev.close()
+                except Exception:
+                    pass
 
         # ------------------------------------------------------------------
         # Sensors are EDGE COUNTERS, never a power gate.
@@ -662,16 +692,32 @@ class RealHardware:
         # drives one pin with the duty cycle and holds the other at 0.
         # Index 0 is motor A, index 1 is motor B — the same order the servo
         # backend and the `jog` command use.
+        if _pwm_overlay_active():
+            # The pwm-2chan overlay has handed GPIO 12/13 to the PWM block, so
+            # lgpio can only answer "GPIO busy" for bridge A. Say so plainly.
+            raise RuntimeError(
+                f"DC drive needs GPIO {PIN_MOTOR_A_RPWM}/{PIN_MOTOR_A_LPWM} for bridge A, but the "
+                "hardware-PWM overlay (dtoverlay=pwm-2chan... in /boot/firmware/config.txt) has "
+                "reserved them for a SERVO build. Either select the servo drive in the app / run "
+                "install.sh --motor servo, or remove that dtoverlay line and reboot for a DC build."
+            )
+
+        def motor(label: str, fwd: int, back: int):
+            try:
+                return Motor(forward=fwd, backward=back, pwm=True)
+            except Exception as exc:
+                raise RuntimeError(f"cannot claim GPIO {fwd}/{back} for DC {label}: {exc}") from exc
+
         self.motors = (
-            Motor(forward=PIN_MOTOR_A_RPWM, backward=PIN_MOTOR_A_LPWM, pwm=True),
-            Motor(forward=PIN_MOTOR_B_RPWM, backward=PIN_MOTOR_B_LPWM, pwm=True),
+            motor("bridge A RPWM/LPWM", PIN_MOTOR_A_RPWM, PIN_MOTOR_A_LPWM),
+            motor("bridge B RPWM/LPWM", PIN_MOTOR_B_RPWM, PIN_MOTOR_B_LPWM),
         )
         # R_EN and L_EN of each bridge tied to one GPIO: HIGH arms the bridge,
         # LOW makes the outputs float. Pulling this LOW is a true hardware stop
         # that works even if a PWM pin is stuck, so the estop path uses it.
         self.enables = (
-            DigitalOutputDevice(PIN_MOTOR_A_EN, initial_value=True),
-            DigitalOutputDevice(PIN_MOTOR_B_EN, initial_value=True),
+            _claim("bridge A EN", DigitalOutputDevice, PIN_MOTOR_A_EN, initial_value=True),
+            _claim("bridge B EN", DigitalOutputDevice, PIN_MOTOR_B_EN, initial_value=True),
         )
         self._motor_lock = threading.Lock()
         self._jog_abort = False
@@ -881,22 +927,65 @@ class RealHardware:
             pass
 
 
+def _pwm_overlay_active() -> bool:
+    """True when a pwm overlay has routed GPIO 12/13 to the PWM block."""
+    try:
+        for d in os.listdir("/sys/class/pwm"):
+            real = os.path.realpath(os.path.join("/sys/class/pwm", d))
+            # RP1 pwm0 on the Pi 5, the BCM283x PWM block on the Pi 3/4. The
+            # Pi 5 fan controller is also a pwmchip but lives elsewhere.
+            if "98000.pwm" in real or "20c000.pwm" in real:
+                return True
+    except OSError:
+        pass
+    return False
+
+
+def _line_consumer(pin: int) -> str:
+    """
+    Who holds a GPIO line right now, per the kernel: 'pwm', another process's
+    name, or '' if free/unknown. Uses `gpioinfo` (libgpiod) when installed;
+    it works without root and understands the Pi 5's chip layout.
+    """
+    import re
+    import subprocess
+
+    try:
+        out = subprocess.run(["gpioinfo"], capture_output=True, text=True, timeout=3).stdout
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    # libgpiod 1.x: `line  12: "GPIO12" "pwm" output active-high [used]`
+    # libgpiod 2.x: `line  12: "GPIO12" output consumer="pwm"` / `... unused`
+    for line in out.splitlines():
+        if not re.match(rf"\s*line\s+{pin}:\s", line):
+            continue
+        m = re.search(r'consumer="([^"]*)"', line) or re.match(r'\s*line\s+\d+:\s+"[^"]*"\s+"([^"]*)"', line)
+        if m:
+            return m.group(1)
+    return ""
+
+
 def _claim(label: str, factory, pin: int, **kwargs):
     """
-    Create a gpiozero device, re-raising any failure with the pin NAMED. lgpio's
-    own message is just "GPIO busy" / "GPIO not allocated", which says nothing
-    about which of the eight servo lines is the problem.
+    Create a gpiozero device, re-raising any failure with the pin NAMED and,
+    when the kernel knows, WHO holds it. lgpio's own message is just
+    "GPIO busy" / "GPIO not allocated", which says nothing about which of the
+    lines is the problem or why.
     """
     try:
         return factory(pin, **kwargs)
     except Exception as exc:
         hint = ""
         if "busy" in str(exc).lower():
-            hint = (
-                " — another process holds this line (an old agent? `sudo fuser -v /dev/gpiochip*`), "
-                "or a device-tree overlay reserved it"
-            )
-        raise RuntimeError(f"cannot claim GPIO {pin} for servo {label}: {exc}{hint}") from exc
+            holder = _line_consumer(pin)
+            if holder:
+                hint = f" — the kernel says this line is held by '{holder}'"
+            else:
+                hint = (
+                    " — another process holds this line (an old agent? `sudo fuser -v /dev/gpiochip*`), "
+                    "or a device-tree overlay reserved it (`gpioinfo | grep -w {pin}`)"
+                ).replace("{pin}", str(pin))
+        raise RuntimeError(f"cannot claim GPIO {pin} for {label}: {exc}{hint}") from exc
 
 
 def _owner_of(path: str) -> str:
@@ -1139,8 +1228,8 @@ class ServoHardware(RealHardware):
             )
         else:
             self.pul = (
-                _claim("PUL A", PWMOutputDevice, PIN_SERVO_PUL_A, frequency=SERVO_IDLE_HZ, initial_value=0),
-                _claim("PUL B", PWMOutputDevice, PIN_SERVO_PUL_B, frequency=SERVO_IDLE_HZ, initial_value=0),
+                _claim("servo PUL A", PWMOutputDevice, PIN_SERVO_PUL_A, frequency=SERVO_IDLE_HZ, initial_value=0),
+                _claim("servo PUL B", PWMOutputDevice, PIN_SERVO_PUL_B, frequency=SERVO_IDLE_HZ, initial_value=0),
             )
             self.pulse_backend = "software"
             self.pps_cap = SERVO_SOFT_PWM_MAX_PPS
@@ -2918,7 +3007,20 @@ async def serve(args) -> None:
     # last `config` > DC. The app re-sends its choice on every connect, so a
     # fresh install converges on the configured mode after the first handshake.
     motor_conf = load_motor_conf()
-    motor_mode = args.motor or motor_conf.get("mode") or "dc"
+    motor_mode = args.motor or motor_conf.get("mode")
+    if not motor_mode:
+        # Nothing chosen yet. The hardware-PWM overlay is only ever installed
+        # for a servo build (install.sh --motor servo), and with it active the
+        # DC driver cannot claim GPIO 12/13 at all — so let the overlay decide
+        # rather than defaulting into a guaranteed "GPIO busy" restart loop.
+        motor_mode = "servo" if _pwm_overlay_active() else "dc"
+        print(
+            f"[agent] no motor mode configured; assuming {motor_mode} "
+            f"({'hardware-PWM overlay present' if motor_mode == 'servo' else 'no PWM overlay'})",
+            flush=True,
+        )
+    print(f"[agent] pax-agent {AGENT_VERSION}, motor mode {motor_mode}, pin factory "
+          f"{os.environ.get('GPIOZERO_PIN_FACTORY')}", flush=True)
     servo_params = {
         "pulses_per_rev": motor_conf.get("pulsesPerRev", SERVO_PULSES_PER_REV),
         "max_pps": motor_conf.get("maxPps", SERVO_MAX_PPS),
@@ -3010,7 +3112,7 @@ async def serve(args) -> None:
             "type": "hello",
             "name": args.name,
             "shelves": carousel.shelves,
-            "firmware": "pax-agent-1.4",
+                "firmware": AGENT_VERSION,
             "role": args.role,
             "simulated": rt["sim_reason"] is not None,
             "simReason": rt["sim_reason"],
