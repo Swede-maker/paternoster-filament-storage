@@ -539,17 +539,6 @@ class RealHardware:
             self._release_partial()
             raise
 
-    def _release_partial(self) -> None:
-        for name in ("shelf", "index", "motors", "enables", "pul", "dir", "alm", "ena"):
-            obj = getattr(self, name, None)
-            if obj is None:
-                continue
-            for dev in obj if isinstance(obj, (tuple, list)) else (obj,):
-                try:
-                    dev.close()
-                except Exception:
-                    pass
-
         # ------------------------------------------------------------------
         # Sensors are EDGE COUNTERS, never a power gate.
         #
@@ -917,6 +906,18 @@ class RealHardware:
             if last is None or lockout <= 0:
                 return False
             return (time.monotonic() - last) < lockout
+
+    def _release_partial(self) -> None:
+        """Close whatever GPIO devices exist so far; used when __init__ fails midway."""
+        for name in ("shelf", "index", "motors", "enables", "pul", "dir", "alm", "ena"):
+            obj = getattr(self, name, None)
+            if obj is None:
+                continue
+            for dev in obj if isinstance(obj, (tuple, list)) else (obj,):
+                try:
+                    dev.close()
+                except Exception:
+                    pass
 
     def cleanup(self) -> None:
         try:
