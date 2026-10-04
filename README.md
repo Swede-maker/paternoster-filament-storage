@@ -22,29 +22,53 @@ On a fresh Raspberry Pi OS (Bookworm or newer, Wi-Fi already set up by the image
 curl -fsSL https://raw.githubusercontent.com/Swede-maker/paternoster-filament-storage/main/setup.sh | sudo bash
 ```
 
-```bash
-# when the terminal ask for the repo
-https://github.com/Swede-maker/paternoster-filament-storage.git
-```
-It asks **what this Pi is** — `1` master (web app + carousel + hotspot fallback) or
-`2` slave (carousel only) — and **how many shelves** the carousel has, then installs
-everything: Node, the app as a service on port 80, the carousel agent, `.local`
-hostnames, the fallback hotspot and slave provisioning. A slave is additionally asked
-for its number and, optionally, the master's hotspot password.
+It asks **what this Pi should do**:
 
-When it finishes the master prints its address (`http://pax-master.local`) and the
-hotspot password — write that down. Run the same command on each slave and answer `2`.
-Re-run it any time to update; your data and hotspot password are kept.
+| Answer | Setup | What gets installed |
+|---|---|---|
+| `1` | **Filament only** | The web app (spools, shelves, printers). No motors, no GPIO. |
+| `2` | **Master** | The web app **and** it drives one paternoster from this Pi. Host for the whole system: `.local` hostnames, hotspot fallback, slave provisioning. |
+| `3` | **Slave** | Carousel agent only; follows the master. A Pi Zero 2 W is enough. |
+
+For `2` and `3` it also asks **which motors** are wired up (integrated servos with
+PUL/DIR, or DC motors on an H-bridge) and **how many shelves** the carousel has. A
+slave is additionally asked for its number and, optionally, the master's hotspot
+password. Then it installs everything — Node, the app as a service on port 80, the
+carousel agent with the right motor backend, mDNS, hotspot, sudoers — without further
+questions.
+
+When it finishes it prints the app's address (`http://pax-master.local` or
+`http://pax.local`) and, for a master, the hotspot password — write that down.
+
+**Updating later: Settings → Update.** On an installed Pi the app checks GitHub for
+you, lists the new changes and has an **Update now** button. It downloads the newest
+code, rebuilds and restarts the app (5–15 minutes on a Pi 4) and shows the progress
+log; the page reconnects by itself when the app is back. Under the hood the app
+only writes `/var/lib/pax/update.request` — a root `pax-update` systemd service
+does the actual work by re-running this installer with your saved answers.
+
+**Running it again over SSH is also safe and smart.** The answers are saved in `/etc/pax-install.conf`,
+so on an installed Pi the same command recognises the setup and asks what you want:
+
+- **Update** — newest code, same setup, no questions.
+- **Add carousel control** (shown on a filament-only Pi) — turns it into the master
+  and only asks the hardware questions. Everything you have entered in the app stays.
+- **Change motor type** (shown on a master/slave) — switch servos ↔ DC.
+- **Reconfigure** — asks everything again.
+
+Your data is never touched by any of these. It lives outside the code checkout in
+`/var/lib/pax/paternoster.db` (filaments, shelves, storage units, printers, history),
+`/var/lib/pax-agent/motor.json` (motor tuning) and `/etc/paxnet.conf` (hotspot
+password), and a timestamped copy of the database is made in `/var/lib/pax/backups`
+before every update.
+
+Scripted installs: `sudo ./setup.sh --role master --motor servo --shelves 9`,
+`--role app`, `--role slave --motor dc --number 1 …`, or `-y` to update with the saved
+answers.
 
 Everything below is the manual route for a PC or home server, or if you want to
 see what the script does.
 
-If you want to set your own password erase 'SET-YOUR-PASSWORD' and write yours there:
-
-```bash
-cd ~/pax/pi-agent
-sudo bash install.sh --role master --ap-psk 'SET-YOUR-PASSWORD'
-```
 ---
 
 ## 1. Requirements
@@ -94,6 +118,21 @@ machine's IP address instead, e.g. `http://192.168.1.50:3000`.
 On first launch you'll see **"Set up your storage"** — pick your storage type, name it,
 and click **Build machine**. From then on, all your printers, spools, usage totals, and
 history are saved automatically to `paternoster.db`.
+
+For a motorised carousel the wizard also asks for the **Motor drive**:
+
+| Option | Hardware | What the Pi agent does |
+| --- | --- | --- |
+| **Standard DC motors** (default) | Two brushed DC motors — one per chain, one on each side — each on its own BTS7960 / IBT-2 bridge | Same PWM duty on both bridges in lockstep, soft start, run/stop, per-motor **timed jog** (milliseconds) for chain alignment |
+| **Integrated servo motors (PUL/DIR)** | Two StepperOnline **iSV57T** servos (e.g. iSV57T-090(S)) | Pulse/direction on both motors in lockstep, speed by pulse frequency, per-motor **micro-jog** (exact pulses) for chain alignment, drive alarm lamps |
+
+Every carousel has two motors; the drive option only decides *what kind*. The
+choice is saved with the unit and pushed to the agent, which persists it and
+boots straight into the matching control logic. You can change it later under
+**Settings → Units → Motor drive**, together with motor-B mirroring (both
+drives), the servo pulses/rev and top pulse rate, and the jog step size (ms or
+pulses). Wiring for both drives is in
+[`pi-agent/README.md`](pi-agent/README.md#hardware).
 
 ---
 

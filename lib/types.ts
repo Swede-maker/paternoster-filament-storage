@@ -1,6 +1,8 @@
 // Core domain types for the PAX paternoster filament storage system.
 
-import type { NetResultEvent, NetSlave, NetStatusEvent } from "@/lib/node-protocol"
+import type { MotorMode, NetResultEvent, NetSlave, NetStatusEvent, ServoEvent } from "@/lib/node-protocol"
+
+export type { MotorMode }
 
 /**
  * Filament material type. Common presets are listed in `MATERIALS`
@@ -234,7 +236,7 @@ export interface TagBinding {
  * A paired wireless RFID/NFC reader (ESP32, Raspberry Pi, or similar). The
  * `token` is a high-entropy shared secret the device is flashed with; the app
  * subscribes to it to receive scans. Bindings themselves live in `tagBindings`,
- * so a reader only ever reports a tag uid — no per-reader data model beyond this.
+ * so a reader only ever reports a tag uid �� no per-reader data model beyond this.
  */
 export interface RfidReader {
   id: string
@@ -790,6 +792,43 @@ export interface StorageNode {
    * unset so nodes saved before this field existed keep their "+1% per step".
    */
   loadCompPct?: number
+  /**
+   * How the carousel's two motors (one per chain) are driven on the Pi. "dc"
+   * (default, and what every node saved before this field existed runs) is two
+   * brushed motors, each on its own BTS7960 bridge; "servo" is two iSV57T
+   * integrated servos on PUL/DIR. The agent persists the choice and
+   * initialises the matching backend; the jog panel switches its unit
+   * (milliseconds vs. pulses) and the servo alarm lamps appear only for servos.
+   */
+  motorMode?: MotorMode
+  /** Servo only: command pulses per motor revolution (DIP S1–S3 / Pr0.08). */
+  servoPulsesPerRev?: number
+  /** Servo only: pulse rate at 100 % speed, pulses/s. */
+  servoMaxPps?: number
+  /**
+   * Servo only: motor revolutions per one revolution of the chain sprocket
+   * (a 1:50 gearbox = 50). Display only — turns pulse rates into sprocket rpm
+   * and jog steps into sprocket degrees. The agent moves until the shelf
+   * sensor triggers, so it never needs the ratio.
+   */
+  servoGearRatio?: number
+  /** Servo only: how many pulses one micro-jog tap sends. */
+  servoJogPulses?: number
+  /** DC only: how many milliseconds one jog tap runs the motor. */
+  dcJogMs?: number
+  /** Invert motor B's direction (motors mounted facing each other). Both drives. */
+  servoMirrorB?: boolean
+  /**
+   * Servo only: idle seconds before the agent releases the servos so the
+   * carousel can be moved by hand. 0 = hold always (until the supply is off).
+   */
+  servoHoldTimeoutS?: number
+  /**
+   * Live drive status (`servo` frames: backend mode, alarm lines, agent-side
+   * tuning). Runtime only, never persisted — like `net`, it describes the
+   * agent THIS device's relay is talking to.
+   */
+  servo?: ServoEvent | null
   storage: StorageConfig
   /** shelf -> slot -> spoolId | null */
   slots: (string | null)[][]

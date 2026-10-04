@@ -243,6 +243,115 @@ export function boostDuty(baseDuty: number, boostPct: number): number {
 
 /** Default soft START ramp intensity (%) for a new carousel. */
 export const DEFAULT_RAMP_PCT = 40
+
+// ---- Servo drive (iSV57T on PUL/DIR) ---------------------------------------
+// Mirrors the constants in pi-agent/paternoster_agent.py; the app sends these
+// to the agent in `config`, so the two must agree on defaults.
+/** Factory DIP setting on the iSV57T: 4000 command pulses per motor revolution. */
+export const DEFAULT_SERVO_PULSES_PER_REV = 4000
+/** Pulse rate at 100 % speed. 8 000 pps at 4000 ppr = 120 rpm at the shaft. */
+export const DEFAULT_SERVO_MAX_PPS = 8000
+export const MIN_SERVO_MAX_PPS = 500
+/** The drive's hard limit (manual §2: pulse input 0–300 kHz). */
+export const MAX_SERVO_MAX_PPS = 300_000
+/** Micro-jog step: 40 pulses at 4000 ppr = 3.6° of motor shaft. */
+export const DEFAULT_SERVO_JOG_PULSES = 40
+export const MIN_SERVO_JOG_PULSES = 1
+/** Mirrors SERVO_JOG_MAX_PULSES in the agent (25 s at its 800 pps jog rate). */
+export const MAX_SERVO_JOG_PULSES = 20_000
+/** Motor revolutions per sprocket revolution; 1 = motor on the sprocket shaft. */
+export const DEFAULT_SERVO_GEAR_RATIO = 1
+export const MIN_SERVO_GEAR_RATIO = 1
+export const MAX_SERVO_GEAR_RATIO = 1000
+/** Most dual-chain builds mount the two motors facing each other (both drives). */
+export const DEFAULT_SERVO_MIRROR_B = true
+/**
+ * Idle seconds before the agent cuts the servo supply (via the optional relay
+ * on GPIO 17/25) so the carousel can be turned by hand. 0 = hold with full
+ * torque always. The iSV57T has no enable input, so without the relay a
+ * release does nothing — hence 0 is the default. Mirrors SERVO_HOLD_TIMEOUT_S
+ * in the agent.
+ */
+export const DEFAULT_SERVO_HOLD_TIMEOUT_S = 0
+export const MAX_SERVO_HOLD_TIMEOUT_S = 86_400
+
+// ---- DC drive (two BTS7960 bridges) ----------------------------------------
+// A DC bridge has no step unit, so its jog is a timed run: "motor A for N ms".
+// Mirrors DC_JOG_MAX_MS in the agent.
+export const DEFAULT_DC_JOG_MS = 150
+export const MIN_DC_JOG_MS = 10
+export const MAX_DC_JOG_MS = 5000
+
+type ServoNode = {
+  motorMode?: "dc" | "servo"
+  servoPulsesPerRev?: number
+  servoMaxPps?: number
+  servoGearRatio?: number
+  servoJogPulses?: number
+  dcJogMs?: number
+  servoMirrorB?: boolean
+  servoHoldTimeoutS?: number
+}
+
+export function isServoNode(node: ServoNode): boolean {
+  return node.motorMode === "servo"
+}
+export function dcJogMsFor(node: ServoNode): number {
+  return node.dcJogMs ?? DEFAULT_DC_JOG_MS
+}
+export function servoPulsesPerRevFor(node: ServoNode): number {
+  return node.servoPulsesPerRev ?? DEFAULT_SERVO_PULSES_PER_REV
+}
+export function servoMaxPpsFor(node: ServoNode): number {
+  return node.servoMaxPps ?? DEFAULT_SERVO_MAX_PPS
+}
+export function servoJogPulsesFor(node: ServoNode): number {
+  return node.servoJogPulses ?? DEFAULT_SERVO_JOG_PULSES
+}
+export function servoMirrorBFor(node: ServoNode): boolean {
+  return node.servoMirrorB ?? DEFAULT_SERVO_MIRROR_B
+}
+export function servoHoldTimeoutFor(node: ServoNode): number {
+  return node.servoHoldTimeoutS ?? DEFAULT_SERVO_HOLD_TIMEOUT_S
+}
+/** Degrees of motor-shaft rotation for a pulse count at the node's resolution. */
+export function servoPulsesToDegrees(node: ServoNode, pulses: number): number {
+  return (pulses / servoPulsesPerRevFor(node)) * 360
+}
+/** Motor-shaft rpm for a 0..1 speed fraction at the node's max pulse rate. */
+export function servoRpmFor(node: ServoNode, speed: number): number {
+  return (servoMaxPpsFor(node) * speed * 60) / servoPulsesPerRevFor(node)
+}
+export function servoGearRatioFor(node: ServoNode): number {
+  const r = node.servoGearRatio
+  return r !== undefined && Number.isFinite(r) && r >= MIN_SERVO_GEAR_RATIO ? r : DEFAULT_SERVO_GEAR_RATIO
+}
+/** Chain-sprocket rpm after the gearbox for a 0..1 speed fraction. */
+export function servoSprocketRpmFor(node: ServoNode, speed: number): number {
+  return servoRpmFor(node, speed) / servoGearRatioFor(node)
+}
+/** Degrees the chain sprocket turns for a pulse count, after the gearbox. */
+export function servoPulsesToSprocketDegrees(node: ServoNode, pulses: number): number {
+  return servoPulsesToDegrees(node, pulses) / servoGearRatioFor(node)
+}
+/** Seconds for one full sprocket revolution at a 0..1 speed fraction. */
+export function servoSecondsPerSprocketRev(node: ServoNode, speed: number): number {
+  const rpm = servoSprocketRpmFor(node, speed)
+  return rpm > 0 ? 60 / rpm : Number.POSITIVE_INFINITY
+}
+/** Format an rpm figure: whole numbers above 10, one decimal below. */
+export function formatRpm(rpm: number): string {
+  return rpm >= 10 ? String(Math.round(rpm)) : rpm.toFixed(1)
+}
+/** "4.2 s", "48 s" or "2 min 5 s" for a duration in seconds. */
+export function formatSeconds(seconds: number): string {
+  if (!Number.isFinite(seconds)) return "—"
+  if (seconds < 10) return `${seconds.toFixed(1)} s`
+  if (seconds < 90) return `${Math.round(seconds)} s`
+  const m = Math.floor(seconds / 60)
+  const s = Math.round(seconds - m * 60)
+  return s ? `${m} min ${s} s` : `${m} min`
+}
 /** How much the ends of a move can be slowed at full ramp (2.5x base delay). */
 const RAMP_MAX_STRENGTH = 1.5
 

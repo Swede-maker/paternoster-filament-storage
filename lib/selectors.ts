@@ -270,6 +270,79 @@ export function searchSpools(entries: StoredEntry[], query: string): StoredEntry
   })
 }
 
+/** A spool that is currently loaded on a printer rather than sitting in storage. */
+export interface LoadedEntry {
+  spool: Spool
+  printerId: string
+  printerName: string
+  printerKind: Printer["kind"]
+  /** Flat slot index into `printer.loaded`. */
+  index: number
+  /** Human-readable slot, e.g. "1-1", "AMS Lite · 2", "T3", "Spool". */
+  slotLabel: string
+  /** Name of the AMS unit holding the spool; undefined for single/toolchanger. */
+  unitName?: string
+  /** 1-based slot within that AMS unit; undefined for single/toolchanger. */
+  unitSlot?: number
+}
+
+/** Every spool currently loaded on ANY printer (AMS slot, toolhead, or single spool). */
+export function loadedSpools(state: AppState): LoadedEntry[] {
+  const out: LoadedEntry[] = []
+  for (const printer of state.printers) {
+    const units = printer.kind === "ams" ? printerAmsUnits(printer) : []
+    for (let index = 0; index < printer.loaded.length; index++) {
+      const id = printer.loaded[index]
+      if (!id || !state.spools[id]) continue
+      let unitName: string | undefined
+      let unitSlot: number | undefined
+      if (units.length) {
+        let remaining = index
+        for (const unit of units) {
+          if (remaining < unit.slots) {
+            unitName = unit.name
+            unitSlot = remaining + 1
+            break
+          }
+          remaining -= unit.slots
+        }
+      }
+      out.push({
+        spool: state.spools[id],
+        printerId: printer.id,
+        printerName: printer.name,
+        printerKind: printer.kind,
+        index,
+        slotLabel: printerSlotLabel(printer, index),
+        unitName,
+        unitSlot,
+      })
+    }
+  }
+  return out
+}
+
+export function searchLoadedSpools(entries: LoadedEntry[], query: string): LoadedEntry[] {
+  const q = query.trim().toLowerCase()
+  if (!q) return entries
+  return entries.filter(({ spool, printerName, slotLabel, unitName, printerKind }) => {
+    const haystack = [
+      spool.material,
+      spool.brand,
+      spool.colorName,
+      spool.color,
+      printerName,
+      slotLabel,
+      unitName ?? "",
+      printerKind === "ams" ? "ams" : printerKind === "toolchanger" ? "tool" : "",
+      "printer",
+    ]
+      .join(" ")
+      .toLowerCase()
+    return haystack.includes(q)
+  })
+}
+
 export function activePrinter(state: AppState) {
   return state.printers.find((p) => p.id === state.activePrinterId) ?? null
 }

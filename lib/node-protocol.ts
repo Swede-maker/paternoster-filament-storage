@@ -40,6 +40,20 @@ export interface StopCommand {
 }
 
 /**
+ * Servo only: cut the servo supply (optional relay) so the carousel can be turned by
+ * hand. Refused with a `fault` while moving; the next move or jog re-engages
+ * the servos automatically. Answered with a `servo` frame (`held: false`).
+ */
+export interface ReleaseCommand {
+  type: "release"
+}
+
+/** Servo only: re-energise the drives now instead of waiting for the next move. */
+export interface HoldCommand {
+  type: "hold"
+}
+
+/**
  * Push machine settings to the agent: shelf count plus the live motion tuning
  * behind the speed and soft-start sliders. Sent after connect and again
  * whenever the operator changes a slider.
@@ -59,6 +73,56 @@ export interface ConfigCommand {
   rampPct?: number
   /** PWM duty (0..1) for the slow approach onto the final/target shelf. */
   approachSpeed?: number
+  /**
+   * Which motor backend the agent should run. The agent persists this and
+   * hot-swaps its hardware layer (when idle) if it differs from the current one.
+   * Omitted = keep the agent's current/persisted mode.
+   */
+  motorMode?: MotorMode
+  /** Servo only: command pulses per motor revolution (must match DIP S1–S3 / Pr0.08). */
+  servoPulsesPerRev?: number
+  /** Servo only: pulse frequency at 100 % speed, in pulses/s (≤ 300 000 per the iSV57T manual). */
+  servoMaxPps?: number
+  /**
+   * Invert motor B's direction so two facing motors pull the same way. Applies
+   * to both drives (DIR line on the servos, RPWM/LPWM swap on the DC bridge).
+   */
+  servoMirrorB?: boolean
+  /**
+   * Servo only: idle seconds before the agent de-energises the drives so the
+   * carousel can be moved by hand. 0 = never release (hold with full torque
+   * until the servo supply is switched off).
+   */
+  servoHoldTimeoutS?: number
+}
+
+/**
+ * How the carousel's two motors (one per chain, one on each side) are driven:
+ * - "dc":    two brushed DC motors, each on its own BTS7960 bridge, speed = PWM duty.
+ * - "servo": two iSV57T integrated servos on PUL/DIR, speed = pulse frequency.
+ */
+export type MotorMode = "dc" | "servo"
+
+/** Which motor a jog addresses. "both" moves the pair in lockstep. */
+export type ServoMotorId = "a" | "b" | "both"
+
+/**
+ * Nudge one motor (or both) for chain alignment. The amount is in the drive's
+ * own unit: `pulses` (exact step count) on the servo pair, `ms` (run time at
+ * `speed` duty) on the DC bridges. The agent answers with `state`
+ * (moving → idle) and a `servo` frame; an amount in the wrong unit for the
+ * live drive is refused with a `fault`.
+ */
+export interface JogCommand {
+  type: "jog"
+  motor: ServoMotorId
+  direction: "up" | "down"
+  /** Servo drive: exact pulse count. */
+  pulses?: number
+  /** DC drive: run time in milliseconds. */
+  ms?: number
+  /** DC drive: PWM duty 0..1 for the jog (agent default when omitted). */
+  speed?: number
 }
 
 // ---- Networking (Wi-Fi / hotspot / slave provisioning) --------------------
@@ -94,6 +158,13 @@ export interface NetForgetCommand {
 export interface NetProvisionSlavesCommand {
   type: "net.provision-slaves"
 }
+/** Master only: change the hotspot password. Pushed to slaves before the
+ * master's own profile is rewritten, so they keep a working fallback. */
+export interface NetSetApPskCommand {
+  type: "net.set-ap-psk"
+  /** 8–63 characters (WPA2-PSK). */
+  psk: string
+}
 
 export type NetCommand =
   | NetStatusCommand
@@ -102,8 +173,18 @@ export type NetCommand =
   | NetModeCommand
   | NetForgetCommand
   | NetProvisionSlavesCommand
+  | NetSetApPskCommand
 
-export type NodeCommand = HelloCommand | HomeCommand | GotoCommand | StopCommand | ConfigCommand | NetCommand
+export type NodeCommand =
+  | HelloCommand
+  | HomeCommand
+  | GotoCommand
+  | StopCommand
+  | ReleaseCommand
+  | HoldCommand
+  | ConfigCommand
+  | JogCommand
+  | NetCommand
 
 export type NetPin = "auto" | "router" | "ap"
 export type NetRole = "master" | "slave"
@@ -140,6 +221,41 @@ export interface HelloEvent {
   simulated?: boolean
   /** Human-readable cause, e.g. the gpiozero import/pin-factory error. */
   simReason?: string | null
+  /**
+   * The motor backend the agent is actually running (pax-agent-1.2+). Absent on
+   * older agents, which only know the DC bridge.
+   */
+  motorMode?: MotorMode
+}
+
+/**
+ * Motor drive status (the frame is still called `servo` on the wire for
+ * compatibility). Sent on connect, whenever an ALM line changes, and around
+ * each jog. `mode` is the backend the agent is actually running (pax-agent-1.3+
+ * sends it in DC mode too). `alarmA`/`alarmB` are the servo drives' fault
+ * outputs and are absent on the DC bridges — the agent also stops the pulse
+ * train and emits a `fault` when one trips.
+ */
+export interface ServoEvent {
+  type: "servo"
+  mode: MotorMode
+  alarmA?: boolean
+  alarmB?: boolean
+  pulsesPerRev?: number
+  maxPps?: number
+  mirrorB?: boolean
+  /** Servo drive: true while the motors are energised and holding position (pax-agent-1.4+). */
+  held?: boolean
+  /** Servo drive: the agent's live idle auto-release timeout in seconds; 0 = never. */
+  holdTimeoutS?: number
+  /** DC drive: the longest timed jog the agent accepts, in ms. */
+  jogMaxMs?: number
+  /** Present on the frame emitted as a jog starts. */
+  jogging?: boolean
+  motor?: ServoMotorId
+  direction?: "up" | "down"
+  pulses?: number
+  ms?: number
 }
 
 /** Full status snapshot; sent on connect and whenever something changes. */
@@ -277,6 +393,7 @@ export type NodeEvent =
   | ArrivedEvent
   | HomedEvent
   | SensorEvent
+  | ServoEvent
   | FaultEvent
   | NetEvent
 
@@ -314,6 +431,7 @@ export function parseEvent(data: string): NodeEvent | null {
     case "arrived":
     case "homed":
     case "sensor":
+    case "servo":
     case "fault":
     case "net.status":
     case "net.scan":

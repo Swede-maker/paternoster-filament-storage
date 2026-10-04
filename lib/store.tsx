@@ -45,7 +45,7 @@ import type {
   TagBinding,
   RfidReader,
 } from "./types"
-import type { NetResultEvent, NetSlave, NetStatusEvent } from "./node-protocol"
+import type { MotorMode, NetResultEvent, NetSlave, NetStatusEvent, ServoEvent } from "./node-protocol"
 import { printerAmsUnits, printerSlotCount, rampStepMs, newId, DEFAULT_RAMP_PCT } from "./filament"
 import { shelfLabel, printerSlotLabel } from "./selectors"
 import { shortestRotation } from "./balance"
@@ -171,6 +171,8 @@ function toPersisted(state: AppState): PersistedState {
         net: _net,
         netSlaves: _netSlaves,
         netResult: _netResult,
+        // Servo alarm lamps likewise describe the live link, not the config.
+        servo: _servo,
         ...n
       }) => ({
         ...n,
@@ -335,6 +337,51 @@ function mergeConsumptionLog(
     .slice(-CONSUMPTION_LOG_CAP)
 }
 
+/**
+ * Three-way merge of the shelf/slot grid for every node.
+ *
+ * Every open client receives the same carousel position ticks from the Pi, and
+ * `pos` is part of the persisted document, so a SECOND tab/phone saves its own
+ * copy of the state a moment after any rotation. With plain last-write-wins that
+ * stale copy overwrote a placement the FIRST device had just made — the spool
+ * appeared in its slot and then vanished seconds later. Here a cell is taken
+ * from `remote` only when this device did NOT touch it since `baseline`; cells
+ * we changed always win, so our own placement can never be undone by a device
+ * that merely echoed a position update.
+ */
+function mergeNodeSlots(local: StorageNode[], remote: StorageNode[] | undefined, baseline: StorageNode[] | undefined): StorageNode[] {
+  if (!remote || !baseline) return local
+  const remoteById = new Map(remote.map((n) => [n.id, n]))
+  const baseById = new Map(baseline.map((n) => [n.id, n]))
+  let changed = false
+  const out = local.map((node) => {
+    const rem = remoteById.get(node.id)
+    const base = baseById.get(node.id)
+    if (!rem || !base) return node
+    let slots: (string | null)[][] | null = null
+    for (let s = 0; s < node.slots.length; s++) {
+      const lRow = node.slots[s] ?? []
+      const rRow = rem.slots[s]
+      const bRow = base.slots[s]
+      if (!rRow || !bRow) continue
+      for (let i = 0; i < lRow.length; i++) {
+        const l = lRow[i] ?? null
+        const r = rRow[i] ?? null
+        const b = bRow[i] ?? null
+        // Unchanged here but changed elsewhere → adopt the other device's value.
+        if (l === b && r !== b) {
+          if (!slots) slots = node.slots.map((row) => [...row])
+          slots[s][i] = r
+        }
+      }
+    }
+    if (!slots) return node
+    changed = true
+    return { ...node, slots }
+  })
+  return changed ? out : local
+}
+
 function mergeCatalog(local: PersistedState, remote: PersistedState, baseline: PersistedState | null): PersistedState {
   const ls = local.settings
   const rs = remote.settings
@@ -373,7 +420,18 @@ function mergeCatalog(local: PersistedState, remote: PersistedState, baseline: P
   // Same idea for spool weights: apply any server-side gram DECREASE since the
   // baseline on top of the local value, so background consumption survives a
   // concurrent local save. A local refill/edit that raises grams still wins.
-  const spools = mergeServerConsumption(local.spools, remote.spools, baseline?.spools)
+  // A spool another device CREATED since our baseline must survive our save
+  // (it isn't in our map at all, so a plain local-wins spread dropped it — the
+  // "I placed a spool and it disappeared" bug seen with two open tabs); a spool
+  // WE deleted since baseline stays deleted. Then fold in server consumption.
+  const spools = mergeServerConsumption(
+    mergeRecordByKey(local.spools, remote.spools, baseline?.spools),
+    remote.spools,
+    baseline?.spools,
+  )
+  // Same protection for where spools physically are: only cells this device did
+  // not touch adopt the other device's value.
+  const nodes = mergeNodeSlots(local.nodes, remote.nodes, baseline?.nodes)
   // Consumption buckets and daily storage snapshots are append-mostly records
   // written by the server (and any device); preserve entries from other devices.
   const consumptionLog = mergeConsumptionLog(local.consumptionLog, remote.consumptionLog)
@@ -410,6 +468,7 @@ function mergeCatalog(local: PersistedState, remote: PersistedState, baseline: P
   const apiToken = local.apiToken === baseline?.apiToken ? remote.apiToken : local.apiToken
   return {
     ...local,
+    nodes,
     spools,
     parts,
     hardwareOrders,
@@ -542,6 +601,7 @@ function makeNode(opts: {
   shelfMeta?: ShelfMeta[]
   driver?: NodeDriver
   port?: number
+  motorMode?: MotorMode
 }): StorageNode {
   nodeCounter += 1
   const type: NodeType = opts.type ?? "paternoster"
@@ -565,6 +625,9 @@ function makeNode(opts: {
     // until the WebSocket connection to the Pi agent is established.
     link: driver === "hardware" ? "offline" : "online",
     rampPct: DEFAULT_RAMP_PCT,
+    // Manual units have no motor at all; a carousel defaults to the DC bridge
+    // unless the wizard / add-node form chose servos.
+    motorMode: manual ? undefined : (opts.motorMode ?? "dc"),
     storage: opts.storage,
     // A library is an unbounded single row of spools, so it ignores the
     // shelves/slots config and starts as one empty row that grows on demand.
@@ -616,6 +679,8 @@ export type Action =
       area?: string
       storage: StorageConfig
       shelfMeta?: ShelfMeta[]
+      /** Motor drive for the first carousel (ignored for manual units). */
+      motorMode?: MotorMode
       settings: Partial<Settings>
     }
   | { type: "RESET_ALL" }
@@ -634,13 +699,34 @@ export type Action =
       shelfMeta?: ShelfMeta[]
       driver?: NodeDriver
       port?: number
+      motorMode?: MotorMode
       /** Mark this unit as a real slave to be linked later via a pairing code. */
       pair?: boolean
     }
   | {
       type: "UPDATE_NODE"
       id: string
-      changes: Partial<Pick<StorageNode, "name" | "ip" | "role" | "link" | "driver" | "port" | "area" | "shelfMeta">>
+      changes: Partial<
+        Pick<
+          StorageNode,
+          | "name"
+          | "ip"
+          | "role"
+          | "link"
+          | "driver"
+          | "port"
+          | "area"
+          | "shelfMeta"
+          | "motorMode"
+          | "servoPulsesPerRev"
+          | "servoMaxPps"
+          | "servoGearRatio"
+          | "servoJogPulses"
+          | "dcJogMs"
+          | "servoMirrorB"
+          | "servoHoldTimeoutS"
+        >
+      >
     }
   /** Rebuild a node's shelf/slot layout, preserving spools that still fit. */
   | { type: "RESHAPE_NODE"; id: string; storage: StorageConfig; shelfMeta?: ShelfMeta[] }
@@ -661,6 +747,8 @@ export type Action =
   | { type: "NODE_AGENT_MODE"; nodeId: string; simulated: boolean; reason?: string }
   | { type: "NODE_POS"; nodeId: string; currentShelf: number }
   | { type: "NODE_SENSOR"; nodeId: string; on: boolean }
+  /** Servo drive status from the agent (`servo` frame): alarms + live tuning. */
+  | { type: "NODE_SERVO"; nodeId: string; servo: ServoEvent | null }
   | { type: "NODE_ARRIVED"; nodeId: string; shelf: number }
   | { type: "NODE_HOMED"; nodeId: string; currentShelf?: number }
   | { type: "NODE_FAULT"; nodeId: string; message: string }
@@ -1046,6 +1134,7 @@ function coreReducer(state: AppState, action: Action): AppState {
             net: old.net,
             netSlaves: old.netSlaves,
             netResult: old.netResult,
+            servo: old.servo,
             machine: keepMotion
               ? old.machine
               : keepRuntime
@@ -1074,6 +1163,7 @@ function coreReducer(state: AppState, action: Action): AppState {
         area: action.area,
         shelfMeta: action.shelfMeta,
         storage: action.storage,
+        motorMode: action.motorMode,
       })
       return {
         ...base,
@@ -1121,6 +1211,7 @@ function coreReducer(state: AppState, action: Action): AppState {
         storage: action.storage,
         driver: action.driver,
         port: action.port,
+        motorMode: action.motorMode,
       })
       // A real slave linked by code starts "unpaired"; it runs on the simulated
       // driver until (and after) a real agent phones home, so the app never
@@ -2048,6 +2139,14 @@ function coreReducer(state: AppState, action: Action): AppState {
       return withNode(state, action.nodeId, (n) => ({
         ...n,
         machine: { ...n.machine, sensor: action.on },
+      }))
+
+    case "NODE_SERVO":
+      // A jog-start frame carries no alarm fields; keep the last known alarm
+      // picture underneath it so the lamps don't blink to "unknown" mid-jog.
+      return withNode(state, action.nodeId, (n) => ({
+        ...n,
+        servo: action.servo === null ? null : { ...(n.servo ?? {}), ...action.servo },
       }))
 
     case "NODE_ARRIVED": {

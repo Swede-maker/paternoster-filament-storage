@@ -95,7 +95,7 @@ interface Relay {
    * default speed until the operator happened to touch a slider again. Replaying
    * this on every open keeps the hardware matching the UI.
    */
-  motion: { moveSpeed?: number; homingSpeed?: number; rampPct?: number; approachSpeed?: number }
+  motion: Omit<Extract<NodeCommand, { type: "config" }>, "type" | "shelves">
   /**
    * Last `net.status` / `net.slaves` frames, replayed to new subscribers for
    * the same reason as `lastState`: the agent only volunteers them on connect
@@ -530,6 +530,13 @@ export function sendCommand(ip: string, port: number, cmd: NodeCommand): boolean
     if (cmd.homingSpeed !== undefined) relay.motion.homingSpeed = cmd.homingSpeed
     if (cmd.rampPct !== undefined) relay.motion.rampPct = cmd.rampPct
     if (cmd.approachSpeed !== undefined) relay.motion.approachSpeed = cmd.approachSpeed
+    // Motor drive selection + servo tuning must survive a reconnect too: the
+    // agent only switches backends on a `config` that names a mode.
+    if (cmd.motorMode !== undefined) relay.motion.motorMode = cmd.motorMode
+    if (cmd.servoPulsesPerRev !== undefined) relay.motion.servoPulsesPerRev = cmd.servoPulsesPerRev
+    if (cmd.servoMaxPps !== undefined) relay.motion.servoMaxPps = cmd.servoMaxPps
+    if (cmd.servoMirrorB !== undefined) relay.motion.servoMirrorB = cmd.servoMirrorB
+    if (cmd.servoHoldTimeoutS !== undefined) relay.motion.servoHoldTimeoutS = cmd.servoHoldTimeoutS
     if (cmd.shelves > 0) relay.shelves = cmd.shelves
   }
 
