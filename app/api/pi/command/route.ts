@@ -52,6 +52,7 @@ function parseCommand(body: unknown): NodeCommand | null {
         servoPulsesPerRev?: unknown
         servoMaxPps?: unknown
         servoMirrorB?: unknown
+        servoIgnoreAlarm?: unknown
         servoHoldTimeoutS?: unknown
       }
       if (typeof b.shelves !== "number" || !Number.isInteger(b.shelves) || b.shelves <= 0) return null
@@ -77,6 +78,7 @@ function parseCommand(body: unknown): NodeCommand | null {
       if (ppr !== undefined) cmd.servoPulsesPerRev = ppr
       if (pps !== undefined) cmd.servoMaxPps = pps
       if (typeof b.servoMirrorB === "boolean") cmd.servoMirrorB = b.servoMirrorB
+      if (typeof b.servoIgnoreAlarm === "boolean") cmd.servoIgnoreAlarm = b.servoIgnoreAlarm
       // 0 is meaningful here (= hold for ever), so it is not a "positive int".
       const hold = b.servoHoldTimeoutS
       if (typeof hold === "number" && Number.isInteger(hold) && hold >= 0 && hold <= 86_400) {
