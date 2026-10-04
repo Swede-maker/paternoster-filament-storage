@@ -1,6 +1,14 @@
 // Core domain types for the PAX paternoster filament storage system.
 
-import type { MotorMode, NetResultEvent, NetSlave, NetStatusEvent, ServoEvent } from "@/lib/node-protocol"
+import type {
+  CalibrationEvent,
+  MotorMode,
+  NetResultEvent,
+  NetSlave,
+  NetStatusEvent,
+  PositionMode,
+  ServoEvent,
+} from "@/lib/node-protocol"
 
 export type { MotorMode }
 
@@ -829,11 +837,30 @@ export interface StorageNode {
    */
   servoHoldTimeoutS?: number
   /**
+   * How `goto` finds a shelf: "sensor" counts shelf-flag edges (default, and
+   * the only option on DC); "pulses" (servo) drives a calibrated distance from
+   * the home datum and re-syncs on every index pass.
+   */
+  positionMode?: PositionMode
+  /**
+   * The app's copy of the servo pulse calibration: pulses per carousel turn and
+   * the index window width. Written from the agent's `calibration` frame and
+   * re-sent in `config` so a re-installed agent gets it back.
+   */
+  servoCarouselPulses?: number
+  servoIndexWindowPulses?: number
+  /** Epoch ms of the calibration above. */
+  servoCalibratedAt?: number
+  /**
    * Live drive status (`servo` frames: backend mode, alarm lines, agent-side
    * tuning). Runtime only, never persisted — like `net`, it describes the
    * agent THIS device's relay is talking to.
    */
   servo?: ServoEvent | null
+  /** Last `calibration` frame from the agent (message, flags seen, last drift). Runtime only. */
+  calibration?: CalibrationEvent | null
+  /** True from pressing Calibrate until the agent answers. Runtime only. */
+  calibrating?: boolean
   storage: StorageConfig
   /** shelf -> slot -> spoolId | null */
   slots: (string | null)[][]

@@ -103,6 +103,8 @@ interface Relay {
    */
   lastNetStatus: string | null
   lastNetSlaves: string | null
+  /** Last `calibration` frame, replayed like `lastState` (sent on connect and after a run). */
+  lastCalibration: string | null
   closing: boolean
 }
 
@@ -268,6 +270,18 @@ function rememberNet(relay: Relay, text: string): void {
   else if (ev?.type === "net.slaves") relay.lastNetSlaves = text
 }
 
+function rememberCalibration(relay: Relay, text: string): void {
+  if (!text.includes('"calibration"')) return
+  let ev: { type?: string; ok?: boolean }
+  try {
+    ev = JSON.parse(text)
+  } catch {
+    return
+  }
+  // A failed run carries no numbers; keep showing the last good one.
+  if (ev?.type === "calibration" && ev.ok === true) relay.lastCalibration = text
+}
+
 /**
  * One-shot request/response over the relay: send `cmd`, resolve with the first
  * event whose `type` is in `expect` (or reject on timeout / not connected).
@@ -401,6 +415,7 @@ function openSocket(relay: Relay) {
     const text = data.toString()
     rememberState(relay, text)
     rememberNet(relay, text)
+    rememberCalibration(relay, text)
     broadcast(relay, { kind: "event", data: text })
   })
 
@@ -460,6 +475,7 @@ function getOrCreate(ip: string, port: number, shelves: number): Relay {
       motion: {},
       lastNetStatus: null,
       lastNetSlaves: null,
+      lastCalibration: null,
       closing: false,
     }
     registry.set(key, relay)
@@ -496,6 +512,7 @@ export function subscribe(ip: string, port: number, shelves: number, listener: L
   if (relay.lastState) listener({ kind: "event", data: relay.lastState })
   if (relay.lastNetStatus) listener({ kind: "event", data: relay.lastNetStatus })
   if (relay.lastNetSlaves) listener({ kind: "event", data: relay.lastNetSlaves })
+  if (relay.lastCalibration) listener({ kind: "event", data: relay.lastCalibration })
 
   return () => {
     relay.listeners.delete(listener)
@@ -538,6 +555,9 @@ export function sendCommand(ip: string, port: number, cmd: NodeCommand): boolean
     if (cmd.servoMirrorB !== undefined) relay.motion.servoMirrorB = cmd.servoMirrorB
     if (cmd.servoIgnoreAlarm !== undefined) relay.motion.servoIgnoreAlarm = cmd.servoIgnoreAlarm
     if (cmd.servoHoldTimeoutS !== undefined) relay.motion.servoHoldTimeoutS = cmd.servoHoldTimeoutS
+    if (cmd.positionMode !== undefined) relay.motion.positionMode = cmd.positionMode
+    if (cmd.servoCarouselPulses !== undefined) relay.motion.servoCarouselPulses = cmd.servoCarouselPulses
+    if (cmd.servoIndexWindowPulses !== undefined) relay.motion.servoIndexWindowPulses = cmd.servoIndexWindowPulses
     if (cmd.shelves > 0) relay.shelves = cmd.shelves
   }
 

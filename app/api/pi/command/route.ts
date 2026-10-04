@@ -15,6 +15,7 @@ function parseCommand(body: unknown): NodeCommand | null {
     case "stop":
     case "release":
     case "hold":
+    case "calibrate":
       return { type }
     case "goto": {
       const shelf = (body as { shelf?: unknown }).shelf
@@ -54,6 +55,9 @@ function parseCommand(body: unknown): NodeCommand | null {
         servoMirrorB?: unknown
         servoIgnoreAlarm?: unknown
         servoHoldTimeoutS?: unknown
+        positionMode?: unknown
+        servoCarouselPulses?: unknown
+        servoIndexWindowPulses?: unknown
       }
       if (typeof b.shelves !== "number" || !Number.isInteger(b.shelves) || b.shelves <= 0) return null
       // Rebuilding the command field-by-field is what dropped the slider values:
@@ -84,6 +88,11 @@ function parseCommand(body: unknown): NodeCommand | null {
       if (typeof hold === "number" && Number.isInteger(hold) && hold >= 0 && hold <= 86_400) {
         cmd.servoHoldTimeoutS = hold
       }
+      if (b.positionMode === "sensor" || b.positionMode === "pulses") cmd.positionMode = b.positionMode
+      const carouselPulses = posInt(b.servoCarouselPulses, 100_000_000)
+      const windowPulses = posInt(b.servoIndexWindowPulses, 100_000_000)
+      if (carouselPulses !== undefined) cmd.servoCarouselPulses = carouselPulses
+      if (windowPulses !== undefined) cmd.servoIndexWindowPulses = windowPulses
       return cmd
     }
     default:

@@ -45,7 +45,7 @@ import type {
   TagBinding,
   RfidReader,
 } from "./types"
-import type { MotorMode, NetResultEvent, NetSlave, NetStatusEvent, ServoEvent } from "./node-protocol"
+import type { CalibrationEvent, MotorMode, NetResultEvent, NetSlave, NetStatusEvent, ServoEvent } from "./node-protocol"
 import { printerAmsUnits, printerSlotCount, rampStepMs, newId, DEFAULT_RAMP_PCT } from "./filament"
 import { shelfLabel, printerSlotLabel } from "./selectors"
 import { shortestRotation } from "./balance"
@@ -173,6 +173,10 @@ function toPersisted(state: AppState): PersistedState {
         netResult: _netResult,
         // Servo alarm lamps likewise describe the live link, not the config.
         servo: _servo,
+        // The calibration REPORT is live too; its numbers are persisted
+        // separately as servoCarouselPulses / servoIndexWindowPulses.
+        calibration: _calibration,
+        calibrating: _calibrating,
         ...n
       }) => ({
         ...n,
@@ -369,6 +373,10 @@ const NODE_TUNING_KEYS = [
   "servoIgnoreAlarm",
   "servoHoldTimeoutS",
   "motorMode",
+  "positionMode",
+  "servoCarouselPulses",
+  "servoIndexWindowPulses",
+  "servoCalibratedAt",
 ] as const satisfies readonly (keyof StorageNode)[]
 
 function mergeNodeSlots(local: StorageNode[], remote: StorageNode[] | undefined, baseline: StorageNode[] | undefined): StorageNode[] {
@@ -603,6 +611,39 @@ function isDrivable(n: StorageNode): boolean {
   return n.driver !== "hardware" || n.link === "online"
 }
 
+/**
+ * What the Pi's calibration run would report for a simulated unit. Toy
+ * mechanics: one sprocket turn per shelf pitch, so a carousel revolution is
+ * shelves × (pulses per motor rev × gear ratio). A small, run-to-run error is
+ * added so the "Last home pass" correction has something realistic to show.
+ */
+function simCalibrationResult(n: StorageNode): StorageNode {
+  const shelves = Math.max(1, n.storage.shelves)
+  const ideal = shelves * (n.servoPulsesPerRev ?? 4000) * (n.servoGearRatio ?? 50)
+  const errorPerMille = (Date.now() % 7) - 3
+  const pulsesPerRev = Math.round(ideal * (1 + errorPerMille / 1000))
+  const indexWindowPulses = Math.max(1, Math.round((pulsesPerRev / shelves) * 0.015))
+  const pulsesPerShelf = Math.round(pulsesPerRev / shelves)
+  return {
+    ...n,
+    calibrating: false,
+    servoCarouselPulses: pulsesPerRev,
+    servoIndexWindowPulses: indexWindowPulses,
+    servoCalibratedAt: Date.now(),
+    calibration: {
+      type: "calibration",
+      ok: true,
+      pulsesPerRev,
+      pulsesPerShelf,
+      indexWindowPulses,
+      shelfFlagsSeen: shelves,
+      shelves,
+      lastDriftPulses: null,
+      message: `Calibrated (simulated): ${pulsesPerRev.toLocaleString()} pulses per revolution, ${pulsesPerShelf.toLocaleString()} per shelf (${shelves} shelves). Saw ${shelves} shelf flags.`,
+    },
+  }
+}
+
 /** Shelf nodes have no hardware, so their "machine" is permanently homed/idle. */
 function shelfMachine(): Machine {
   return { currentShelf: 0, homed: true, status: "idle", targetShelf: null, direction: null, moveFrom: null }
@@ -759,6 +800,7 @@ export type Action =
           | "servoMirrorB"
           | "servoIgnoreAlarm"
           | "servoHoldTimeoutS"
+          | "positionMode"
         >
       >
     }
@@ -783,6 +825,18 @@ export type Action =
   | { type: "NODE_SENSOR"; nodeId: string; on: boolean }
   /** Servo drive status from the agent (`servo` frame): alarms + live tuning. */
   | { type: "NODE_SERVO"; nodeId: string; servo: ServoEvent | null }
+  /** Pulse calibration report from the agent (`calibration` frame). */
+  | { type: "NODE_CALIBRATION"; nodeId: string; calibration: CalibrationEvent }
+  /** Calibrate pressed locally; cleared by the agent's answer. */
+  | { type: "NODE_CALIBRATING"; nodeId: string; on: boolean }
+  /**
+   * Simulated unit: run the calibration the Pi would — home, one full turn
+   * through every shelf, stop at home — and produce a result from the servo
+   * settings, so pulse positioning can be tried without hardware.
+   */
+  | { type: "SIM_CALIBRATE_START"; nodeId: string }
+  /** Pulse mode: odometer correction at a home pass (`sync` frame). */
+  | { type: "NODE_SYNC"; nodeId: string; driftPulses: number }
   | { type: "NODE_ARRIVED"; nodeId: string; shelf: number }
   | { type: "NODE_HOMED"; nodeId: string; currentShelf?: number }
   | { type: "NODE_FAULT"; nodeId: string; message: string }
@@ -1946,11 +2000,12 @@ function coreReducer(state: AppState, action: Action): AppState {
 
     // ----- machine (per node) -----
     case "HOME_START": {
-      // Refuse rather than spin forever on a disconnected unit.
-      const target = getNode(state, action.nodeId)
-      if (!target || !isDrivable(target)) return state
+      const node = getNode(state, action.nodeId)
+      if (!node || !isDrivable(node)) return state
       return withNode(state, action.nodeId, (n) => ({
         ...n,
+        // Homing by hand abandons a simulated measuring run.
+        calibrating: n.driver === "hardware" ? n.calibrating : false,
         machine: {
           ...n.machine,
           status: "homing",
@@ -1969,20 +2024,26 @@ function coreReducer(state: AppState, action: Action): AppState {
     }
 
     case "HOME_DONE":
-      return withNode(state, action.nodeId, (n) => ({
-        ...n,
-        machine: {
-          ...n.machine,
-          status: "idle",
-          homed: true,
-          currentShelf: 0,
-          fault: null,
-          targetShelf: null,
-          direction: null,
-          moveFrom: null,
-          resumeStatus: null,
-        },
-      }))
+      return withNode(state, action.nodeId, (n) => {
+        // Simulated calibration, phase 2: a full turn back to shelf 0. A move
+        // whose target equals its start only "arrives" after every shelf has
+        // ticked past — exactly one revolution.
+        const measuring = n.calibrating === true && n.driver !== "hardware"
+        return {
+          ...n,
+          machine: {
+            ...n.machine,
+            status: measuring ? "moving" : "idle",
+            homed: true,
+            currentShelf: 0,
+            fault: null,
+            targetShelf: measuring ? 0 : null,
+            direction: measuring ? "down" : null,
+            moveFrom: measuring ? 0 : null,
+            resumeStatus: null,
+          },
+        }
+      })
 
     case "MANUAL_MOVE": {
       const node = getNode(state, action.nodeId)
@@ -2032,8 +2093,10 @@ function coreReducer(state: AppState, action: Action): AppState {
         ...n,
         machine: { ...n.machine, currentShelf: nextShelf },
       }))
-      if (nextShelf === targetShelf) return onNodeArrived(moved, action.nodeId)
-      return moved
+      if (nextShelf !== targetShelf) return moved
+      const arrived = onNodeArrived(moved, action.nodeId)
+      if (node.calibrating !== true || node.driver === "hardware") return arrived
+      return withNode(arrived, action.nodeId, (n) => simCalibrationResult(n))
     }
 
     case "ARRIVED":
@@ -2182,6 +2245,52 @@ function coreReducer(state: AppState, action: Action): AppState {
         ...n,
         servo: action.servo === null ? null : { ...(n.servo ?? {}), ...action.servo },
       }))
+
+    case "NODE_CALIBRATION": {
+      const cal = action.calibration
+      return withNode(state, action.nodeId, (n) => {
+        const next: StorageNode = { ...n, calibration: cal, calibrating: false }
+        // A successful measurement is the agent's truth; keep our copy in step
+        // so it can be handed back after a re-install.
+        if (cal.ok && typeof cal.pulsesPerRev === "number" && cal.pulsesPerRev > 0) {
+          if (cal.pulsesPerRev !== n.servoCarouselPulses) next.servoCarouselPulses = cal.pulsesPerRev
+          const win = typeof cal.indexWindowPulses === "number" && cal.indexWindowPulses > 0 ? cal.indexWindowPulses : undefined
+          if (win !== n.servoIndexWindowPulses) next.servoIndexWindowPulses = win
+          if (!cal.restored) next.servoCalibratedAt = Date.now()
+        }
+        return next
+      })
+    }
+
+    case "NODE_CALIBRATING":
+      return withNode(state, action.nodeId, (n) => ({ ...n, calibrating: action.on }))
+
+    case "SIM_CALIBRATE_START": {
+      const node = getNode(state, action.nodeId)
+      if (!node || node.driver === "hardware" || node.machine.status !== "idle" || state.job) return state
+      // Phase 1 is an ordinary homing; HOME_DONE sees `calibrating` and turns
+      // it into the measuring revolution instead of parking idle.
+      return withNode(state, action.nodeId, (n) => ({
+        ...n,
+        calibrating: true,
+        machine: {
+          ...n.machine,
+          status: "homing",
+          homed: false,
+          targetShelf: null,
+          direction: null,
+          moveFrom: null,
+          resumeStatus: null,
+          fault: null,
+          homingRequest: null,
+        },
+      }))
+    }
+
+    case "NODE_SYNC":
+      return withNode(state, action.nodeId, (n) =>
+        n.calibration ? { ...n, calibration: { ...n.calibration, lastDriftPulses: action.driftPulses } } : n,
+      )
 
     case "NODE_ARRIVED": {
       // The Pi reports it stopped at `shelf`. Snap position, then run the same
@@ -2485,6 +2594,12 @@ function coreReducer(state: AppState, action: Action): AppState {
       if (node.machine.status === "stopped") return state
       return withNode(state, action.nodeId, (n) => ({
         ...n,
+        // A measuring run cannot be resumed mid-turn; it is simply abandoned.
+        calibrating: false,
+        calibration:
+          n.calibrating && n.driver !== "hardware"
+            ? { type: "calibration", ok: false, message: "Calibration stopped." }
+            : n.calibration,
         machine: { ...n.machine, status: "stopped", resumeStatus: n.machine.status },
       }))
     }

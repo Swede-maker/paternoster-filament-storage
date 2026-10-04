@@ -54,6 +54,25 @@ export interface HoldCommand {
 }
 
 /**
+ * Servo only (pax-agent-1.5+): measure the carousel in pulses. One continuous
+ * run at homing speed: home on the index flag, keep going a full turn, stop on
+ * the index flag again. Answered with `homed`, then a `calibration` frame.
+ */
+export interface CalibrateCommand {
+  type: "calibrate"
+}
+
+/**
+ * How a `goto` finds its shelf.
+ * - "sensor": count shelf-flag edges on the proximity sensor (the only option on DC).
+ * - "pulses": servo only — drive a calibrated number of pulses per shelf from the
+ *   home datum, re-synchronised on every pass of the index flag. Needs a
+ *   calibration run; the agent falls back to the sensor (with a `fault` note)
+ *   when it cannot position by pulses.
+ */
+export type PositionMode = "sensor" | "pulses"
+
+/**
  * Push machine settings to the agent: shelf count plus the live motion tuning
  * behind the speed and soft-start sliders. Sent after connect and again
  * whenever the operator changes a slider.
@@ -96,6 +115,14 @@ export interface ConfigCommand {
    * until the servo supply is switched off).
    */
   servoHoldTimeoutS?: number
+  /** Sensor counting or calibrated pulses (pax-agent-1.5+). */
+  positionMode?: PositionMode
+  /**
+   * The app's copy of the last calibration, so a re-installed agent gets it
+   * back. An agent that already holds its own measurement ignores these.
+   */
+  servoCarouselPulses?: number
+  servoIndexWindowPulses?: number
 }
 
 /**
@@ -184,6 +211,7 @@ export type NodeCommand =
   | StopCommand
   | ReleaseCommand
   | HoldCommand
+  | CalibrateCommand
   | ConfigCommand
   | JogCommand
   | NetCommand
@@ -263,9 +291,13 @@ export interface ServoEvent {
 /** Full status snapshot; sent on connect and whenever something changes. */
 export interface StateEvent {
   type: "state"
-  status: "idle" | "moving" | "homing"
+  status: "idle" | "moving" | "homing" | "calibrating"
   shelf: number
   homed: boolean
+  /** pax-agent-1.5+: the positioning the agent is actually using. */
+  positionMode?: PositionMode
+  /** pax-agent-1.5+: whether a pulse calibration is on file. */
+  calibrated?: boolean
 }
 
 /** Emitted each time the carousel passes a shelf (the per-shelf sensor). */
@@ -290,6 +322,44 @@ export interface ArrivedEvent {
    * mechanical — lower the move speed.
    */
   onSensor?: boolean
+  /** Which positioning produced this stop (pax-agent-1.5+). */
+  positionMode?: PositionMode
+  /** Sensor mode: shelf edges the distance filter threw out as bounce/re-entry. */
+  rejectedEdges?: number
+}
+
+/**
+ * Result of a `calibrate` run (servo). Also sent on connect when the agent has
+ * a calibration on file (`restored: true` when it came from disk or the app
+ * rather than a fresh measurement).
+ */
+export interface CalibrationEvent {
+  type: "calibration"
+  ok: boolean
+  message: string
+  /** Pulses for one full turn of the carousel (both motors in lockstep). */
+  pulsesPerRev?: number
+  /** `pulsesPerRev / shelves`, rounded. */
+  pulsesPerShelf?: number | null
+  /** Width of the index sensor's window in pulses, in the homing direction. */
+  indexWindowPulses?: number | null
+  /** Shelf-flag edges seen during the measuring turn (should equal `shelves`). */
+  shelfFlagsSeen?: number | null
+  shelves?: number | null
+  /** Odometer correction applied at the most recent home pass, in pulses. */
+  lastDriftPulses?: number | null
+  restored?: boolean
+}
+
+/**
+ * Pulse mode: the index flag passed the sensor mid-move and the odometer was
+ * corrected by `driftPulses` without stopping. Small values are normal; more
+ * than half a `pulsesPerShelf` also raises a `fault`.
+ */
+export interface SyncEvent {
+  type: "sync"
+  driftPulses: number
+  pulsesPerShelf: number
 }
 
 /** Homing finished; `shelf` is the index the machine settled on (usually 0). */
@@ -397,6 +467,8 @@ export type NodeEvent =
   | SensorEvent
   | ServoEvent
   | FaultEvent
+  | CalibrationEvent
+  | SyncEvent
   | NetEvent
 
 // ---------------------------------------------------------------------------
@@ -435,6 +507,8 @@ export function parseEvent(data: string): NodeEvent | null {
     case "sensor":
     case "servo":
     case "fault":
+    case "calibration":
+    case "sync":
     case "net.status":
     case "net.scan":
     case "net.result":
