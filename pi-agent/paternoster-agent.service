@@ -36,12 +36,6 @@ WorkingDirectory=__DIR__
 # makes `journalctl` show only systemd's own "Started ..." lines and none of the
 # agent's, which reads as a dead agent even when it is running perfectly.
 Environment=PYTHONUNBUFFERED=1
-# Clean up before starting, as root (`+`): stop a stray agent on this port,
-# reset the hardware-PWM channels a previous run may have left exported and
-# root-owned, and hand /sys/class/pwm to the gpio group. Without this a stale
-# process or stale PWM state makes the agent fail with "address in use" /
-# "GPIO busy" and restart forever. `-` means a clean system is not an error.
-ExecStartPre=-+/usr/local/sbin/pax-agent-prestart __PORT__
 ExecStart=/usr/bin/python3 __DIR__/paternoster_agent.py --name "__NAME__" --shelves __SHELVES__ --port __PORT__ __EXTRA_ARGS__
 # Set by install.sh when needed (a Pi 5 requires the lgpio pin factory).
 __ENVIRONMENT__
