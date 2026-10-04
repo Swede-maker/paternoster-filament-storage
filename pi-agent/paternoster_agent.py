@@ -222,6 +222,10 @@ STOP_RAMP_SECONDS = 0.25
 DECEL_LEG_FRACTION = 0.6
 PULSE_TIMEOUT = 8.0   # seconds to wait for the next shelf pulse before faulting
 HOME_TIMEOUT = 30.0   # seconds to find the index sensor before faulting
+# The servo build turns the carousel through a 1:50 gearbox and is a good deal
+# slower between flags than the DC build these timeouts were tuned on, so give
+# it twice as long before calling a move or a homing run stuck. DC keeps 1x.
+SERVO_TIMEOUT_SCALE = 2.0
 # How often a long sensor wait re-checks for an emergency stop. Small enough to
 # feel instant to an operator, large enough not to spin the CPU.
 ABORT_POLL_SECONDS = 0.02
@@ -2030,6 +2034,10 @@ class Carousel:
             if snap:
                 self.emit(snap)
 
+    def _timeout_scale(self) -> float:
+        """Stuck-detection allowance for the drive in use: servo gets 2x, DC 1x."""
+        return SERVO_TIMEOUT_SCALE if getattr(self.hw, "motor_mode", "dc") == "servo" else 1.0
+
     def _await(self, wait_fn, timeout: float) -> bool:
         """
         Abort-aware wrapper around a blocking sensor wait.
@@ -2116,7 +2124,9 @@ class Carousel:
             self._await_stepping(self.hw.index_clear, INDEX_CLEAR_TIMEOUT, _home_ramp_step)
             self.hw.reset_pulses()  # ignore the edge produced by leaving the flag
 
-        found = self._await_stepping(self.hw.take_index_pulse, HOME_TIMEOUT, _home_ramp_step)
+        found = self._await_stepping(
+            self.hw.take_index_pulse, HOME_TIMEOUT * self._timeout_scale(), _home_ramp_step
+        )
         self.hw.stop()
         if self._abort.is_set():
             self.status = "idle"
@@ -2402,7 +2412,9 @@ class Carousel:
         # slow-but-healthy move. Scaled by duty because a lower PWM legitimately
         # takes longer to reach the next shelf.
         # ------------------------------------------------------------------
-        silence_limit = PULSE_TIMEOUT * (MOVE_SPEED / max(0.01, cruise)) + self._ramp_seconds()
+        silence_limit = (
+            PULSE_TIMEOUT * self._timeout_scale() * (MOVE_SPEED / max(0.01, cruise)) + self._ramp_seconds()
+        )
         last_trigger = time.monotonic()
 
         while True:
