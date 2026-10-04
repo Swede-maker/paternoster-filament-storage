@@ -536,6 +536,7 @@ export function sendCommand(ip: string, port: number, cmd: NodeCommand): boolean
     if (cmd.servoPulsesPerRev !== undefined) relay.motion.servoPulsesPerRev = cmd.servoPulsesPerRev
     if (cmd.servoMaxPps !== undefined) relay.motion.servoMaxPps = cmd.servoMaxPps
     if (cmd.servoMirrorB !== undefined) relay.motion.servoMirrorB = cmd.servoMirrorB
+    if (cmd.servoIgnoreAlarm !== undefined) relay.motion.servoIgnoreAlarm = cmd.servoIgnoreAlarm
     if (cmd.servoHoldTimeoutS !== undefined) relay.motion.servoHoldTimeoutS = cmd.servoHoldTimeoutS
     if (cmd.shelves > 0) relay.shelves = cmd.shelves
   }

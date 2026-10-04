@@ -290,7 +290,11 @@ type ServoNode = {
   servoJogPulses?: number
   dcJogMs?: number
   servoMirrorB?: boolean
+  servoIgnoreAlarm?: boolean
   servoHoldTimeoutS?: number
+}
+export function servoIgnoreAlarmFor(node: ServoNode): boolean {
+  return node.servoIgnoreAlarm === true
 }
 
 export function isServoNode(node: ServoNode): boolean {

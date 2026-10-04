@@ -819,6 +819,11 @@ export interface StorageNode {
   /** Invert motor B's direction (motors mounted facing each other). Both drives. */
   servoMirrorB?: boolean
   /**
+   * Servo only: ignore the drives' ALM inputs. The pins have a pull-up, so an
+   * unwired ALM+/ALM− reads as a permanent alarm and blocks every move.
+   */
+  servoIgnoreAlarm?: boolean
+  /**
    * Servo only: idle seconds before the agent releases the servos so the
    * carousel can be moved by hand. 0 = hold always (until the supply is off).
    */

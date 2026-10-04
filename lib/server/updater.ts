@@ -36,10 +36,47 @@ export type UpdateStatus = {
 }
 
 const APP_DIR = process.cwd()
-const DATA_DIR = process.env.PAX_DATA_DIR
-  ?? (process.env.PATERNOSTER_DB_PATH ? path.dirname(process.env.PATERNOSTER_DB_PATH) : "")
-const BRANCH = process.env.PAX_BRANCH || "main"
 const UPDATER_BIN = "/usr/local/sbin/pax-update"
+/** Written by setup.sh; the fallback when the service env has no PAX_* vars. */
+const INSTALL_STATE = "/etc/pax-install.conf"
+const DEFAULT_DATA_DIR = "/var/lib/pax"
+
+let DATA_DIR = ""
+let BRANCH = "main"
+
+/**
+ * The service unit normally passes PAX_DATA_DIR / PAX_BRANCH. An app that was
+ * updated some other way (git pull by hand, an older setup.sh) runs under the
+ * old unit without them, so fall back to the installer's state file and then
+ * to the standard data directory before deciding this is not a Pi.
+ */
+async function resolveInstall(): Promise<void> {
+  if (DATA_DIR) return
+  const env = process.env
+  if (env.PAX_BRANCH) BRANCH = env.PAX_BRANCH
+  if (env.PAX_DATA_DIR) {
+    DATA_DIR = env.PAX_DATA_DIR
+    return
+  }
+  if (env.PATERNOSTER_DB_PATH) {
+    DATA_DIR = path.dirname(env.PATERNOSTER_DB_PATH)
+    return
+  }
+  try {
+    const state = await fs.readFile(INSTALL_STATE, "utf8")
+    const get = (key: string) => state.match(new RegExp(`^${key}=(.*)$`, "m"))?.[1]?.trim()
+    const branch = get("branch")
+    if (branch && !env.PAX_BRANCH) BRANCH = branch
+    const dataDir = get("data_dir")
+    if (dataDir) {
+      DATA_DIR = dataDir
+      return
+    }
+    if (await exists(DEFAULT_DATA_DIR)) DATA_DIR = DEFAULT_DATA_DIR
+  } catch {
+    // No state file: not installed with setup.sh.
+  }
+}
 
 const REQUEST_FILE = () => path.join(DATA_DIR, "update.request")
 const LOG_FILE = () => path.join(DATA_DIR, "update.log")
@@ -68,9 +105,12 @@ async function exists(p: string): Promise<boolean> {
 }
 
 async function installedOnPi(): Promise<string | undefined> {
-  if (!DATA_DIR) return "The app is not running from a Pi installation (no data directory configured)."
+  await resolveInstall()
+  if (!DATA_DIR) {
+    return "This copy of the app was not installed by the Pi installer (no /etc/pax-install.conf and no PAX_DATA_DIR). Updating from here only works on a Raspberry Pi set up with the one-line installer."
+  }
   if (!(await exists(UPDATER_BIN))) {
-    return "The updater is not installed. Run setup.sh once over SSH to add it; after that updates can be started from here."
+    return "The updater service is not installed on this Pi yet. Run the one-line installer over SSH once more; it adds the updater and from then on updates start from here."
   }
   if (!(await exists(path.join(APP_DIR, ".git")))) return "The app directory is not a git checkout."
   return undefined

@@ -111,6 +111,38 @@ if getent group gpio >/dev/null 2>&1; then
   echo "[install] added $RUN_USER to the gpio group"
 fi
 
+# --- hardware PWM for the servo pulse pins ------------------------------------
+# GPIO 12/13 carry PWM0/PWM1. Routing them to the PWM peripheral lets the agent
+# generate the servo pulse train in hardware (any rate up to the drive's
+# 300 kHz, no jitter) instead of timing edges in software (a few kHz, tops).
+# Harmless for DC builds: GPIO 12/13 are unused there. Needs a reboot to apply.
+BOOT_CONF=/boot/firmware/config.txt
+[[ -f "$BOOT_CONF" ]] || BOOT_CONF=/boot/config.txt
+PWM_OVERLAY="dtoverlay=pwm-2chan,pin=12,func=4,pin2=13,func2=4"
+NEED_REBOOT=0
+if [[ -f "$BOOT_CONF" ]]; then
+  if grep -q "^dtoverlay=pwm" "$BOOT_CONF"; then
+    echo "[install] hardware PWM overlay already present in $BOOT_CONF"
+  else
+    printf '\n# PAX: hardware PWM on GPIO 12/13 for the servo PUL signals\n%s\n' "$PWM_OVERLAY" >> "$BOOT_CONF"
+    echo "[install] enabled hardware PWM overlay in $BOOT_CONF (reboot to apply)"
+    NEED_REBOOT=1
+  fi
+fi
+# Raspberry Pi OS ships a udev rule handing /sys/class/pwm to the gpio group;
+# older images do not, so add one if none mentions pwm.
+if ! grep -qs 'SUBSYSTEM=="pwm' /etc/udev/rules.d/*.rules /lib/udev/rules.d/*.rules 2>/dev/null; then
+  cat > /etc/udev/rules.d/99-pax-pwm.rules <<'EOF'
+SUBSYSTEM=="pwm*", PROGRAM="/bin/sh -c '\
+  chown -R root:gpio /sys/class/pwm && chmod -R 770 /sys/class/pwm;\
+  chown -R root:gpio /sys/devices/platform/soc/*.pwm/pwm/pwmchip* && chmod -R 770 /sys/devices/platform/soc/*.pwm/pwm/pwmchip*;\
+  chown -R root:gpio /sys/devices/platform/axi/*.pcie/*.rp1/*.pwm/pwm/pwmchip* && chmod -R 770 /sys/devices/platform/axi/*.pcie/*.rp1/*.pwm/pwm/pwmchip*\
+'"
+EOF
+  udevadm control --reload-rules 2>/dev/null || true
+  echo "[install] added udev rule for PWM access"
+fi
+
 # --- motor drive ------------------------------------------------------------
 # Seed the agent's persisted drive choice so the right backend comes up on
 # first boot. Only `mode` changes; pulses/rev, pulse rate, mirror and the
@@ -335,6 +367,15 @@ if systemctl is-active --quiet paternoster-agent; then
   echo "[install] service is running"
   echo "[install] verify GPIO mode with:"
   echo "           journalctl -u paternoster-agent -n 20 --no-pager | grep -i -e gpio -e simulation"
+  if [[ $NEED_REBOOT -eq 1 ]]; then
+    echo
+    echo "================================================================"
+    echo " REBOOT NEEDED for full servo speed"
+    echo "   Hardware PWM was just enabled in $BOOT_CONF. Until the Pi"
+    echo "   reboots the servo pulses are made in software and capped at"
+    echo "   a few kHz, so the carousel runs slowly.   sudo reboot"
+    echo "================================================================"
+  fi
   if [[ $NET -eq 1 ]]; then
     echo
     echo "================================================================"

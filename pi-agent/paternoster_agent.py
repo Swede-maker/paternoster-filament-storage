@@ -49,6 +49,7 @@ import argparse
 import asyncio
 import json
 import math
+import os
 import threading
 import time
 from typing import Callable, Optional
@@ -169,6 +170,10 @@ SERVO_MAX_PPS = 8000
 # Lowest frequency the slider floor maps to; below this the carousel just
 # twitches between pulses.
 SERVO_MIN_PPS = 200
+# Highest rate software PWM is trusted to (lgpio tops out at 10 kHz; above a
+# few kHz the edges jitter and the drive loses pulses). Hardware PWM has no
+# such limit short of the drive's own 300 kHz.
+SERVO_SOFT_PWM_MAX_PPS = 5000
 # Idle frequency programmed into the PWM channel while it is switched off.
 SERVO_IDLE_HZ = 1000
 # Micro-jog pulse rate. Deliberately slow (bit-banged, exact pulse count) so a
@@ -874,6 +879,102 @@ class RealHardware:
             pass
 
 
+class _SysfsPwm:
+    """
+    One hardware PWM channel through the kernel's sysfs interface, exposing the
+    small part of gpiozero's PWMOutputDevice API the servo code uses:
+    `.frequency`, `.value` (0 = low, 1 = high, anything else = that duty) and
+    `.close()`. Writes go to /sys/class/pwm/pwmchipN/pwmM/{period,duty_cycle,enable}.
+
+    Pi 4: the pwm-2chan overlay registers pwmchip0 with 2 channels (GPIO 12 → 0,
+    GPIO 13 → 1). Pi 5: the RP1 chip registers 4 channels; with the same overlay
+    GPIO 12/13 are again channels 0/1. Both are found by scanning the chips.
+    """
+
+    PWM_ROOT = "/sys/class/pwm"
+
+    def __init__(self, chip: str, channel: int) -> None:
+        self.path = os.path.join(chip, f"pwm{channel}")
+        if not os.path.isdir(self.path):
+            with open(os.path.join(chip, "export"), "w", encoding="ascii") as fh:
+                fh.write(str(channel))
+            # udev needs a moment to chown the new channel directory.
+            for _ in range(50):
+                if os.access(os.path.join(self.path, "enable"), os.W_OK):
+                    break
+                time.sleep(0.02)
+        self._period_ns = 0
+        self._duty = 0.0
+        self._write("enable", "0")
+        self._write("duty_cycle", "0")
+        self.frequency = SERVO_IDLE_HZ
+        self._write("enable", "1")
+
+    def _write(self, name: str, text: str) -> None:
+        with open(os.path.join(self.path, name), "w", encoding="ascii") as fh:
+            fh.write(text)
+
+    @property
+    def frequency(self) -> int:
+        return int(round(1e9 / self._period_ns)) if self._period_ns else 0
+
+    @frequency.setter
+    def frequency(self, hz: float) -> None:
+        period = max(1, int(round(1e9 / max(1.0, float(hz)))))
+        if period == self._period_ns:
+            return
+        # The kernel refuses duty_cycle > period, so shrink duty before a
+        # shorter period and re-apply it afterwards.
+        self._write("duty_cycle", "0")
+        self._write("period", str(period))
+        self._period_ns = period
+        self._apply_duty()
+
+    def _apply_duty(self) -> None:
+        self._write("duty_cycle", str(int(round(self._period_ns * self._duty))))
+
+    @property
+    def value(self) -> float:
+        return self._duty
+
+    @value.setter
+    def value(self, duty: float) -> None:
+        self._duty = max(0.0, min(1.0, float(duty)))
+        self._apply_duty()
+
+    def close(self) -> None:
+        try:
+            self._write("duty_cycle", "0")
+            self._write("enable", "0")
+        except OSError:
+            pass
+
+    @classmethod
+    def open_pair(cls) -> Optional[tuple["_SysfsPwm", "_SysfsPwm"]]:
+        """Channels 0 and 1 of the first usable PWM chip, or None if there is none."""
+        if os.environ.get("PAX_SERVO_SOFT_PWM") == "1":
+            return None
+        try:
+            chips = sorted(
+                os.path.join(cls.PWM_ROOT, d) for d in os.listdir(cls.PWM_ROOT) if d.startswith("pwmchip")
+            )
+        except OSError:
+            return None
+        for chip in chips:
+            try:
+                with open(os.path.join(chip, "npwm"), encoding="ascii") as fh:
+                    if int(fh.read().strip() or 0) < 2:
+                        continue
+                a = cls(chip, 0)
+                b = cls(chip, 1)
+            except (OSError, ValueError) as exc:
+                print(f"[agent] hardware PWM at {chip} not usable: {exc}", flush=True)
+                continue
+            print(f"[agent] servo PUL on hardware PWM ({chip} ch0/ch1)", flush=True)
+            return (a, b)
+        return None
+
+
 class ServoHardware(RealHardware):
     """
     Two iSV57T integrated servos driven by pulse (PUL) and direction (DIR).
@@ -906,19 +1007,46 @@ class ServoHardware(RealHardware):
         pulses_per_rev: int = SERVO_PULSES_PER_REV,
         max_pps: int = SERVO_MAX_PPS,
         mirror_b: bool = SERVO_MIRROR_B,
+        ignore_alarm: bool = False,
     ) -> None:
         self.pulses_per_rev = max(1, int(pulses_per_rev))
         self.max_pps = max(SERVO_MIN_PPS, min(300_000, int(max_pps)))
         self.mirror_b = bool(mirror_b)
+        # ALM has a pull-up, so an UNWIRED ALM pin reads exactly like a tripped
+        # drive. Builds without ALM+/ALM- connected set this to run anyway.
+        self.ignore_alarm = bool(ignore_alarm)
+        # Filled in by _init_motor: "hardware" (sysfs PWM peripheral) or
+        # "software" (gpiozero timing the edges), and the highest pulse rate the
+        # chosen path can actually produce.
+        self.pulse_backend = "software"
+        self.pps_cap = SERVO_SOFT_PWM_MAX_PPS
         super().__init__()
 
     def _init_motor(self) -> None:
         from gpiozero import PWMOutputDevice, DigitalOutputDevice, DigitalInputDevice
 
-        self.pul = (
-            PWMOutputDevice(PIN_SERVO_PUL_A, frequency=SERVO_IDLE_HZ, initial_value=0),
-            PWMOutputDevice(PIN_SERVO_PUL_B, frequency=SERVO_IDLE_HZ, initial_value=0),
-        )
+        # GPIO 12/13 are the Pi's hardware PWM pins (PWM0/PWM1). With the
+        # pwm-2chan overlay the peripheral makes the pulse train itself — any
+        # rate up to the drive's 300 kHz with no jitter. Software PWM (gpiozero
+        # timing each edge) is the fallback; usable to a few kHz only.
+        hw = _SysfsPwm.open_pair()
+        if hw is not None:
+            self.pul = hw
+            self.pulse_backend = "hardware"
+            self.pps_cap = 300_000
+        else:
+            self.pul = (
+                PWMOutputDevice(PIN_SERVO_PUL_A, frequency=SERVO_IDLE_HZ, initial_value=0),
+                PWMOutputDevice(PIN_SERVO_PUL_B, frequency=SERVO_IDLE_HZ, initial_value=0),
+            )
+            self.pulse_backend = "software"
+            self.pps_cap = SERVO_SOFT_PWM_MAX_PPS
+            print(
+                "[agent] servo PUL on software PWM (max ~%d pps). For full speed enable hardware "
+                "PWM: dtoverlay=pwm-2chan,pin=12,func=4,pin2=13,func2=4 in config.txt (install.sh "
+                "does this) and reboot." % SERVO_SOFT_PWM_MAX_PPS,
+                flush=True,
+            )
         self.dir = (
             DigitalOutputDevice(PIN_SERVO_DIR_A, initial_value=False),
             DigitalOutputDevice(PIN_SERVO_DIR_B, initial_value=False),
@@ -975,7 +1103,8 @@ class ServoHardware(RealHardware):
 
     def _hz_for(self, speed: float) -> int:
         speed = max(0.0, min(1.0, float(speed)))
-        return max(SERVO_MIN_PPS, int(round(speed * self.max_pps)))
+        top = min(self.max_pps, self.pps_cap)
+        return max(SERVO_MIN_PPS, int(round(speed * top)))
 
     def _run_pulses(self, forward: bool, speed: float) -> None:
         self.engage()
@@ -1053,16 +1182,22 @@ class ServoHardware(RealHardware):
                     self.pul[i].value = 0
                 time.sleep(half)
 
-    def set_servo_params(self, pulses_per_rev=None, max_pps=None, mirror_b=None, **_: object) -> None:
+    def set_servo_params(
+        self, pulses_per_rev=None, max_pps=None, mirror_b=None, ignore_alarm=None, **_: object
+    ) -> None:
         if pulses_per_rev is not None:
             self.pulses_per_rev = max(1, int(pulses_per_rev))
         if max_pps is not None:
             self.max_pps = max(SERVO_MIN_PPS, min(300_000, int(max_pps)))
         if mirror_b is not None:
             self.mirror_b = bool(mirror_b)
+        if ignore_alarm is not None:
+            self.ignore_alarm = bool(ignore_alarm)
 
     def alarms(self) -> tuple[bool, bool]:
         """(motor A alarm, motor B alarm) — True when the drive has tripped."""
+        if self.ignore_alarm:
+            return (False, False)
         return (not self.alm[0].is_active, not self.alm[1].is_active)
 
     def servo_snapshot(self) -> Optional[dict]:
@@ -1072,8 +1207,11 @@ class ServoHardware(RealHardware):
             "mode": "servo",
             "alarmA": a,
             "alarmB": b,
+            "ignoreAlarm": self.ignore_alarm,
             "pulsesPerRev": self.pulses_per_rev,
             "maxPps": self.max_pps,
+            "pulseBackend": self.pulse_backend,
+            "ppsCap": self.pps_cap,
             "mirrorB": self.mirror_b,
             "held": self._held,
         }
@@ -1475,16 +1613,17 @@ class Carousel:
         if shelves > 0:
             self.shelves = shelves
 
-    def set_servo(self, pulses_per_rev=None, max_pps=None, mirror_b=None) -> None:
+    def set_servo(self, pulses_per_rev=None, max_pps=None, mirror_b=None, ignore_alarm=None) -> None:
         """Forward servo tuning from the app's `config` to the servo backend."""
         setter = getattr(self.hw, "set_servo_params", None)
         if setter is None:
             return
-        setter(pulses_per_rev=pulses_per_rev, max_pps=max_pps, mirror_b=mirror_b)
-        if any(v is not None for v in (pulses_per_rev, max_pps, mirror_b)):
+        setter(pulses_per_rev=pulses_per_rev, max_pps=max_pps, mirror_b=mirror_b, ignore_alarm=ignore_alarm)
+        if any(v is not None for v in (pulses_per_rev, max_pps, mirror_b, ignore_alarm)):
             print(
                 f"[agent] servo set: ppr={getattr(self.hw, 'pulses_per_rev', '?')} "
-                f"max_pps={getattr(self.hw, 'max_pps', '?')} mirror_b={getattr(self.hw, 'mirror_b', '?')}",
+                f"max_pps={getattr(self.hw, 'max_pps', '?')} mirror_b={getattr(self.hw, 'mirror_b', '?')} "
+                f"ignore_alarm={getattr(self.hw, 'ignore_alarm', '?')}",
                 flush=True,
             )
 
@@ -2675,6 +2814,7 @@ async def serve(args) -> None:
         "pulses_per_rev": motor_conf.get("pulsesPerRev", SERVO_PULSES_PER_REV),
         "max_pps": motor_conf.get("maxPps", SERVO_MAX_PPS),
         "mirror_b": motor_conf.get("mirrorB", SERVO_MIRROR_B),
+        "ignore_alarm": bool(motor_conf.get("ignoreAlarm", False)),
     }
     hold_timeout_s = motor_conf.get("holdTimeoutS", SERVO_HOLD_TIMEOUT_S)
 
@@ -2855,6 +2995,7 @@ async def serve(args) -> None:
                         "pulses_per_rev": msg.get("servoPulsesPerRev"),
                         "max_pps": msg.get("servoMaxPps"),
                         "mirror_b": msg.get("servoMirrorB"),
+                        "ignore_alarm": msg.get("servoIgnoreAlarm"),
                     }
                     if any(v is not None for v in servo_fields.values()):
                         for k, v in servo_fields.items():
@@ -2869,12 +3010,15 @@ async def serve(args) -> None:
                             "pulsesPerRev": servo_params["pulses_per_rev"],
                             "maxPps": servo_params["max_pps"],
                             "mirrorB": servo_params["mirror_b"],
+                            "ignoreAlarm": bool(servo_params["ignore_alarm"]),
                             "holdTimeoutS": carousel.hold_timeout_s,
                         })
                     if want in ("dc", "servo") and want != rt["mode"]:
                         switch_motor_mode(want)
                     carousel.set_servo(**servo_fields)
-                    if hold is not None:
+                    # The alarm flags in the status come from this switch, so
+                    # the app must see the new reading right away.
+                    if hold is not None or servo_fields["ignore_alarm"] is not None:
                         snap = carousel.servo_snapshot()
                         if snap:
                             broadcast(snap)

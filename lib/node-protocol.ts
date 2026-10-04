@@ -88,6 +88,8 @@ export interface ConfigCommand {
    * to both drives (DIR line on the servos, RPWM/LPWM swap on the DC bridge).
    */
   servoMirrorB?: boolean
+  /** Servo only: treat the ALM inputs as healthy (ALM+/ALM− not wired). */
+  servoIgnoreAlarm?: boolean
   /**
    * Servo only: idle seconds before the agent de-energises the drives so the
    * carousel can be moved by hand. 0 = never release (hold with full torque
@@ -243,6 +245,10 @@ export interface ServoEvent {
   alarmB?: boolean
   pulsesPerRev?: number
   maxPps?: number
+  /** How the agent makes the PUL train: the PWM peripheral, or software-timed edges. */
+  pulseBackend?: "hardware" | "software"
+  /** Highest pulse rate that backend can produce; the agent clamps maxPps to it. */
+  ppsCap?: number
   mirrorB?: boolean
   /** Servo drive: true while the motors are energised and holding position (pax-agent-1.4+). */
   held?: boolean

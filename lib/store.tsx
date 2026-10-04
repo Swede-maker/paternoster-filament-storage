@@ -724,6 +724,7 @@ export type Action =
           | "servoJogPulses"
           | "dcJogMs"
           | "servoMirrorB"
+          | "servoIgnoreAlarm"
           | "servoHoldTimeoutS"
         >
       >
