@@ -966,6 +966,38 @@ def _line_consumer(pin: int) -> str:
     return ""
 
 
+def _other_gpio_processes() -> list[str]:
+    """'pid cmdline' for every other process with /dev/gpiochip* open (from /proc)."""
+    me = os.getpid()
+    found: list[str] = []
+    try:
+        pids = [int(p) for p in os.listdir("/proc") if p.isdigit()]
+    except OSError:
+        return found
+    for pid in pids:
+        if pid == me:
+            continue
+        fd_dir = f"/proc/{pid}/fd"
+        try:
+            for fd in os.listdir(fd_dir):
+                try:
+                    target = os.readlink(os.path.join(fd_dir, fd))
+                except OSError:
+                    continue
+                if target.startswith("/dev/gpiochip"):
+                    try:
+                        with open(f"/proc/{pid}/cmdline", "rb") as fh:
+                            cmd = fh.read().replace(b"\0", b" ").decode(errors="replace").strip()
+                    except OSError:
+                        cmd = "?"
+                    found.append(f"pid {pid} ({cmd[:100]})")
+                    break
+        except OSError:
+            # Another user's process: /proc/<pid>/fd is not readable.
+            continue
+    return found
+
+
 def _claim(label: str, factory, pin: int, **kwargs):
     """
     Create a gpiozero device, re-raising any failure with the pin NAMED and,
@@ -979,7 +1011,18 @@ def _claim(label: str, factory, pin: int, **kwargs):
         hint = ""
         if "busy" in str(exc).lower():
             holder = _line_consumer(pin)
-            if holder:
+            if holder == "lg":
+                # 'lg' is lgpio's own consumer name: another lgpio PROCESS has
+                # the line (usually a second copy of this agent). Name it.
+                others = _other_gpio_processes()
+                if others:
+                    hint = " — held by another lgpio process: " + "; ".join(others)
+                else:
+                    hint = (
+                        " — held by another lgpio process that has since gone (or is not visible "
+                        "to this user). `sudo fuser -v /dev/gpiochip*` shows it."
+                    )
+            elif holder:
                 hint = f" — the kernel says this line is held by '{holder}'"
             else:
                 hint = (
