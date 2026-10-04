@@ -231,7 +231,19 @@ export function ServoJogPanel({ node }: { node: StorageNode }) {
         </span>
       </div>
 
-      {hardware && online && !agentReady && (
+      {hardware && online && node.agentSimulated && (
+        <div className="mt-2 rounded-lg border border-destructive/40 bg-destructive/10 px-3 py-2">
+          <p className="text-sm font-medium text-destructive">The agent is not driving the GPIO pins</p>
+          <p className="mt-1 text-xs leading-relaxed text-destructive/90 text-pretty">
+            It could not open the motor hardware at start-up and is simulating instead, so nothing here reaches the
+            motors{node.agentSimReason ? ` (${node.agentSimReason})` : ""}. On the Pi, run{" "}
+            <span className="font-mono">journalctl -u paternoster-agent -n 40</span> for the reason, fix it, then{" "}
+            <span className="font-mono">sudo systemctl restart paternoster-agent</span>.
+          </p>
+        </div>
+      )}
+
+      {hardware && online && !agentReady && !node.agentSimulated && (
         <p className="mt-2 text-xs leading-relaxed text-warning text-pretty">
             The Pi agent has not confirmed the {servo ? "servo" : "DC"} drive yet. It switches as soon as it is idle and
             receives this unit&apos;s settings. If this stays, the agent on the Pi is an older version — update it with{" "}
