@@ -167,40 +167,22 @@ export function MotorDriveEditor({ node }: { node: StorageNode }) {
               1. Only changes how speeds and jog steps are shown; the carousel still stops on the shelf sensor.
             </p>
           </Field>
-          <Field label="Top speed at the sprocket (rpm)" htmlFor={`sprocket-rpm-${node.id}`}>
-            <Input
-              id={`sprocket-rpm-${node.id}`}
-              type="number"
-              inputMode="decimal"
-              min={0.1}
-              step="any"
-              value={Number(servoSprocketRpmFor(node, 1).toFixed(2))}
-              onChange={(e) => {
-                const rpm = Number.parseFloat(e.target.value)
-                if (!Number.isFinite(rpm) || rpm <= 0) return
-                // Same stored value as the pulse-rate field, entered the way
-                // the operator thinks about it: G = rpm × ratio × N / 60.
-                const pps = Math.round((rpm * gearRatio * ppr) / 60)
-                update({ servoMaxPps: Math.max(MIN_SERVO_MAX_PPS, Math.min(MAX_SERVO_MAX_PPS, pps)) })
-              }}
-            />
-            <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
-              {formatSeconds(servoSecondsPerSprocketRev(node, 1))} per full turn at 100 %. This sets the pulse rate
-              above; the Motor speed and Approach sliders are a share of it.
-            </p>
-          </Field>
-          {node.servo?.pulseBackend === "software" && (
-            <div className="rounded-lg border border-destructive/40 bg-destructive/10 px-3 py-2 sm:col-span-2">
-              <p className="text-sm font-medium text-destructive">Pulses are made in software on this Pi</p>
-              <p className="mt-1 text-xs leading-relaxed text-destructive/90 text-pretty">
-                The agent reports its pulse train is software-timed and capped at{" "}
-                {(node.servo.ppsCap ?? 0).toLocaleString()} pulses/s — about{" "}
-                {formatRpm(((node.servo.ppsCap ?? 0) * 60) / ppr / gearRatio)} rpm at the sprocket
-                regardless of the settings above. Run the installer so it enables hardware PWM on GPIO 12/13, then
-                reboot the Pi.
+          <div className="flex flex-col justify-end">
+            <div className="rounded-lg border border-border bg-secondary/30 px-3 py-2">
+              <p className="text-xs uppercase tracking-wider text-muted-foreground">At the sprocket, 100 %</p>
+              <p className="mt-0.5 font-mono text-sm text-foreground">
+                {formatRpm(servoSprocketRpmFor(node, 1))} rpm
+                <span className="text-muted-foreground">
+                  {" · "}
+                  {formatSeconds(servoSecondsPerSprocketRev(node, 1))} per full turn
+                </span>
+              </p>
+              <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
+                The Motor speed and Approach sliders in Manual control show their speeds in sprocket rpm using this
+                ratio.
               </p>
             </div>
-          )}
+          </div>
         </div>
       )}
 
