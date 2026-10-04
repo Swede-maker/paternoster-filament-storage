@@ -365,15 +365,12 @@ if ! command -v fuser >/dev/null 2>&1; then
   apt-get install -y -qq psmisc >/dev/null 2>&1 || echo "[install] warning: could not install psmisc (fuser)"
 fi
 
-# Stop anything already serving this port that systemd does not know about —
-# an agent started by hand for testing is the classic case. The service's own
-# ExecStartPre does the same on every later start.
-STRAY=$(fuser "$PORT"/tcp 2>/dev/null || true)
-if [[ -n "$STRAY" ]]; then
-  echo "[install] stopping stray process on port $PORT (pid$STRAY)"
-  fuser -k -TERM "$PORT"/tcp >/dev/null 2>&1 || true
-  sleep 1
-fi
+# The unit's ExecStartPre runs this as root on every start: stops a stray
+# agent on the port, resets stale hardware-PWM channels, fixes /sys/class/pwm
+# permissions. Run it once now too so the first start after install is clean.
+install -m 0755 "$DIR/pax-agent-prestart.sh" /usr/local/sbin/pax-agent-prestart
+systemctl stop paternoster-agent >/dev/null 2>&1 || true
+/usr/local/sbin/pax-agent-prestart "$PORT" || true
 
 systemctl daemon-reload
 systemctl enable paternoster-agent >/dev/null 2>&1 || true

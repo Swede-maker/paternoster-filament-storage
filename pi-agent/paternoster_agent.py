@@ -881,6 +881,38 @@ class RealHardware:
             pass
 
 
+def _claim(label: str, factory, pin: int, **kwargs):
+    """
+    Create a gpiozero device, re-raising any failure with the pin NAMED. lgpio's
+    own message is just "GPIO busy" / "GPIO not allocated", which says nothing
+    about which of the eight servo lines is the problem.
+    """
+    try:
+        return factory(pin, **kwargs)
+    except Exception as exc:
+        hint = ""
+        if "busy" in str(exc).lower():
+            hint = (
+                " — another process holds this line (an old agent? `sudo fuser -v /dev/gpiochip*`), "
+                "or a device-tree overlay reserved it"
+            )
+        raise RuntimeError(f"cannot claim GPIO {pin} for servo {label}: {exc}{hint}") from exc
+
+
+def _owner_of(path: str) -> str:
+    """'user:group mode' of a path, for permission error messages."""
+    try:
+        import grp
+        import pwd
+
+        st = os.stat(path)
+        user = pwd.getpwuid(st.st_uid).pw_name
+        group = grp.getgrgid(st.st_gid).gr_name
+        return f"{user}:{group} {oct(st.st_mode & 0o777)}"
+    except Exception:
+        return "unknown"
+
+
 class _SysfsPwm:
     """
     One hardware PWM channel through the kernel's sysfs interface, exposing the
@@ -897,14 +929,38 @@ class _SysfsPwm:
 
     def __init__(self, chip: str, channel: int) -> None:
         self.path = os.path.join(chip, f"pwm{channel}")
+        if os.path.isdir(self.path):
+            # Left over from a previous run (or a `sudo` test). Unexport and
+            # re-export so we start from a known state AND udev re-applies the
+            # gpio-group ownership; a root-owned channel would otherwise give
+            # EACCES here. If unexport is not permitted, use it as it is.
+            try:
+                with open(os.path.join(self.path, "enable"), "w", encoding="ascii") as fh:
+                    fh.write("0")
+            except OSError:
+                pass
+            try:
+                with open(os.path.join(chip, "unexport"), "w", encoding="ascii") as fh:
+                    fh.write(str(channel))
+                for _ in range(25):
+                    if not os.path.isdir(self.path):
+                        break
+                    time.sleep(0.02)
+            except OSError:
+                pass
         if not os.path.isdir(self.path):
             with open(os.path.join(chip, "export"), "w", encoding="ascii") as fh:
                 fh.write(str(channel))
-            # udev needs a moment to chown the new channel directory.
-            for _ in range(50):
-                if os.access(os.path.join(self.path, "enable"), os.W_OK):
-                    break
-                time.sleep(0.02)
+        # udev needs a moment to chown the channel directory to the gpio group.
+        for _ in range(100):
+            if os.access(os.path.join(self.path, "enable"), os.W_OK):
+                break
+            time.sleep(0.02)
+        if not os.access(os.path.join(self.path, "enable"), os.W_OK):
+            raise PermissionError(
+                f"{self.path} is not writable by this user (owned by "
+                f"{_owner_of(self.path)}); the gpio-group udev rule for pwm is missing or did not fire"
+            )
         # The kernel rejects ANY state with period 0 (enable, duty, everything),
         # so on a freshly exported channel the period must be written first.
         # A channel left over from a previous run may be enabled with a stale
@@ -984,6 +1040,19 @@ class _SysfsPwm:
             )
         except OSError:
             return None
+
+        # The chip NUMBER is not stable (Pi 5 has two RP1 PWM blocks and a
+        # fan controller that also registers as a pwmchip), but the block that
+        # drives GPIO 12/13 has a fixed address: 1f00098000.pwm on the Pi 5
+        # (RP1 pwm0), fe20c000.pwm on the Pi 4 / 3f20c000.pwm on the Pi 3.
+        # Try that one first so we never grab the fan's channels by mistake.
+        def rank(chip: str) -> int:
+            real = os.path.realpath(chip)
+            if "98000.pwm" in real or "20c000.pwm" in real:
+                return 0
+            return 1
+
+        chips.sort(key=rank)
         for chip in chips:
             try:
                 with open(os.path.join(chip, "npwm"), encoding="ascii") as fh:
@@ -1058,23 +1127,21 @@ class ServoHardware(RealHardware):
             self.pul = hw
             self.pulse_backend = "hardware"
             self.pps_cap = 300_000
+        elif _SysfsPwm.chips_present():
+            # The pwm overlay is active, so GPIO 12/13 belong to the PWM block
+            # and lgpio would only answer "GPIO busy". Do not even try the
+            # software fallback: say what is actually wrong.
+            raise RuntimeError(
+                "hardware PWM overlay is active but no PWM channel pair could be opened "
+                f"(see the 'hardware PWM ... not usable' line above). Usually /sys/class/pwm is not "
+                f"writable by {RUN_USER_HINT}: re-run install.sh (adds the udev rule and the root "
+                "pre-start cleanup), or `sudo systemctl restart paternoster-agent`."
+            )
         else:
-            try:
-                self.pul = (
-                    PWMOutputDevice(PIN_SERVO_PUL_A, frequency=SERVO_IDLE_HZ, initial_value=0),
-                    PWMOutputDevice(PIN_SERVO_PUL_B, frequency=SERVO_IDLE_HZ, initial_value=0),
-                )
-            except Exception as exc:
-                # Once the pwm overlay owns GPIO 12/13 they cannot be claimed as
-                # plain outputs ("GPIO busy"). Say what actually went wrong
-                # instead of letting a generic GPIO error send us to simulation.
-                if _SysfsPwm.chips_present():
-                    raise RuntimeError(
-                        f"servo PUL pins are reserved by the hardware PWM overlay but the PWM "
-                        f"channels could not be opened ({exc}). Check that {RUN_USER_HINT} may write "
-                        f"/sys/class/pwm (gpio group + udev rule) — see `journalctl -u paternoster-agent`."
-                    ) from exc
-                raise
+            self.pul = (
+                _claim("PUL A", PWMOutputDevice, PIN_SERVO_PUL_A, frequency=SERVO_IDLE_HZ, initial_value=0),
+                _claim("PUL B", PWMOutputDevice, PIN_SERVO_PUL_B, frequency=SERVO_IDLE_HZ, initial_value=0),
+            )
             self.pulse_backend = "software"
             self.pps_cap = SERVO_SOFT_PWM_MAX_PPS
             print(
@@ -1084,21 +1151,27 @@ class ServoHardware(RealHardware):
                 flush=True,
             )
         self.dir = (
-            DigitalOutputDevice(PIN_SERVO_DIR_A, initial_value=False),
-            DigitalOutputDevice(PIN_SERVO_DIR_B, initial_value=False),
+            _claim("DIR A", DigitalOutputDevice, PIN_SERVO_DIR_A, initial_value=False),
+            _claim("DIR B", DigitalOutputDevice, PIN_SERVO_DIR_B, initial_value=False),
         )
         # ALM is an opto-isolated open-collector output that CONDUCTS in normal
         # operation and goes high-impedance on a fault. With the Pi's pull-up,
         # gpiozero's `is_active` (pin LOW) therefore means "healthy".
         self.alm = (
-            DigitalInputDevice(PIN_SERVO_ALM_A, pull_up=True, bounce_time=0.05),
-            DigitalInputDevice(PIN_SERVO_ALM_B, pull_up=True, bounce_time=0.05),
+            _claim("ALM A", DigitalInputDevice, PIN_SERVO_ALM_A, pull_up=True, bounce_time=0.05),
+            _claim("ALM B", DigitalInputDevice, PIN_SERVO_ALM_B, pull_up=True, bounce_time=0.05),
         )
         # Start ENGAGED (holding) so power-up matches the drive's own default.
         # `active_high` folds the opto polarity in: `.on()` always means "release".
         self.ena = (
-            DigitalOutputDevice(PIN_SERVO_ENA_A, active_high=SERVO_ENA_ACTIVE_RELEASES, initial_value=False),
-            DigitalOutputDevice(PIN_SERVO_ENA_B, active_high=SERVO_ENA_ACTIVE_RELEASES, initial_value=False),
+            _claim(
+                "ENA A", DigitalOutputDevice, PIN_SERVO_ENA_A,
+                active_high=SERVO_ENA_ACTIVE_RELEASES, initial_value=False,
+            ),
+            _claim(
+                "ENA B", DigitalOutputDevice, PIN_SERVO_ENA_B,
+                active_high=SERVO_ENA_ACTIVE_RELEASES, initial_value=False,
+            ),
         )
         self._held = True
         self._motor_lock = threading.Lock()
