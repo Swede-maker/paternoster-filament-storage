@@ -245,10 +245,6 @@ export interface ServoEvent {
   alarmB?: boolean
   pulsesPerRev?: number
   maxPps?: number
-  /** How the agent makes the PUL train: the PWM peripheral, or software-timed edges. */
-  pulseBackend?: "hardware" | "software"
-  /** Highest pulse rate that backend can produce; the agent clamps maxPps to it. */
-  ppsCap?: number
   mirrorB?: boolean
   /** Servo drive: true while the motors are energised and holding position (pax-agent-1.4+). */
   held?: boolean
