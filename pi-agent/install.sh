@@ -17,6 +17,8 @@
 #       are optional if the slave is on the same network as the master right
 #       now: it fetches them from the master on first registration.
 #   --no-net            skip all Wi-Fi/hostname setup (wired lab bench)
+#   --motor dc|servo    which drive is wired to this Pi; written to
+#                       /var/lib/pax-agent/motor.json (other tuning kept)
 #
 # Detects the invoking user and this directory instead of assuming `pi` and
 # /home/pi, which is what previously caused `status=217/USER` on systems where no
@@ -35,9 +37,11 @@ MASTER_HOST="pax-master.local"
 AP_SSID=""
 AP_PSK=""
 NET=1
+MOTOR=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --motor) MOTOR="$2"; shift 2 ;;
     --name) NAME="$2"; shift 2 ;;
     --shelves) SHELVES="$2"; shift 2 ;;
     --port) PORT="$2"; shift 2 ;;
@@ -55,6 +59,10 @@ done
 
 if [[ "$ROLE" != "master" && "$ROLE" != "slave" ]]; then
   echo "error: --role must be master or slave" >&2
+  exit 2
+fi
+if [[ -n "$MOTOR" && "$MOTOR" != "dc" && "$MOTOR" != "servo" ]]; then
+  echo "error: --motor must be dc or servo" >&2
   exit 2
 fi
 
@@ -101,6 +109,32 @@ fi
 if getent group gpio >/dev/null 2>&1; then
   usermod -aG gpio "$RUN_USER"
   echo "[install] added $RUN_USER to the gpio group"
+fi
+
+# --- motor drive ------------------------------------------------------------
+# Seed the agent's persisted drive choice so the right backend comes up on
+# first boot. Only `mode` changes; pulses/rev, pulse rate, mirror and the
+# hold timeout the app may already have tuned are kept.
+MOTOR_CONF=/var/lib/pax-agent/motor.json
+if [[ -n "$MOTOR" ]]; then
+  mkdir -p "$(dirname "$MOTOR_CONF")"
+  python3 - "$MOTOR_CONF" "$MOTOR" <<'PY'
+import json, os, sys
+path, mode = sys.argv[1], sys.argv[2]
+conf = {}
+try:
+    with open(path, encoding="utf-8") as fh:
+        conf = json.load(fh) or {}
+except (OSError, ValueError):
+    pass
+conf["mode"] = mode
+tmp = path + ".tmp"
+with open(tmp, "w", encoding="utf-8") as fh:
+    json.dump(conf, fh)
+os.replace(tmp, path)
+PY
+  chown -R "$RUN_USER:$RUN_USER" "$(dirname "$MOTOR_CONF")"
+  echo "[install] motor drive → $MOTOR ($MOTOR_CONF)"
 fi
 
 EXTRA_ARGS=""

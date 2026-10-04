@@ -391,6 +391,10 @@ def ap_down(cfg: Config) -> None:
         _nmcli("con", "down", PROFILE_AP)
 
 
+def ap_active(cfg: Config) -> bool:
+    return _active_profile(cfg.iface) == PROFILE_AP
+
+
 def router_up(iface: str = "wlan0") -> None:
     if not _profile_exists(PROFILE_ROUTER):
         raise NetError("no router saved yet — pick one from the Wi-Fi list first")

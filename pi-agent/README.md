@@ -10,57 +10,229 @@ physical paternoster carousel and connect it to the PAX web app.
   slaves) and they act as one combined storage pool.
 
 ```
-[ Browser / PAX app ]  --WebSocket-->  [ Pi agent ]  --GPIO-->  DC motor + 2 sensors
+[ Browser / PAX app ]  --WebSocket-->  [ Pi agent ]  --GPIO-->  motor drive + 2 sensors
 ```
+
+The agent supports two **motor drive modes**, selected in the app (setup wizard
+or *Settings → Units → Motor drive*) and persisted on the Pi in
+`/var/lib/pax-agent/motor.json`:
+
+| Mode | Hardware | Section |
+| --- | --- | --- |
+| `dc` (default) | **Two** brushed DC motors, each on its own BTS7960 / IBT-2 bridge | [DC drive](#dc-drive-two-bts7960-bridges) |
+| `servo` | **Two** StepperOnline **iSV57T** integrated servos on PUL/DIR | [Servo drive](#servo-drive-two-isv57t-on-puldir) |
+
+A carousel always has **two motors — one per chain, one on each side** (motor
+**A** and motor **B**). In both modes they run in lockstep during a move, and
+each can be **jogged on its own** from *Manual control* to level the shelves if
+the chains drift. The sensors are identical in both modes. You can also force a
+mode from the command line with `--motor dc` / `--motor servo`.
 
 ## Hardware
 
+### DC drive (two BTS7960 bridges)
+
 Each carousel uses:
 
-| Part                       | Purpose                                            |
-| -------------------------- | -------------------------------------------------- |
-| DC motor                   | Rotates the carousel.                              |
-| BTS7960 / IBT-2 43A        | Half-bridge driver. **Dual PWM**: RPWM vs LPWM picks direction. |
-| Inductive **shelf** sensor | Pulses once as **every** shelf passes the window.  |
-| Inductive **index** sensor | Active **only at shelf 1** — the home reference.   |
+| Part                       | Qty | Purpose                                            |
+| -------------------------- | --- | -------------------------------------------------- |
+| Brushed DC motor           | 2   | One per chain, one on each side of the carousel.   |
+| BTS7960 / IBT-2 43A        | 2   | One half-bridge driver **per motor**. **Dual PWM**: RPWM vs LPWM picks direction. |
+| Inductive **shelf** sensor | 1   | Pulses once as **every** shelf passes the window.  |
+| Inductive **index** sensor | 1   | Active **only at shelf 1** — the home reference.   |
+
+The agent gives both bridges the **same PWM duty and direction** during a move,
+so the two chains stay in step. Because motor B usually sits across the
+carousel from motor A, its direction is **inverted in software** by default
+(`DC_MIRROR_B = True` / *Mirror motor B* in the app) — flip that switch rather
+than rewiring if the two sides fight each other.
 
 ### Default wiring (BCM pin numbers)
 
-Edit the constants at the top of `paternoster_agent.py` to match your board.
+Edit the constants at the top of `paternoster_agent.py` (`PIN_MOTOR_A_*`,
+`PIN_MOTOR_B_*`) to match your boards.
 
-| BTS7960 pin  | Pin (BCM) | Notes                                          |
-| ------------ | --------- | ---------------------------------------------- |
-| RPWM         | GPIO 12   | PWM — drives one direction                     |
-| LPWM         | GPIO 13   | PWM — drives the other direction               |
-| R_EN + L_EN  | GPIO 22   | **Tie both to this one pin.** HIGH = armed     |
-| VCC          | 3.3 V     | Logic supply — **not** 5 V (see below)         |
-| GND          | any GND   | **Common ground** Pi ↔ driver ↔ sensors        |
-| R_IS / L_IS  | *unused*  | Current-sense outputs, leave disconnected      |
-| Shelf sensor | GPIO 23   | One pulse per shelf                            |
-| Index sensor | GPIO 24   | Active only at shelf 1                         |
+| Signal        | Bridge **A** (motor A) | Bridge **B** (motor B) | Notes                                      |
+| ------------- | ---------------------- | ---------------------- | ------------------------------------------ |
+| RPWM          | GPIO 12                | GPIO 20                | PWM — drives one direction                 |
+| LPWM          | GPIO 13                | GPIO 21                | PWM — drives the other direction           |
+| R_EN + L_EN   | GPIO 22                | GPIO 27                | **Tie both EN pins of a bridge to its one GPIO.** HIGH = armed |
+| VCC           | 3.3 V                  | 3.3 V                  | Logic supply — **not** 5 V (see below)     |
+| GND           | any GND                | any GND                | **Common ground** Pi ↔ both drivers ↔ sensors |
+| R_IS / L_IS   | *unused*               | *unused*               | Current-sense outputs, leave disconnected  |
+| Shelf sensor  | GPIO 23                |                        | One pulse per shelf (shared)               |
+| Index sensor  | GPIO 24                |                        | Active only at shelf 1 (shared)            |
 
-The screw terminals carry the power side: **B+ / B−** to your motor supply
-(with the big cap already on-board), **M+ / M−** to the motor. Swap M+/M− if the
-carousel runs the wrong way, or just flip `HOMING_DIRECTION`.
+The screw terminals carry the power side: **B+ / B−** of *each* bridge to your
+motor supply (the big cap is already on-board), **M+ / M−** to that bridge's
+motor. If the whole carousel runs the wrong way, flip `HOMING_DIRECTION`; if
+only *one* side runs the wrong way, toggle **Mirror motor B** in the app (or
+swap M+/M− on that bridge).
 
-**Key points for this board:**
+**Key points for these boards:**
 
 - **Never drive RPWM and LPWM high at the same time** — that shoots through the
   bridge. The code uses gpiozero's `Motor` without an `enable` argument, which
-  guarantees only one of the two is ever given a duty cycle.
+  guarantees only one of the two is ever given a duty cycle, on each bridge.
 - **Power VCC from 3.3 V, not 5 V.** The BTS7960's inputs are happy at 3.3 V
   logic, and feeding VCC 5 V can make the on-board logic pull the input pins
   above the Pi's 3.3 V limit.
-- GPIO 12/13 are the Pi's **hardware PWM** channels. For jitter-free speed
-  control install `pigpio` (`sudo apt install pigpio && sudo systemctl enable
-  --now pigpiod`) and export `GPIOZERO_PIN_FACTORY=pigpio`; otherwise gpiozero
-  falls back to software PWM, which can make the motor buzz.
+- GPIO 12/13 are the Pi's **hardware PWM** channels, so bridge A gets them;
+  bridge B on GPIO 20/21 is driven by software PWM. For the smoothest result
+  install `pigpio` (`sudo apt install pigpio && sudo systemctl enable --now
+  pigpiod`) and export `GPIOZERO_PIN_FACTORY=pigpio` — pigpio generates
+  jitter-free PWM on *any* GPIO, so both bridges then run identically. Without
+  it gpiozero falls back to software PWM, which can make a motor buzz.
 - Pulling **EN low is a hardware stop** — the outputs float regardless of the PWM
-  state. That's why `stop()` zeroes the PWM and then disarms EN.
+  state. That's why `stop()` zeroes both PWMs and then disarms both ENs.
 
-> Power the motor from its **own supply**, not the Pi's 5V rail. Tie all grounds
-> together — the Pi's GND *must* be common with the driver's GND or the PWM
-> signals have no reference and the motor behaves erratically.
+> Power the motors from their **own supply**, not the Pi's 5V rail. Size it for
+> two motors. Tie all grounds together — the Pi's GND *must* be common with both
+> drivers' GND or the PWM signals have no reference and the motors behave
+> erratically.
+
+#### Jogging one DC motor
+
+A DC bridge has no step unit, so a jog is **timed**: *Manual control → Motor
+jog* runs motor A, motor B or both for a set number of **milliseconds** (default
+150 ms, 10–5000 ms) at the unit's *Motor speed* PWM. Use it exactly like the
+servo micro-jog: nudge one side until the shelf hangs level, then **Home**. The
+step size is saved per unit.
+
+`motor_test.py` still exercises bridge A only (`PIN_MOTOR_RPWM/LPWM/EN` are
+aliases for the A pins); to bench-test bridge B, point those constants at the
+`PIN_MOTOR_B_*` values temporarily.
+
+### Servo drive: two iSV57T on PUL/DIR
+
+Select **Integrated servo motors (PUL/DIR)** in the app. The agent then drives
+two StepperOnline iSV57T integrated servos (tested target: **iSV57T-090(S)**)
+instead of the two BTS7960 bridges:
+
+- both motors receive the **same pulse train and direction**, so the two chains
+  stay synchronised during a move;
+- speed = **pulse frequency** (the app's speed sliders scale 0–100 % of the
+  configurable top rate, default 8 000 pulses/s);
+- each motor can be **micro-jogged individually** by an exact pulse count to
+  level the shelf if the chains drift (Manual control → *Servo micro-jog*; the
+  DC drive has the same panel in milliseconds);
+- the drives' **ALM** fault outputs are read back and shown as lamps; an alarm
+  stops the pulse train and raises a fault in the app;
+- a parked servo **holds its position with full torque** and cannot be turned
+  by hand. The iSV57T has **no enable input** (its control header is only
+  PUL/DIR/ALM), so by default the servos simply stay on and you move the
+  carousel with the jog arrows. Optionally, a relay in the drives' +Vdc lead
+  on **GPIO 17/25** lets the agent cut the servo supply after an idle timeout
+  (*Settings → Motor drive → Release servos after idle*, default *Always on*)
+  or on the **Release** button; any move or jog powers the drives up again
+  first and re-homes.
+
+#### What you need
+
+| Part | Qty | Notes |
+| --- | --- | --- |
+| iSV57T-090(S) integrated servo | 2 | 24–36 V DC, 180 W. Each has its own driver inside — there is no separate motor driver board. |
+| 24–36 V DC supply | 1 | ≥ 10 A for two motors (manual recommends 24 V/8 A per motor at full torque; a carousel seldom needs that). **Separate from the Pi's 5 V.** |
+| 5 V logic level shifter / line driver | 1 | **74AHCT125** or **74HCT245**, powered from the Pi's 5 V pin. The iSV57T's PUL/DIR opto inputs want 4–5 V and 7–16 mA; a Pi GPIO is 3.3 V and only safely sources a few mA, so **do not connect PUL/DIR straight to the GPIO**. |
+| Twisted-pair / shielded cable for PUL/DIR | — | Keep signal cables away from the motor power leads. |
+
+#### Pin map (BCM numbers)
+
+Constants live at the top of `paternoster_agent.py` (`PIN_SERVO_*`). Both
+drives share the direction convention, so **motor B's DIR is inverted in software**
+by default (`SERVO_MIRROR_B = True` / *Mirror motor B* in the app) because on most
+dual-chain builds the two servos face each other.
+
+| Pi (BCM) | → 74AHCT125 | → Motor **A** | → Motor **B** | Notes |
+| --- | --- | --- | --- | --- |
+| **GPIO 12** | 1A → 1Y | **PUL+** | — | Hardware PWM channel 0: the pulse train |
+| **GPIO 13** | 2A → 2Y | — | **PUL+** | Hardware PWM channel 1 |
+| **GPIO 5**  | 3A → 3Y | **DIR+** | — | Direction |
+| **GPIO 6**  | 4A → 4Y | — | **DIR+** | Direction (mirrored in software) |
+| **GPIO 17** | *(optional)* relay IN | relay in **+Vdc** lead | — | Supply relay for *Release*. Leave unconnected if you don't need it (see note) |
+| **GPIO 25** | *(optional)* relay IN | — | relay in **+Vdc** lead | Supply relay, motor B (or share one relay for both) |
+| **GPIO 16** | *(direct)* | **ALM+** | — | Alarm output, internal pull-up |
+| **GPIO 26** | *(direct)* | — | **ALM+** | Alarm output, internal pull-up |
+| **GND** | GND, all /OE pins | **PUL−, DIR−, ALM−** | **PUL−, DIR−, ALM−** | **Common ground** Pi ↔ shifter ↔ both drives |
+| **5 V** | VCC | — | — | Powers the line driver only |
+| **GPIO 23** | — | shelf sensor | | unchanged from DC mode |
+| **GPIO 24** | — | index sensor | | unchanged from DC mode |
+
+Why PUL on GPIO 12/13: those are the Pi's two **hardware PWM** channels, so the
+pulse train comes from the PWM peripheral and is jitter-free. Each motor has its
+own channel, which is what makes individual jogging possible. Install `pigpio`
+(or `lgpio` on a Pi 5) exactly as in the DC section so gpiozero uses them.
+
+The iSV57T control connector (manual §3, 6-pin "control signal" header):
+
+| iSV57T pin | Function | Wire to |
+| --- | --- | --- |
+| PUL+ / PUL− | Pulse input, opto-isolated | PUL+ ← shifter output, PUL− → GND |
+| DIR+ / DIR− | Direction input, opto-isolated | DIR+ ← shifter output, DIR− → GND |
+| ALM+ / ALM− | Alarm output, open-collector | ALM+ → GPIO 16 / 26, ALM− → GND |
+
+There is no ENA pin on this drive — the 5-pin header next to the DIP switches
+(NC/RX/GND/TX/5V) is the RS232 tuning port, not a control input.
+
+**Power connector**: `VDC` to +24…36 V, `GND` to supply −. Also tie the supply −
+to the Pi's GND so the opto inputs have a return path.
+
+> The ALM output is **conducting when healthy** and goes high-impedance on a
+> fault. With the Pi's pull-up enabled the GPIO therefore reads LOW = OK,
+> HIGH = alarm. If your lamps show "alarm" with healthy drives, check that ALM−
+> really is at GND.
+
+> **Optional supply relay (GPIO 17/25).** Because the drive cannot be
+> disabled electrically, *Release* works by cutting its 24–36 V supply. Put a
+> relay or high-side MOSFET module rated for the drive current in each
+> drive's +Vdc lead (or one relay feeding both) and drive its IN pin from
+> GPIO 17 / 25. `SERVO_ENA_ACTIVE_RELEASES = True` means GPIO HIGH = relay
+> open = motor free; set it `False` for active-low relay boards. The agent
+> waits `SERVO_ENABLE_SETTLE_S` (1.2 s) for the drive to boot before sending
+> pulses. With nothing wired, leave *Release servos after idle* on
+> **Always on** (the default) — the servos hold and you move the carousel with
+> the jog arrows.
+
+#### Drive configuration (DIP switches / software)
+
+Set these on **both** servos; the app's *Settings → Motor drive* values must match.
+
+| Setting | Value | Why |
+| --- | --- | --- |
+| Control mode (Pr0.01) | **0 — position (pulse + direction)** | Factory default. The agent streams pulses; the servo follows them. |
+| Pulse mode (Pr0.07) | **PUL/DIR** | Not CW/CCW. Factory default. |
+| Pulses per revolution (S1–S3 / Pr0.08) | **4000** (factory default) | Matches `SERVO_PULSES_PER_REV` and the app default. If you change the DIP, change *Pulses per rev* in the app so jog degrees and rpm read correctly. |
+| Direction (S4 / Pr0.06) | leave default | Flip *Mirror motor B* in the app instead if one chain runs the wrong way. |
+| Enable | not wired | The drive is enabled on power-up and holds position when the pulse train stops — a stopped servo brakes far harder than a coasting DC motor. |
+
+The top pulse rate (*Max pulse rate*, default 8 000 pps = 120 rpm at 4000 ppr) is
+far below the drive's 300 kHz input limit; raise it only if your gearing needs
+more carousel speed.
+
+#### Aligning the two chains (both drives)
+
+If the shelf hangs lower on one side after assembly or a jam:
+
+1. Open **Manual control** for the unit; the jog card (**Servo micro-jog** or
+   **Motor jog**) shows the motor selector and the arrows — plus the two ALM
+   lamps on servos.
+2. Set the **step size**. Servo: pulses per tap (40 pulses = 3.6° at 4000 ppr).
+   DC: milliseconds per tap (default 150 ms, at the unit's *Motor speed* PWM).
+   It is saved per unit.
+3. Select **Motor A** or **Motor B** and tap **▲ / ▼** until the shelf is level,
+   or select **Both** to nudge the whole carousel.
+4. **Home** the carousel so the shelf count is re-referenced.
+
+A jog never changes the recorded shelf number; the shelf sensor keeps counting
+underneath it, so jogging across a flag is handled like a coasting stop. The
+arrows stay disabled until the agent has confirmed it is running the same drive
+the app has selected (so a pulse count is never sent to a DC bridge or vice
+versa); that needs pax-agent-1.3+ for the DC drive.
+
+#### Running without hardware
+
+`--simulate` honours the mode too, so either jog panel can be exercised on a
+laptop: `python3 paternoster_agent.py --simulate --motor servo` (or `--motor dc`).
 
 ### Sensor type: NPN vs PNP
 
@@ -109,53 +281,22 @@ the app's up/down labels, flip `HOMING_DIRECTION`.
 
 ## Install & run on the Pi
 
+**Easiest:** the one-command installer at the repository root sets up the agent, the
+networking and (on a master) the web app, asking only for the role and shelf count:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Swede-maker/paternoster-filament-storage/main/setup.sh | sudo bash
+```
+
+The manual steps below are what that script runs for you.
+
 ```bash
 # 1. Copy this folder to the Pi (anywhere in your home dir), then:
 cd ~/pi-agent
-sudo apt update && sudo apt install -y python3-pip python3-full
 pip3 install -r requirements.txt
-```
 
-```bash
 # 2. Run it (must match the shelves count you set for this unit in the app):
 python3 paternoster_agent.py --name "Paternoster 1" --shelves 9 --port 8765
-```
-
-# IF you wanna install it on your Paternoster with the server on paste this and skip the "Start automaticlly on boot":
-```bash
-cd ~/pax/pi-agent
-sudo apt update && sudo apt install -y python3-pip python3-full
-pip3 install -r requirements.txt --break-system-packages
-```
-
-```bash
-# 2. Run it (must match the shelves count you set for this unit in the app):
-python3 paternoster_agent.py --name "Paternoster 1" --shelves 9 --port 8765
-```
-
-```bash
-# 3. Clean off if you have dubble server running in PM2:
-pm2 delete pax
-pm2 start npm --name "pax" -- start
-pm2 save
-```
-
-```bash
-# 4. Restart the server:
-pm2 restart pax
-```
-
-```bash
-#  If it show "Offline" in the browser under settings try this:
-cd ~/pax/pi-agent
-python3 paternoster_agent.py --name "Paternoster 1" --shelves 9 --port 8765
-```
-
-```bash
-# 5. start the server so it wont die after you close the terminal:
-cd ~/pax/pi-agent
-pm2 start "python3 paternoster_agent.py --name 'Paternoster 1' --shelves 9 --port 8765" --name "paternoster-agent"
-pm2 save
 ```
 
 ### Start automatically on boot
@@ -649,6 +790,115 @@ sudo systemctl status paternoster-agent
 sudo ss -ltnp | grep 8765     # want 0.0.0.0:8765, not 127.0.0.1:8765
 ```
 
+## Networking: router mode, hotspot fallback, slave provisioning
+
+`paxnet.py` runs inside the agent and manages the Pi's Wi-Fi through
+NetworkManager (`nmcli`). It needs **Raspberry Pi OS Bookworm or newer**; on a
+dhcpcd-based image `install.sh` stops with a clear error, or run it with
+`--no-net` for a wired bench setup.
+
+### Roles
+
+| | Master (Pi 4/5, runs the web app) | Slave (Pi Zero 2 W) |
+| --- | --- | --- |
+| Install | `sudo ./install.sh --role master --hostname pax-master` | `sudo ./install.sh --role slave --hostname pax-slave-1 --master pax-master.local --ap-ssid PAX-Setup-XXXX --ap-psk <pw>` |
+| Router profile | `pax-router` (autoconnect, priority 100) | same |
+| Fallback | Brings up its own hotspot `pax-ap` (SSID `PAX-Setup-XXXX`, gateway `10.42.0.1`) | Joins the master's hotspot via `pax-master-ap` (autoconnect, priority 10) |
+| Reachable as | `http://pax-master.local` (or `http://10.42.0.1` on the hotspot) | `ws://pax-slave-1.local:8765` |
+| Extra | Keeps a registry of slaves and pushes router credentials to them | Keeps an outbound socket to the master and registers itself |
+
+The installer sets the hostname, enables Avahi (mDNS) so `pax-*.local` resolves
+on any network, generates the hotspot password once (reinstalling never rotates
+it), writes `/etc/paxnet.conf`, and drops a sudoers rule so the agent may run
+`nmcli` without becoming root. Address nodes in the app by hostname, not IP, and
+a move to a network with different addresses needs no edits.
+
+### The fallback timeline (`mode = auto`)
+
+```
+boot ─▶ NM autoconnects pax-router ─▶ gateway reachable?  yes ─▶ stay, re-check every 5 s
+                                                          │
+                                        45 s with no gateway
+                                                          ▼
+                        master: nmcli con up pax-ap      slave: NM autoconnects pax-master-ap
+                        broadcast net.status {mode:"ap"}
+                                                          │
+                                  every 60 s: try pax-router again
+                                                          │
+                                      router back? ─▶ drop hotspot, resume
+```
+
+The same loop runs if the router disappears mid-session (loss timeout 45 s).
+The mode pin in Settings → Network changes the rules:
+
+| Pin | Behaviour |
+| --- | --- |
+| **Auto** | The timeline above. Default. |
+| **Local router** | Never falls back. Hotspot stays down even with no router. Use when a nearby PAX hotspot would confuse people. |
+| **Standalone AP** | Master only. Hotspot always on, router never tried. Use at a show or a shop with no Wi-Fi. |
+
+### Moving the system to a new workshop
+
+Nothing needs a keyboard or a re-flash. Power everything on and:
+
+1. **Master boots**, cannot find the old router, after 45 s starts
+   `PAX-Setup-XXXX`.
+2. **Slaves boot**, cannot find the old router, NetworkManager joins
+   `PAX-Setup-XXXX` on its own. Each slave's agent connects to
+   `ws://pax-master.local:8765` and registers (`net.register`). The master now
+   lists them under *Slave units following this master*.
+3. On a phone, join `PAX-Setup-XXXX` with the password from the install
+   printout (or scan the QR in Settings → Network → Standalone hotspot), and
+   open `http://10.42.0.1`.
+4. **Settings → Network → Scan for Wi-Fi networks**, pick the new router, type
+   its password, **Save & connect**.
+5. The master first pushes the SSID/password to every registered slave
+   (`net.join {fromMaster:true}`) and waits for their acks (5 s each). They
+   only *store* the profile; they do not switch yet because the socket they
+   are being asked on would die.
+6. The master drops the hotspot and joins the router. The hotspot vanishing
+   makes each slave's NetworkManager fall through to `pax-router`, which is
+   now saved with the new credentials, so they follow within seconds.
+7. Reconnect the phone to the workshop Wi-Fi and open
+   `http://pax-master.local`. Every node is back online at its `.local` name.
+
+If a slave was powered off during step 5, plug it in later: it lands on the
+master's hotspot only if the master is still serving one, so instead the
+master reappears in *Slave units* as offline. Press **Re-push credentials**
+once it registers (it will, over whatever link it has), or simply leave it:
+the next time the master falls back to AP mode both sides meet there again.
+
+### Slave first contact without hotspot credentials
+
+`--ap-ssid/--ap-psk` are optional on the slave installer **if the slave is on
+the same router as the master at install time**. On its first registration
+the master replies `net.registered {apSsid, apPsk}`; the slave stores them in
+`/etc/paxnet.conf` and creates `pax-master-ap`. From then on it has the
+fallback network. Check with:
+
+```bash
+sudo python3 /path/to/pi-agent/paxnet.py status
+nmcli -f NAME,AUTOCONNECT,AUTOCONNECT-PRIORITY con show | grep pax-
+```
+
+### Debugging paxnet
+
+```bash
+python3 paxnet.py status          # what the agent would broadcast as net.status
+python3 paxnet.py scan            # what the app's scanner shows
+journalctl -u paternoster-agent -f | grep -e paxnet -e '\[agent\] net'
+sudo cat /etc/paxnet.conf         # role / pin / hotspot creds / master host
+```
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| Panel says *nmcli not found* / mode `unknown` | Not NetworkManager | Bookworm image, or `raspi-config → Advanced → Network Config → NetworkManager` |
+| `net.join` fails with *sudo: a password is required* | Sudoers rule missing | Re-run `install.sh` (writes `/etc/sudoers.d/paxnet`) |
+| Master boots straight into hotspot every time | `pax-ap` has autoconnect on, or pin is `ap` | `nmcli con modify pax-ap connection.autoconnect no`; set pin to Auto |
+| Slave never appears in the slaves table | Cannot resolve `pax-master.local` | Both need `avahi-daemon` running; try `ping pax-master.local` from the slave |
+| Slave ignored pushed creds | Slave was on the master's hotspot but the ack timed out | Panel shows it under *failed*; press **Re-push credentials** |
+| Phone joins the hotspot but the app will not load | App not running on the master | The web app must be hosted on the master Pi for AP mode to be useful |
+
 ## Wire protocol
 
 The agent and app exchange newline-free JSON messages. This mirrors
@@ -659,21 +909,46 @@ The agent and app exchange newline-free JSON messages. This mirrors
 | Message                              | Meaning                          |
 | ------------------------------------ | -------------------------------- |
 | `{"type":"hello"}`                   | Handshake request                |
-| `{"type":"config","shelves":N,"moveSpeed":0.7,"homingSpeed":0.45,"rampPct":40}` | Shelf count + live motion tuning. The motion fields are optional; omitted ones keep their current value, so they must be sent for the sliders to take effect. |
+| `{"type":"config","shelves":N,"moveSpeed":0.7,"homingSpeed":0.45,"rampPct":40,"motorMode":"dc"\|"servo","servoPulsesPerRev":4000,"servoMaxPps":8000,"servoMirrorB":true,"servoHoldTimeoutS":60}` | Shelf count + live motion tuning + drive selection. The motion fields are optional; omitted ones keep their current value, so they must be sent for the sliders to take effect. `servoMirrorB` applies to both drives. `servoHoldTimeoutS` is the idle auto-release (0 = hold always), persisted on the Pi. |
+| `{"type":"release"}` / `{"type":"hold"}` | Servo only: de-energise the drives now so the carousel can be turned by hand / re-energise them. `release` is refused with a `fault` while moving; moves and jogs re-engage automatically |
 | `{"type":"home"}`                    | Start homing                     |
 | `{"type":"goto","shelf":N}`          | Rotate to shelf N (0-based)      |
-| `{"type":"stop"}`                    | Emergency stop                   |
+| `{"type":"stop"}`                    | Emergency stop (also aborts a jog) |
+| `{"type":"jog","motor":"a"\|"b"\|"both","direction":"up"\|"down","pulses":N}` | Servo drive: step one motor (or both) by exactly N pulses |
+| `{"type":"jog","motor":"a"\|"b"\|"both","direction":"up"\|"down","ms":N,"speed":0.45}` | DC drive: run one motor (or both) for N milliseconds at `speed` duty (optional, agent default otherwise). An amount in the wrong unit for the live drive is answered with a `fault`. |
+| `{"type":"net.status"}`              | Ask for a fresh `net.status` (+ `net.slaves` on a master) |
+| `{"type":"net.scan"}`                | Rescan Wi-Fi → `net.scan`        |
+| `{"type":"net.join","ssid":S,"psk":P}` | Save router + connect. Master pushes to slaves first. `psk:""` for an open network |
+| `{"type":"net.mode","mode":"auto"\|"router"\|"ap"}` | Pin the mode (`ap` master only) |
+| `{"type":"net.forget"}`              | Delete the saved router profile  |
+| `{"type":"net.provision-slaves"}`    | Master: re-push saved router creds to all registered slaves |
+| `{"type":"net.set-ap-psk","psk":P}`  | Master: change the hotspot password (pushes to slaves first, then rewrites `pax-ap`, bouncing it if live) |
+
+**Pi ↔ Pi (slave's outbound socket to the master)**
+
+| Message | Meaning |
+| --- | --- |
+| slave → master `{"type":"net.register","hostname":H,"mac":M,"mode":...,"ssid":...,"ip":...}` | Slave introduces itself on (re)connect |
+| master → slave `{"type":"net.registered","master":H,"apSsid":S,"apPsk":P}` | Ack; slave stores the hotspot creds |
+| master → slave `{"type":"net.join","fromMaster":true,"ssid":S,"psk":P,"apSsid":..,"apPsk":..}` | Store these router creds (do not switch yet) |
+| master → slave `{"type":"net.set-ap-psk","fromMaster":true,"psk":P,"apSsid":S}` | Hotspot key changed; update `pax-master-ap` |
+| slave → master `{"type":"net.ack","op":"join"\|"set-ap-psk","ok":true,"hostname":H}` | Stored |
 
 **Pi → App**
 
 | Message                                             | Meaning                         |
 | --------------------------------------------------- | ------------------------------- |
-| `{"type":"hello","name":...,"shelves":N,"homed":b}` | Handshake reply                 |
+| `{"type":"hello","name":...,"shelves":N,"motorMode":"dc"\|"servo","simulated":b}` | Handshake reply                 |
 | `{"type":"state","status":...,"shelf":N,"homed":b}` | Full state snapshot             |
+| `{"type":"servo","mode":"dc"\|"servo","mirrorB":b,"alarmA"?:b,"alarmB"?:b,"pulsesPerRev"?:N,"maxPps"?:N,"held"?:b,"holdTimeoutS"?:N,"jogMaxMs"?:N,"jogging"?:b,"motor"?:..,"direction"?:..,"pulses"?:N,"ms"?:N}` | Drive status; sent on connect, on a drive switch, when an ALM line changes, when the servos are released/engaged and around each jog. `mode` is the backend actually running — the app only enables the jog arrows once it matches the selected drive. Alarm/pulse fields are servo-only |
 | `{"type":"pos","shelf":N}`                          | Passed a shelf (live position)  |
 | `{"type":"arrived","shelf":N}`                      | Stopped at shelf N              |
 | `{"type":"homed","shelf":0}`                        | Homing finished                 |
 | `{"type":"fault","message":...}`                    | Jam / timeout / sensor error    |
+| `{"type":"net.status","role":..,"pin":..,"mode":"router"\|"ap"\|"master-ap"\|"offline"\|"unknown","ssid":..,"signal":..,"ip":..,"gateway":..,"hostname":..,"apSsid":..,"routerSaved":b}` | Network picture; sent on connect and on every change |
+| `{"type":"net.scan","networks":[{"ssid","signal","security","inUse"}]}` | Scan result |
+| `{"type":"net.result","op":..,"ok":b,"error"?:..}`  | Outcome of a `net.*` op. `op:"join-starting"` / `"ap-starting"` are sent right before the Pi switches networks and drops this socket |
+| `{"type":"net.slaves","slaves":[{"hostname","mac","online","mode","ssid","ip"}]}` | Master only: registered slaves |
 
 Shelf indexes are **0-based** on the wire (shelf 0 = the index-sensor position),
 matching the app's internal representation.
