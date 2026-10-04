@@ -349,6 +349,28 @@ function mergeConsumptionLog(
  * we changed always win, so our own placement can never be undone by a device
  * that merely echoed a position update.
  */
+/**
+ * Operator-tuned drive settings on a node. These get the same three-way merge
+ * as slot cells: the Pi's position ticks make EVERY open device re-save the
+ * document, so a phone's new approach speed was overwritten seconds later by a
+ * desktop tab that still held the old value and merely echoed a position — and
+ * then synced back to the phone as "reverted to default".
+ */
+const NODE_TUNING_KEYS = [
+  "pwmDuty",
+  "homingDuty",
+  "approachDuty",
+  "servoPulsesPerRev",
+  "servoMaxPps",
+  "servoGearRatio",
+  "servoJogPulses",
+  "dcJogMs",
+  "servoMirrorB",
+  "servoIgnoreAlarm",
+  "servoHoldTimeoutS",
+  "motorMode",
+] as const satisfies readonly (keyof StorageNode)[]
+
 function mergeNodeSlots(local: StorageNode[], remote: StorageNode[] | undefined, baseline: StorageNode[] | undefined): StorageNode[] {
   if (!remote || !baseline) return local
   const remoteById = new Map(remote.map((n) => [n.id, n]))
@@ -358,6 +380,17 @@ function mergeNodeSlots(local: StorageNode[], remote: StorageNode[] | undefined,
     const rem = remoteById.get(node.id)
     const base = baseById.get(node.id)
     if (!rem || !base) return node
+    let tuned: Partial<StorageNode> | null = null
+    for (const key of NODE_TUNING_KEYS) {
+      const l = node[key]
+      const r = rem[key]
+      const b = base[key]
+      // Unchanged here but changed on another device → adopt its value.
+      if (l === b && r !== b) {
+        if (!tuned) tuned = {}
+        ;(tuned as Record<string, unknown>)[key] = r
+      }
+    }
     let slots: (string | null)[][] | null = null
     for (let s = 0; s < node.slots.length; s++) {
       const lRow = node.slots[s] ?? []
@@ -375,9 +408,9 @@ function mergeNodeSlots(local: StorageNode[], remote: StorageNode[] | undefined,
         }
       }
     }
-    if (!slots) return node
+    if (!slots && !tuned) return node
     changed = true
-    return { ...node, slots }
+    return { ...node, ...(tuned ?? {}), ...(slots ? { slots } : {}) }
   })
   return changed ? out : local
 }
