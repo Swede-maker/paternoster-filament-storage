@@ -5,11 +5,12 @@ import { useStore } from "@/lib/store"
 import { activeNode, shelfLabel } from "@/lib/selectors"
 import { cn } from "@/lib/utils"
 import { spoolFill } from "@/lib/filament"
+import type { StorageNode } from "@/lib/types"
 import { SpoolDisc, EmptySlot, discColor2 } from "./spool"
 
-export function ShelfOverview() {
+export function ShelfOverview({ node: nodeProp }: { node?: StorageNode } = {}) {
   const { state, dispatch } = useStore()
-  const node = activeNode(state)
+  const node = nodeProp ?? activeNode(state)
   const shelves = node.slots.length
   const { currentShelf, homed, status } = node.machine
   const canNavigate = homed && status === "idle" && !state.job

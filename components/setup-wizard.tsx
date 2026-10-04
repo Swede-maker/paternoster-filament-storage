@@ -1,12 +1,13 @@
 "use client"
 
 import { useState } from "react"
-import { Boxes, Check, Scale, Layers, Wrench } from "lucide-react"
+import { Boxes, Check, Scale, Layers, Wrench, Cog } from "lucide-react"
 import { useStore } from "@/lib/store"
 import { cn } from "@/lib/utils"
-import type { SystemKind } from "@/lib/types"
+import type { MotorMode, SystemKind } from "@/lib/types"
 import { Button } from "./ui/button"
 import { draftToConfig, makeDraft, StorageLayoutEditor } from "./storage-layout-editor"
+import { MotorDrivePicker } from "./motor-drive-picker"
 
 export function SetupWizard() {
   const { dispatch } = useStore()
@@ -17,6 +18,9 @@ export function SetupWizard() {
   // Where to surface the "Total filament used" totals. Chosen here at setup,
   // editable later under Settings.
   const [showUsageCardOnHome, setShowUsageCardOnHome] = useState(true)
+  // How the carousel motor is driven on the Pi. Saved on the node so the agent
+  // initialises the matching control logic (DC bridge vs. servo PUL/DIR).
+  const [motorMode, setMotorMode] = useState<MotorMode>("dc")
 
   const isShelf = draft.nodeType === "shelf"
   const isLibrary = draft.nodeType === "library"
@@ -36,6 +40,7 @@ export function SetupWizard() {
       area: draft.area,
       storage,
       shelfMeta,
+      motorMode: isManual ? undefined : motorMode,
       settings: {
         systemName: draft.name.trim() || "PAX System",
         showUsageCardOnHome,
@@ -100,6 +105,27 @@ export function SetupWizard() {
         </div>
 
         <StorageLayoutEditor draft={draft} onChange={setDraft} />
+
+        {/* Motor drive (carousel only): what the Pi agent should initialise. */}
+        {!isManual && (
+          <div className="mt-6 rounded-xl border border-border bg-background/60 p-4">
+            <div className="mb-3 flex items-center gap-2">
+              <span className="flex h-8 w-8 items-center justify-center rounded-lg bg-secondary">
+                <Cog className="h-4 w-4 text-muted-foreground" />
+              </span>
+              <div>
+                <h2 className="text-sm font-semibold text-foreground">Motor drive</h2>
+                <p className="text-xs text-muted-foreground">What turns the carousel? The Pi agent loads the matching control logic.</p>
+              </div>
+            </div>
+            <MotorDrivePicker value={motorMode} onChange={setMotorMode} />
+            <p className="mt-2 text-xs leading-relaxed text-muted-foreground text-pretty">
+              {motorMode === "servo"
+                ? "Servo mode adds per-motor micro-jog for chain alignment and shows the drives' alarm lamps. Wiring for two iSV57T servos is in the README."
+                : "DC mode keeps the standard run/stop control with PWM speed, soft start and approach tuning."}
+            </p>
+          </div>
+        )}
 
         {/* Filament-usage visibility preference (filament area only). */}
         {!isHardware && (

@@ -6,6 +6,8 @@ import { useStore } from "@/lib/store"
 import { useFlow, type NodeLocation } from "./flow-controller"
 import { Button } from "./ui/button"
 import { ResizableSidebar } from "./resizable-sidebar"
+import { ShelfOverview } from "./shelf-overview"
+import { ManualControl } from "./manual-control"
 import { StatsBar } from "./stats-bar"
 import { ReorderableTabs } from "./reorderable-tabs"
 import { CarouselView } from "./carousel-view"
@@ -161,6 +163,15 @@ export function HomeView() {
   // A stored spool was tapped in the SEARCH browser → focus its unit and open
   // the full slot action hub (same as a direct slot tap), so search and direct
   // taps offer identical options.
+  // A spool loaded on a printer was tapped in search → open the same take-off
+  // dialog the slot picker uses, so it can be moved into storage.
+  function handleInspectLoaded(spool: Spool, printerId: string, slot: number) {
+    const printer = state.printers.find((p) => p.id === printerId)
+    if (!printer) return
+    setBrowserOpen(false)
+    setUnloadTarget({ printer, slot, spool })
+  }
+
   function handleInspect(_spool: Spool, loc: NodeLocation) {
     setBrowserOpen(false)
     if (state.activeNodeId !== loc.nodeId) {
@@ -277,7 +288,13 @@ export function HomeView() {
       {!isManual && (
         <aside className="flex w-full shrink-0 flex-col rounded-2xl border border-border bg-panel lg:w-[300px] lg:min-h-0">
           <SidebarHeader />
-          <ResizableSidebar />
+          {/* Bind the sidebar to the unit shown in this area, not the raw
+              activeNodeId — that can point at a hardware carousel (with its
+              own drive settings) when the user last worked in that area. */}
+          <ResizableSidebar
+            overview={<ShelfOverview node={currentNode} />}
+            control={<ManualControl node={currentNode} />}
+          />
         </aside>
       )}
 
@@ -420,6 +437,7 @@ export function HomeView() {
         }}
         onPick={pickTarget ? handlePicked : undefined}
         onInspect={pickTarget ? undefined : handleInspect}
+        onInspectLoaded={pickTarget ? undefined : handleInspectLoaded}
         onNew={pickTarget ? handleChooseNew : undefined}
         excludeIds={flow.outItems.map((i) => i.spool.id)}
         title={pickTarget ? "Choose filament to load" : "Search filament"}

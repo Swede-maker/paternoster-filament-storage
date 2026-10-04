@@ -11,6 +11,10 @@ import {
   loadBoostPctFor,
   boostDuty,
   DEFAULT_RAMP_PCT,
+  servoPulsesPerRevFor,
+  servoMaxPpsFor,
+  servoMirrorBFor,
+  servoHoldTimeoutFor,
 } from "@/lib/filament"
 import { nodeLoadGrams } from "@/lib/selectors"
 
@@ -177,6 +181,10 @@ export function NodeConnection() {
             // whenever it changes and once on connect. Drives the real-time
             // sensor lamp on the carousel.
             dispatch({ type: "NODE_SENSOR", nodeId, on: ev.on })
+            break
+          case "servo":
+            // Servo drive status: ALM lines, agent-side tuning, jog progress.
+            dispatch({ type: "NODE_SERVO", nodeId, servo: ev })
             break
           case "arrived":
             if (conn) {
@@ -382,6 +390,11 @@ export function NodeConnection() {
         boostDuty(homingDutyFor(n), boost),
         boostDuty(approachDutyFor(n), boost),
         n.rampPct ?? DEFAULT_RAMP_PCT,
+        n.motorMode ?? "dc",
+        servoPulsesPerRevFor(n),
+        servoMaxPpsFor(n),
+        servoMirrorBFor(n),
+        servoHoldTimeoutFor(n),
       ].join(":")
     })
     .join("|")
@@ -411,6 +424,13 @@ export function NodeConnection() {
               homingSpeed: boostDuty(homingDutyFor(node), boost),
               approachSpeed: boostDuty(approachDutyFor(node), boost),
               rampPct: node.rampPct ?? DEFAULT_RAMP_PCT,
+              // Drive selection travels with every config so the agent can
+              // initialise (or hot-swap to) the matching motor backend.
+              motorMode: node.motorMode ?? "dc",
+              servoPulsesPerRev: servoPulsesPerRevFor(node),
+              servoMaxPps: servoMaxPpsFor(node),
+              servoMirrorB: servoMirrorBFor(node),
+              servoHoldTimeoutS: servoHoldTimeoutFor(node),
             },
           }),
         }).catch(() => {

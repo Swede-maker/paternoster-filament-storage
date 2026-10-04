@@ -4,6 +4,7 @@ import { useEffect, useMemo, useState } from "react"
 import {
   Eye,
   EyeOff,
+  KeyRound,
   Loader2,
   Radio,
   RefreshCw,
@@ -17,7 +18,7 @@ import {
 import { useStore } from "@/lib/store"
 import type { StorageNode } from "@/lib/types"
 import type { NetPin, WifiNetwork } from "@/lib/node-protocol"
-import { NET_MODE_LABEL, NET_PIN_LABEL, signalBars, wifiQrPayload } from "@/lib/net"
+import { NET_MODE_LABEL, NET_PIN_LABEL, signalBars, validatePsk, wifiQrPayload } from "@/lib/net"
 import { qrSvgMarkup } from "@/lib/qr"
 import { cn } from "@/lib/utils"
 import { Button } from "../ui/button"
@@ -50,6 +51,9 @@ export function NetworkPanel({ node }: { node: StorageNode }) {
   const [showApPsk, setShowApPsk] = useState(false)
   const [apPsk, setApPsk] = useState<string | null>(null)
   const [busy, setBusy] = useState<string | null>(null)
+  const [changingPsk, setChangingPsk] = useState(false)
+  const [newPsk, setNewPsk] = useState("")
+  const [newPskError, setNewPskError] = useState<string | null>(null)
 
   // Ask for a fresh picture whenever the link comes up.
   useEffect(() => {
@@ -63,6 +67,13 @@ export function NetworkPanel({ node }: { node: StorageNode }) {
     if (result.op === "join") setJoining(null)
     if (result.op === "mode") setPendingPin(null)
     if (result.op === "provision-slaves" || result.op === "forget") setBusy(null)
+    if (result.op === "set-ap-psk") {
+      setBusy(null)
+      if (result.ok) {
+        setChangingPsk(false)
+        setNewPsk("")
+      }
+    }
   }, [result])
 
   // Once the Pi is genuinely on the new network, clear the join spinner even
@@ -128,6 +139,36 @@ export function NetworkPanel({ node }: { node: StorageNode }) {
         type: "NODE_NET_RESULT",
         nodeId: node.id,
         result: { type: "net.result", op: opLabel, ok: false, error: err instanceof Error ? err.message : "Failed" },
+      })
+    }
+  }
+
+  const submitNewPsk = async () => {
+    const err = validatePsk(newPsk) ?? (newPsk === "" ? "A hotspot password is required" : null)
+    if (err) {
+      setNewPskError(err)
+      return
+    }
+    setNewPskError(null)
+    setBusy("set-ap-psk")
+    dispatch({ type: "NODE_NET_RESULT", nodeId: node.id, result: null })
+    try {
+      const r = await fetch("/api/net/hotspot", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ ...target, psk: newPsk }),
+      })
+      const data = (await r.json()) as { ok: boolean; error?: string }
+      if (!data.ok) throw new Error(data.error ?? "Could not send")
+      // Optimistically show the new key in the QR field; the result banner
+      // will say if the Pi rejected it.
+      setApPsk(newPsk)
+    } catch (err) {
+      setBusy(null)
+      dispatch({
+        type: "NODE_NET_RESULT",
+        nodeId: node.id,
+        result: { type: "net.result", op: "set-ap-psk", ok: false, error: err instanceof Error ? err.message : "Failed" },
       })
     }
   }
@@ -300,9 +341,25 @@ export function NetworkPanel({ node }: { node: StorageNode }) {
               </dd>
             </div>
             <p className="pt-1 text-xs text-muted-foreground text-pretty">
-              The password is set once by <span className="font-mono">install.sh</span> and stays the same across
-              reinstalls. Paste it here to get a phone-scannable QR code.
+              The password is generated once at install and kept across reinstalls (it is in{" "}
+              <span className="font-mono">/etc/paxnet.conf</span> on the master). Paste it here to get a
+              phone-scannable QR code, or set your own below.
             </p>
+            <div className="pt-1">
+              <Button
+                variant="outline"
+                size="sm"
+                disabled={!online || busy === "set-ap-psk"}
+                onClick={() => {
+                  setNewPsk("")
+                  setNewPskError(null)
+                  setChangingPsk(true)
+                }}
+              >
+                <KeyRound className="mr-1.5 h-4 w-4" />
+                Change hotspot password
+              </Button>
+            </div>
           </dl>
           <div className="flex shrink-0 items-center justify-center">
             {qr ? (
@@ -408,6 +465,63 @@ export function NetworkPanel({ node }: { node: StorageNode }) {
           </Button>
         </DialogFooter>
       </Dialog>
+
+      <Dialog
+        open={changingPsk}
+        onClose={() => setChangingPsk(false)}
+        title="Change hotspot password"
+        description={`New Wi-Fi password for ${apSsid}.`}
+        className="max-w-md"
+      >
+        <form
+          className="space-y-3 text-sm text-foreground"
+          onSubmit={(e) => {
+            e.preventDefault()
+            void submitNewPsk()
+          }}
+        >
+          <label className="block space-y-1.5">
+            <span className="text-xs font-medium text-muted-foreground">New password (8–63 characters)</span>
+            <input
+              type="text"
+              value={newPsk}
+              onChange={(e) => {
+                setNewPsk(e.target.value)
+                if (newPskError) setNewPskError(null)
+              }}
+              autoFocus
+              autoComplete="off"
+              spellCheck={false}
+              aria-invalid={newPskError ? true : undefined}
+              className={cn(
+                "h-10 w-full rounded-md border bg-background px-3 font-mono text-sm text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+                newPskError ? "border-destructive" : "border-input",
+              )}
+            />
+            {newPskError && <span className="block text-xs text-destructive">{newPskError}</span>}
+          </label>
+          <p className="text-muted-foreground text-pretty">
+            The master first sends the new password to every online slave (so they keep a working fallback), then
+            rewrites its own hotspot. Slaves that are offline right now keep the old key until they next talk to the
+            master on the router.
+          </p>
+          {net?.mode === "ap" && (
+            <p className="flex items-start gap-2 rounded-lg border border-border bg-muted/40 px-3 py-2 text-muted-foreground text-pretty">
+              <TriangleAlert className="mt-0.5 h-4 w-4 shrink-0" />
+              The hotspot is live: it will restart and this device will need to rejoin with the new password.
+            </p>
+          )}
+          <DialogFooter>
+            <Button type="button" variant="ghost" onClick={() => setChangingPsk(false)}>
+              Cancel
+            </Button>
+            <Button type="submit" disabled={busy === "set-ap-psk"}>
+              {busy === "set-ap-psk" ? <Loader2 className="h-4 w-4 animate-spin" /> : <KeyRound className="h-4 w-4" />}
+              Save password
+            </Button>
+          </DialogFooter>
+        </form>
+      </Dialog>
     </div>
   )
 }
@@ -479,6 +593,14 @@ function ResultBanner({
     case "forget":
       text = result.ok ? "Saved router removed." : `Could not forget router: ${result.error}`
       break
+    case "set-ap-psk": {
+      const a = result.acked?.length ?? 0
+      const f = result.failed ?? []
+      text = result.ok
+        ? `Hotspot password changed${a ? ` and sent to ${a} slave${a === 1 ? "" : "s"}` : ""}${f.length ? ` — ${f.length} slave${f.length === 1 ? "" : "s"} did not answer (${f.join(", ")}) and still has the old key` : ""}.`
+        : `Could not change hotspot password: ${result.error ?? "unknown error"}`
+      break
+    }
     default:
       text = result.ok ? `${result.op} done.` : `${result.op} failed: ${result.error ?? "unknown error"}`
   }

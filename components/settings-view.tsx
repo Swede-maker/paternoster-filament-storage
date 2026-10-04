@@ -28,17 +28,21 @@ import {
   Link2Off,
   Package as PackageIcon,
   Wifi,
+  DownloadCloud,
 } from "lucide-react"
 import { useStore } from "@/lib/store"
 import { useTheme } from "@/lib/use-theme"
 import { cn } from "@/lib/utils"
 import { getStats, masterNode, nodeSlotCount, nodesForSystem, shelfLabel } from "@/lib/selectors"
 import { NetworkPanel } from "./network/network-panel"
+import { UpdateSection } from "./update-section"
 import { newId, formatGrams } from "@/lib/filament"
 import { newQrTagId, qrPayload, allBindings, describeTarget } from "@/lib/tags"
 import { QrPrintButton } from "./qr-print-button"
-import type { Container, StorageNode, TagBinding } from "@/lib/types"
+import type { Container, MotorMode, StorageNode, TagBinding } from "@/lib/types"
 import { Button } from "./ui/button"
+import { MotorDrivePicker, motorModeLabel } from "./motor-drive-picker"
+import { MotorDriveEditor } from "./motor-drive-editor"
 import { Field, Input, Select, Checkbox } from "./ui/field"
 import { SpoolDisc, discColor2 } from "./spool"
 import { NumField } from "./spool-form"
@@ -213,6 +217,11 @@ export function SettingsView() {
         </Section>
       )}
 
+      {/* Update — pulls the newest code from GitHub on a Pi installation */}
+      <Section icon={<DownloadCloud className="h-5 w-5 text-primary" />} title="Update">
+        <UpdateSection />
+      </Section>
+
       {/* RFID / QR tags */}
       <Section icon={<Nfc className="h-5 w-5 text-primary" />} title="RFID / QR tags">
         <p className="text-sm text-muted-foreground">
@@ -373,6 +382,9 @@ function NodeList() {
                       >
                         {node.driver === "hardware" ? "hardware" : "simulated"}
                       </span>
+                      <span className="rounded-md bg-muted px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
+                        {motorModeLabel(node.motorMode)}
+                      </span>
                       <LinkChip node={node} />
                     </>
                   )}
@@ -458,6 +470,7 @@ function NodeList() {
             )}
 
             {!isManual && node.driver === "hardware" && <NodeEndpointEditor node={node} />}
+            {!isManual && <MotorDriveEditor node={node} />}
           </li>
         )
       })}
@@ -575,6 +588,7 @@ function AddNodeRow() {
   const [open, setOpen] = useState(false)
   const [draft, setDraft] = useState<StorageDraft>(() => makeDraft("paternoster"))
   const [hardware, setHardware] = useState(false)
+  const [motorMode, setMotorMode] = useState<MotorMode>("dc")
   const [ip, setIp] = useState("")
   const [port, setPort] = useState(8765)
   const clamp = (v: number, min: number, max: number) => Math.max(min, Math.min(max, v))
@@ -586,6 +600,7 @@ function AddNodeRow() {
     setOpen(false)
     setDraft(makeDraft("paternoster"))
     setHardware(false)
+    setMotorMode("dc")
     setIp("")
     setPort(8765)
   }
@@ -610,6 +625,11 @@ function AddNodeRow() {
       {/* Controller settings only apply to the automated paternoster. */}
       {!isManual && (
         <>
+          <div>
+            <p className="mb-1.5 text-sm font-medium text-muted-foreground">Motor drive</p>
+            <MotorDrivePicker value={motorMode} onChange={setMotorMode} compact />
+          </div>
+
           <div>
             <p className="mb-1.5 text-sm font-medium text-muted-foreground">Controller</p>
             <div className="grid grid-cols-2 gap-2">
@@ -683,6 +703,7 @@ function AddNodeRow() {
               ip: !isManual && hardware ? ip.trim() : undefined,
               driver: !isManual && hardware ? "hardware" : "simulated",
               port: !isManual && hardware ? port : undefined,
+              motorMode: !isManual ? motorMode : undefined,
             })
             reset()
           }}

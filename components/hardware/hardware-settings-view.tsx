@@ -33,9 +33,11 @@ import { nodeSlotCount, nodesForSystem, getHardwareStats, masterNode } from "@/l
 import { NetworkPanel } from "../network/network-panel"
 import { newId } from "@/lib/filament"
 import { HARDWARE_COLORS } from "@/lib/hardware"
-import type { StorageNode } from "@/lib/types"
+import type { MotorMode, StorageNode } from "@/lib/types"
 import { Button } from "../ui/button"
 import { Field, Input, Checkbox } from "../ui/field"
+import { MotorDrivePicker } from "../motor-drive-picker"
+import { MotorDriveEditor } from "../motor-drive-editor"
 import {
   draftFromNode,
   draftToConfig,
@@ -361,6 +363,7 @@ function NodeList() {
             </div>
 
             {editingId === node.id && <NodeLayoutEditor node={node} onDone={() => setEditingId(null)} />}
+            {!isManual && <MotorDriveEditor node={node} />}
           </li>
         )
       })}
@@ -647,6 +650,7 @@ function AddNodeRow() {
   const [draft, setDraft] = useState<StorageDraft>(() => makeDraft("paternoster"))
   // "Real Pi" here means a physical slave linked by pairing code (no IP typed).
   const [hardware, setHardware] = useState(false)
+  const [motorMode, setMotorMode] = useState<MotorMode>("dc")
 
   const isShelf = draft.nodeType === "shelf"
   const isManual = draft.nodeType === "shelf" || draft.nodeType === "library"
@@ -654,6 +658,7 @@ function AddNodeRow() {
     setOpen(false)
     setDraft(makeDraft("paternoster"))
     setHardware(false)
+    setMotorMode("dc")
   }
 
   const canAdd = draft.name.trim().length > 0
@@ -669,6 +674,13 @@ function AddNodeRow() {
   return (
     <div className="space-y-4 rounded-xl border border-border bg-background/50 p-3">
       <StorageLayoutEditor draft={draft} onChange={setDraft} />
+
+      {!isManual && (
+        <div>
+          <p className="mb-1.5 text-sm font-medium text-muted-foreground">Motor drive</p>
+          <MotorDrivePicker value={motorMode} onChange={setMotorMode} compact />
+        </div>
+      )}
 
       {!isManual && (
         <div>
@@ -733,6 +745,7 @@ function AddNodeRow() {
               // linked by pairing code rather than a hand-typed IP.
               driver: "simulated",
               pair: !isManual && hardware,
+              motorMode: !isManual ? motorMode : undefined,
             })
             reset()
           }}

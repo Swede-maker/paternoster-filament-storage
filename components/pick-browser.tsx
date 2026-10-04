@@ -1,12 +1,13 @@
 "use client"
 
 import { useMemo, useState } from "react"
-import { Search, X, PackagePlus } from "lucide-react"
+import { Search, X, PackagePlus, Printer } from "lucide-react"
 import { useStore } from "@/lib/store"
+import { cn } from "@/lib/utils"
 import { Dialog, DialogHeader, DialogBody } from "./ui/dialog"
 import { Input } from "./ui/field"
 import { SpoolDisc, discColor2 } from "./spool"
-import { storedSpools, searchSpools } from "@/lib/selectors"
+import { storedSpools, searchSpools, loadedSpools, searchLoadedSpools } from "@/lib/selectors"
 import { formatGrams, isLightColor, spoolFill } from "@/lib/filament"
 import type { Spool } from "@/lib/types"
 
@@ -26,6 +27,7 @@ export function PickBrowser({
   onClose,
   onPick,
   onInspect,
+  onInspectLoaded,
   onNew,
   excludeIds = [],
   title = "Pick filament from storage",
@@ -38,6 +40,9 @@ export function PickBrowser({
   /** When provided (and no onPick), tapping a spool opens an action menu
    *  (load onto a printer / take out / cancel). */
   onInspect?: (spool: Spool, loc: BrowserLocation) => void
+  /** When provided, tapping a spool that is loaded on a printer opens the
+   *  take-off dialog so it can be moved into storage. */
+  onInspectLoaded?: (spool: Spool, printerId: string, slot: number) => void
   /** When provided, shows a "Create new spool" option that loads a fresh spool
    *  straight onto the printer (no storage step). */
   onNew?: () => void
@@ -53,6 +58,15 @@ export function PickBrowser({
     return searchSpools(all, q)
   }, [state, q, excludeIds])
 
+  // Spools sitting on a printer can't be picked from storage, but they should
+  // still be findable so nobody goes hunting for a spool that is in the AMS.
+  const onPrinter = useMemo(() => {
+    const all = loadedSpools(state).filter((e) => !excludeIds.includes(e.spool.id))
+    return searchLoadedSpools(all, q)
+  }, [state, q, excludeIds])
+
+  const nothingFound = entries.length === 0 && onPrinter.length === 0
+
   return (
     <Dialog open={open} onClose={onClose} className="max-w-2xl">
       <DialogHeader
@@ -60,9 +74,9 @@ export function PickBrowser({
         title={title}
         description={
           onInspect && !onPick
-            ? "Tap a spool to load it onto a printer or take it out."
+            ? "Tap a stored spool to load it onto a printer or take it out. Tap a spool on a printer to move it into storage."
             : readOnly
-              ? "Browse all filament in storage."
+              ? "Browse all filament in storage and on your printers."
               : onNew
                 ? "Pick a stored spool, or create a brand-new one."
                 : "Tap a spool to add it to the queue."
@@ -108,7 +122,7 @@ export function PickBrowser({
           </button>
         )}
 
-        {entries.length === 0 ? (
+        {nothingFound ? (
           <p className="py-10 text-center text-sm text-muted-foreground">
             {q
               ? "No filament matches your search."
@@ -117,7 +131,15 @@ export function PickBrowser({
                 : "No filament in storage yet."}
           </p>
         ) : (
-          <ul className="grid max-h-[50vh] grid-cols-2 gap-2 overflow-y-auto scrollbar-thin sm:grid-cols-3">
+          <div className="max-h-[50vh] space-y-4 overflow-y-auto scrollbar-thin">
+            {entries.length > 0 && (
+              <section aria-label="In storage">
+                {onPrinter.length > 0 && (
+                  <h3 className="mb-2 text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
+                    In storage
+                  </h3>
+                )}
+                <ul className="grid grid-cols-2 gap-2 sm:grid-cols-3">
             {entries.map(({ spool, loc, nodeId, nodeName, shelfName }) => (
               <li key={spool.id}>
                 <button
@@ -151,7 +173,67 @@ export function PickBrowser({
                 </button>
               </li>
             ))}
-          </ul>
+                </ul>
+              </section>
+            )}
+
+            {onPrinter.length > 0 && (
+              <section aria-label="Loaded on a printer">
+                <h3 className="mb-2 flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
+                  <Printer className="h-3.5 w-3.5" />
+                  Loaded on a printer
+                </h3>
+                <ul className="grid grid-cols-2 gap-2 sm:grid-cols-3">
+                  {onPrinter.map(({ spool, printerId, index, printerName, printerKind, slotLabel, unitName, unitSlot }) => {
+                    const where =
+                      printerKind === "ams"
+                        ? `${unitName ?? "AMS"} · Slot ${unitSlot ?? "?"}`
+                        : printerKind === "toolchanger"
+                          ? `Tool ${slotLabel}`
+                          : "Loaded"
+                    const tappable = Boolean(onInspectLoaded)
+                    return (
+                    <li key={spool.id}>
+                      <button
+                        type="button"
+                        disabled={!tappable}
+                        onClick={() => onInspectLoaded?.(spool, printerId, index)}
+                        className={cn(
+                          "flex w-full flex-col items-center gap-2 rounded-xl border border-dashed border-border bg-background/30 p-3 text-center transition-colors",
+                          tappable ? "hover:border-primary/60 hover:bg-secondary/40" : "cursor-default",
+                        )}
+                        aria-label={`${spool.material} ${spool.colorName}, loaded on ${printerName} — ${where}. ${tappable ? "Tap to take off the printer and store it." : ""}`}
+                        title={`${printerName} — ${where}${tappable ? " · tap to move into storage" : ""}`}
+                      >
+                        <SpoolDisc color={spool.color} color2={discColor2(spool)} size={56} fill={spoolFill(spool)} />
+                        <span
+                          className="text-sm font-semibold"
+                          style={{ color: isLightColor(spool.color) ? "#d4d4d8" : spool.color }}
+                        >
+                          {spool.material}
+                        </span>
+                        <span className="text-xs text-muted-foreground">{spool.colorName}</span>
+                        <span className="text-[11px] text-muted-foreground/80">
+                          {spool.brand} · {formatGrams(spool.grams)}
+                        </span>
+                        <span className="inline-flex flex-col items-center gap-0.5 rounded-md bg-primary/10 px-2 py-1 font-mono text-[10px] text-primary">
+                          <span className="flex items-center gap-1 font-semibold">
+                            <Printer className="h-3 w-3" />
+                            {printerName}
+                          </span>
+                          <span className="text-primary/80">{where}</span>
+                        </span>
+                        {tappable && (
+                          <span className="text-[10px] text-muted-foreground">Tap to move into storage</span>
+                        )}
+                      </button>
+                    </li>
+                    )
+                  })}
+                </ul>
+              </section>
+            )}
+          </div>
         )}
       </DialogBody>
     </Dialog>

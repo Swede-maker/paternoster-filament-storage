@@ -27,11 +27,16 @@ import {
   loadBoostPctFor,
   boostDuty,
   formatGrams,
-} from "@/lib/filament"
+  isServoNode,
+  servoGearRatioFor,
+  servoSprocketRpmFor,
+  formatRpm,
+  } from "@/lib/filament"
 import { Button } from "./ui/button"
 import { cn } from "@/lib/utils"
 import { usePersistentBoolean } from "@/lib/use-persistent"
 import type { StorageNode } from "@/lib/types"
+import { ServoJogPanel } from "./servo-jog-panel"
 
 export function ManualControl({ node: nodeProp }: { node?: StorageNode } = {}) {
   const { state, dispatch } = useStore()
@@ -61,6 +66,16 @@ export function ManualControl({ node: nodeProp }: { node?: StorageNode } = {}) {
 
   // Speed controls only apply to a motorized carousel, not manual shelf storage.
   const isCarousel = node.type !== "shelf"
+  // Servo (PUL/DIR) drive: the same 0..1 speed fraction becomes a pulse rate
+  // instead of a PWM duty, so the sliders are relabelled and the jog panel
+  // appears. The motion commands themselves are identical in both modes.
+  const servo = isCarousel && isServoNode(node)
+  const speedUnit = servo ? "speed" : "PWM"
+  // With a gearbox the sprocket speed is what the user can relate to the
+  // carousel; without one it equals the motor speed, so the label just says rpm.
+  const geared = servoGearRatioFor(node) !== 1
+  const rpm = (fraction: number) =>
+    `${formatRpm(servoSprocketRpmFor(node, fraction))} rpm${geared ? " sprocket" : ""}`
   const rampPct = node.rampPct ?? DEFAULT_RAMP_PCT
   // Resolved through the same helper the Pi is configured from, so the slider
   // shows the duty homing will actually use — including while it is tracking the
@@ -369,23 +384,26 @@ export function ManualControl({ node: nodeProp }: { node?: StorageNode } = {}) {
             <span>Gentle</span>
           </div>
           <p className="mt-1 text-[10px] leading-relaxed text-muted-foreground">
-            Affects starting only. Stopping is always immediate — the motor cuts
-            the moment the shelf sensor triggers.
+            {servo
+              ? "Ramps the pulse rate up from standstill so the servos never jerk the chains. Stopping is always immediate — the pulse train halts the moment the shelf sensor triggers and the servos hold position."
+              : "Affects starting only. Stopping is always immediate — the motor cuts the moment the shelf sensor triggers."}
           </p>
 
           {/* Direct PWM duty. The speed slider above is in seconds-per-shelf and
               its duty curve is clamped to 25–100%, which cannot express the very
               low duties a heavy carousel needs to stop coasting past the sensor
-              flag. This sends the duty to the motor as-is. */}
+              flag. This sends the duty to the motor as-is. In servo mode the same
+              fraction scales the pulse frequency instead. */}
           <div className="mt-4 flex items-center justify-between">
-            <p className="text-xs uppercase tracking-wider text-muted-foreground">Motor PWM</p>
+            <p className="text-xs uppercase tracking-wider text-muted-foreground">Motor {speedUnit}</p>
             <span className="font-mono text-xs text-foreground">
               {node.pwmDuty === undefined ? "Auto" : `${Math.round(node.pwmDuty * 100)}%`}
+              {servo && ` · ${rpm(moveDutyFor(node))}`}
             </span>
           </div>
           <input
             type="range"
-            aria-label="Direct motor PWM duty (percent)"
+            aria-label={servo ? "Motor speed as percent of the top pulse rate" : "Direct motor PWM duty (percent)"}
             min={5}
             max={100}
             step={1}
@@ -401,8 +419,9 @@ export function ManualControl({ node: nodeProp }: { node?: StorageNode } = {}) {
             <span>100%</span>
           </div>
           <p className="mt-1 text-[10px] leading-relaxed text-muted-foreground">
-            Sets the motor speed directly. Lower it until the carousel stops overshooting the shelf
-            sensor.
+            {servo
+              ? "Scales the pulse rate the servos follow. Servos brake hard, so overshoot is rare; raise this until the chains start to skip, then back off. Set the top rate in Settings → Motor drive."
+              : "Sets the motor speed directly. Lower it until the carousel stops overshooting the shelf sensor."}
           </p>
 
           {/* Homing duty, separate from the move duty above. Homing hunts a
@@ -411,16 +430,17 @@ export function ManualControl({ node: nodeProp }: { node?: StorageNode } = {}) {
               because every later shelf position is measured from where homing
               decided "zero" is. Left untouched it tracks the move duty. */}
           <div className="mt-4 flex items-center justify-between">
-            <p className="text-xs uppercase tracking-wider text-muted-foreground">Homing PWM</p>
+            <p className="text-xs uppercase tracking-wider text-muted-foreground">Homing {speedUnit}</p>
             <span className="font-mono text-xs text-foreground">
               {node.homingDuty === undefined
                 ? `Auto · ${Math.round(homingDuty * 100)}%`
                 : `${Math.round(homingDuty * 100)}%`}
+              {servo && ` · ${rpm(homingDuty)}`}
             </span>
           </div>
           <input
             type="range"
-            aria-label="Homing motor PWM duty (percent)"
+            aria-label={servo ? "Homing speed as percent of the top pulse rate" : "Homing motor PWM duty (percent)"}
             min={5}
             max={100}
             step={1}
@@ -441,7 +461,7 @@ export function ManualControl({ node: nodeProp }: { node?: StorageNode } = {}) {
           </div>
           <p className="mt-1 text-[10px] leading-relaxed text-muted-foreground">
             {node.homingDuty === undefined ? (
-              <>Following Motor PWM at {Math.round(HOMING_DUTY_RATIO * 100)}%. Drag to set it yourself.</>
+              <>Following Motor {speedUnit} at {Math.round(HOMING_DUTY_RATIO * 100)}%. Drag to set it yourself.</>
             ) : (
               <>
                 Set manually.{" "}
@@ -453,7 +473,7 @@ export function ManualControl({ node: nodeProp }: { node?: StorageNode } = {}) {
                   }
                   className="underline underline-offset-2 transition-colors hover:text-foreground disabled:opacity-40"
                 >
-                  Follow Motor PWM
+                  Follow Motor {speedUnit}
                 </button>{" "}
                 instead.
               </>
@@ -470,11 +490,12 @@ export function ManualControl({ node: nodeProp }: { node?: StorageNode } = {}) {
               {node.approachDuty === undefined
                 ? `Auto · ${Math.round(approachDuty * 100)}%`
                 : `${Math.round(approachDuty * 100)}%`}
+              {servo && ` · ${rpm(approachDuty)}`}
             </span>
           </div>
           <input
             type="range"
-            aria-label="Slow approach PWM duty for the final shelf (percent)"
+            aria-label={servo ? "Slow approach speed for the final shelf (percent of top pulse rate)" : "Slow approach PWM duty for the final shelf (percent)"}
             min={5}
             max={100}
             step={1}
@@ -623,6 +644,11 @@ export function ManualControl({ node: nodeProp }: { node?: StorageNode } = {}) {
           )}
         </div>
       )}
+
+          {/* Per-motor jog for chain alignment on both drives: exact pulses on
+              the servo pair (plus ALM lamps), timed milliseconds on the two DC
+              bridges. */}
+          {isCarousel && !stopped && <ServoJogPanel node={node} />}
 
       <div className="mt-4 rounded-xl border border-border bg-background/50 p-3">
         <p className="text-xs uppercase tracking-wider text-muted-foreground">Current Position</p>
