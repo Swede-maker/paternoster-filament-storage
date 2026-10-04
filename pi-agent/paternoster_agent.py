@@ -174,6 +174,8 @@ SERVO_MIN_PPS = 200
 # few kHz the edges jitter and the drive loses pulses). Hardware PWM has no
 # such limit short of the drive's own 300 kHz.
 SERVO_SOFT_PWM_MAX_PPS = 5000
+# Only used in error messages.
+RUN_USER_HINT = os.environ.get("USER") or os.environ.get("LOGNAME") or "the service user"
 # Idle frequency programmed into the PWM channel while it is switched off.
 SERVO_IDLE_HZ = 1000
 # Micro-jog pulse rate. Deliberately slow (bit-banged, exact pulse count) so a
@@ -903,16 +905,29 @@ class _SysfsPwm:
                 if os.access(os.path.join(self.path, "enable"), os.W_OK):
                     break
                 time.sleep(0.02)
-        self._period_ns = 0
+        # The kernel rejects ANY state with period 0 (enable, duty, everything),
+        # so on a freshly exported channel the period must be written first.
+        # A channel left over from a previous run may be enabled with a stale
+        # duty; zero that before shrinking the period or the write fails too.
+        self._period_ns = self._read_int("period")
         self._duty = 0.0
-        self._write("enable", "0")
-        self._write("duty_cycle", "0")
+        if self._period_ns > 0:
+            self._write("duty_cycle", "0")
+            self._write("enable", "0")
         self.frequency = SERVO_IDLE_HZ
+        self._write("duty_cycle", "0")
         self._write("enable", "1")
 
     def _write(self, name: str, text: str) -> None:
         with open(os.path.join(self.path, name), "w", encoding="ascii") as fh:
             fh.write(text)
+
+    def _read_int(self, name: str) -> int:
+        try:
+            with open(os.path.join(self.path, name), encoding="ascii") as fh:
+                return int(fh.read().strip() or 0)
+        except (OSError, ValueError):
+            return 0
 
     @property
     def frequency(self) -> int:
@@ -924,8 +939,10 @@ class _SysfsPwm:
         if period == self._period_ns:
             return
         # The kernel refuses duty_cycle > period, so shrink duty before a
-        # shorter period and re-apply it afterwards.
-        self._write("duty_cycle", "0")
+        # shorter period and re-apply it afterwards. (Skip the zeroing on a
+        # fresh channel: with period 0 even that write is rejected.)
+        if self._period_ns > 0:
+            self._write("duty_cycle", "0")
         self._write("period", str(period))
         self._period_ns = period
         self._apply_duty()
@@ -948,6 +965,13 @@ class _SysfsPwm:
             self._write("enable", "0")
         except OSError:
             pass
+
+    @classmethod
+    def chips_present(cls) -> bool:
+        try:
+            return any(d.startswith("pwmchip") for d in os.listdir(cls.PWM_ROOT))
+        except OSError:
+            return False
 
     @classmethod
     def open_pair(cls) -> Optional[tuple["_SysfsPwm", "_SysfsPwm"]]:
@@ -1035,10 +1059,22 @@ class ServoHardware(RealHardware):
             self.pulse_backend = "hardware"
             self.pps_cap = 300_000
         else:
-            self.pul = (
-                PWMOutputDevice(PIN_SERVO_PUL_A, frequency=SERVO_IDLE_HZ, initial_value=0),
-                PWMOutputDevice(PIN_SERVO_PUL_B, frequency=SERVO_IDLE_HZ, initial_value=0),
-            )
+            try:
+                self.pul = (
+                    PWMOutputDevice(PIN_SERVO_PUL_A, frequency=SERVO_IDLE_HZ, initial_value=0),
+                    PWMOutputDevice(PIN_SERVO_PUL_B, frequency=SERVO_IDLE_HZ, initial_value=0),
+                )
+            except Exception as exc:
+                # Once the pwm overlay owns GPIO 12/13 they cannot be claimed as
+                # plain outputs ("GPIO busy"). Say what actually went wrong
+                # instead of letting a generic GPIO error send us to simulation.
+                if _SysfsPwm.chips_present():
+                    raise RuntimeError(
+                        f"servo PUL pins are reserved by the hardware PWM overlay but the PWM "
+                        f"channels could not be opened ({exc}). Check that {RUN_USER_HINT} may write "
+                        f"/sys/class/pwm (gpio group + udev rule) — see `journalctl -u paternoster-agent`."
+                    ) from exc
+                raise
             self.pulse_backend = "software"
             self.pps_cap = SERVO_SOFT_PWM_MAX_PPS
             print(
@@ -2847,6 +2883,14 @@ async def serve(args) -> None:
                 )
             return built, None
         except Exception as exc:
+            if mode == "servo":
+                print(
+                    "[agent] ******************************************************************\n"
+                    f"[agent] * SERVO HARDWARE FAILED TO START: {exc}\n"
+                    "[agent] * The app will show the carousel moving but the motors will NOT.\n"
+                    "[agent] ******************************************************************",
+                    flush=True,
+                )
             if args.strict_gpio:
                 # Refuse to pretend. Better a dead service you can see in
                 # `systemctl status` than a live one that quietly does nothing.

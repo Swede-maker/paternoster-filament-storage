@@ -36,6 +36,15 @@ WorkingDirectory=__DIR__
 # makes `journalctl` show only systemd's own "Started ..." lines and none of the
 # agent's, which reads as a dead agent even when it is running perfectly.
 Environment=PYTHONUNBUFFERED=1
+# Free the port before starting. A stray agent (started by hand with
+# `python3 paternoster_agent.py`, or left over from a crashed update) holds
+# both the port and the GPIO lines, so the new one would fail with "address
+# in use" / "GPIO busy" and restart forever. Killing by PORT rather than by
+# process name keeps a second agent on another port (two units, one Pi) alive.
+# `+` runs as root so it can reach a stray started with sudo; `-` means a
+# clean port is not an error. SIGTERM lets the old agent release GPIO cleanly.
+ExecStartPre=-+/usr/bin/fuser -k -TERM __PORT__/tcp
+ExecStartPre=-/bin/sleep 1
 ExecStart=/usr/bin/python3 __DIR__/paternoster_agent.py --name "__NAME__" --shelves __SHELVES__ --port __PORT__ __EXTRA_ARGS__
 # Set by install.sh when needed (a Pi 5 requires the lgpio pin factory).
 __ENVIRONMENT__

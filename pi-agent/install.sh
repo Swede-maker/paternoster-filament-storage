@@ -358,6 +358,23 @@ if grep -vE '^\s*#' "$UNIT" | grep -q "__"; then
   exit 1
 fi
 
+# The unit's ExecStartPre frees the port with fuser (package psmisc). It is on
+# every Raspberry Pi OS image, but make sure, since a missing binary would
+# just be skipped and the stale-process protection silently lost.
+if ! command -v fuser >/dev/null 2>&1; then
+  apt-get install -y -qq psmisc >/dev/null 2>&1 || echo "[install] warning: could not install psmisc (fuser)"
+fi
+
+# Stop anything already serving this port that systemd does not know about —
+# an agent started by hand for testing is the classic case. The service's own
+# ExecStartPre does the same on every later start.
+STRAY=$(fuser "$PORT"/tcp 2>/dev/null || true)
+if [[ -n "$STRAY" ]]; then
+  echo "[install] stopping stray process on port $PORT (pid$STRAY)"
+  fuser -k -TERM "$PORT"/tcp >/dev/null 2>&1 || true
+  sleep 1
+fi
+
 systemctl daemon-reload
 systemctl enable paternoster-agent >/dev/null 2>&1 || true
 systemctl restart paternoster-agent
