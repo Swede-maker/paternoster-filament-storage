@@ -13,11 +13,33 @@ function parseCommand(body: unknown): NodeCommand | null {
     case "hello":
     case "home":
     case "stop":
+    case "release":
+    case "hold":
       return { type }
     case "goto": {
       const shelf = (body as { shelf?: unknown }).shelf
       if (typeof shelf !== "number" || !Number.isInteger(shelf) || shelf < 0) return null
       return { type: "goto", shelf }
+    }
+    case "jog": {
+      const b = body as { motor?: unknown; direction?: unknown; pulses?: unknown; ms?: unknown; speed?: unknown }
+      if (b.motor !== "a" && b.motor !== "b" && b.motor !== "both") return null
+      if (b.direction !== "up" && b.direction !== "down") return null
+      // Exactly one amount: pulses (servo) or ms (DC). Both or neither is a bug.
+      const amountInt = (v: unknown, max: number) =>
+        typeof v === "number" && Number.isInteger(v) && v > 0 && v <= max ? v : undefined
+      const pulses = amountInt(b.pulses, 20_000)
+      const ms = amountInt(b.ms, 5_000)
+      if ((pulses === undefined) === (ms === undefined)) return null
+      const cmd: NodeCommand = { type: "jog", motor: b.motor, direction: b.direction }
+      if (pulses !== undefined) cmd.pulses = pulses
+      if (ms !== undefined) {
+        cmd.ms = ms
+        if (typeof b.speed === "number" && Number.isFinite(b.speed) && b.speed > 0 && b.speed <= 1) {
+          cmd.speed = b.speed
+        }
+      }
+      return cmd
     }
     case "config": {
       const b = body as {
@@ -26,6 +48,11 @@ function parseCommand(body: unknown): NodeCommand | null {
         homingSpeed?: unknown
         rampPct?: unknown
         approachSpeed?: unknown
+        motorMode?: unknown
+        servoPulsesPerRev?: unknown
+        servoMaxPps?: unknown
+        servoMirrorB?: unknown
+        servoHoldTimeoutS?: unknown
       }
       if (typeof b.shelves !== "number" || !Number.isInteger(b.shelves) || b.shelves <= 0) return null
       // Rebuilding the command field-by-field is what dropped the slider values:
@@ -41,6 +68,19 @@ function parseCommand(body: unknown): NodeCommand | null {
       if (approachSpeed !== undefined) cmd.approachSpeed = approachSpeed
       if (typeof b.rampPct === "number" && Number.isFinite(b.rampPct) && b.rampPct >= 0 && b.rampPct <= 100) {
         cmd.rampPct = Math.round(b.rampPct)
+      }
+      if (b.motorMode === "dc" || b.motorMode === "servo") cmd.motorMode = b.motorMode
+      const posInt = (v: unknown, max: number) =>
+        typeof v === "number" && Number.isInteger(v) && v > 0 && v <= max ? v : undefined
+      const ppr = posInt(b.servoPulsesPerRev, 32767)
+      const pps = posInt(b.servoMaxPps, 300_000)
+      if (ppr !== undefined) cmd.servoPulsesPerRev = ppr
+      if (pps !== undefined) cmd.servoMaxPps = pps
+      if (typeof b.servoMirrorB === "boolean") cmd.servoMirrorB = b.servoMirrorB
+      // 0 is meaningful here (= hold for ever), so it is not a "positive int".
+      const hold = b.servoHoldTimeoutS
+      if (typeof hold === "number" && Number.isInteger(hold) && hold >= 0 && hold <= 86_400) {
+        cmd.servoHoldTimeoutS = hold
       }
       return cmd
     }
