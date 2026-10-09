@@ -94,8 +94,11 @@ apt-get update -qq
 apt-get install -y -qq python3-websockets python3-gpiozero >/dev/null
 
 # --- pin factory ------------------------------------------------------------
-# Pi 5 uses a different GPIO chip; gpiozero needs lgpio to drive it. Without
-# this the agent cannot init GPIO and silently simulates motion instead.
+# lgpio is installed on every model so a minimal OS image without any GPIO
+# backend still works. Only the Pi 5 strictly needs it: its GPIO chip is
+# unsupported by RPi.GPIO, so there the install must succeed and gpiozero is
+# pinned to lgpio. On a Pi 3/4 a failed install is only a warning, and the
+# factory is left unpinned so an optional pigpio setup keeps working.
 ENVIRONMENT=""
 MODEL="$(tr -d '\0' < /proc/device-tree/model 2>/dev/null || echo unknown)"
 echo "[install] detected board: $MODEL"
@@ -103,6 +106,11 @@ if [[ "$MODEL" == *"Raspberry Pi 5"* ]]; then
   echo "[install] Pi 5 detected — installing lgpio pin factory"
   apt-get install -y -qq python3-lgpio >/dev/null
   ENVIRONMENT='Environment=GPIOZERO_PIN_FACTORY=lgpio'
+else
+  echo "[install] installing lgpio as a fallback GPIO backend"
+  if ! apt-get install -y -qq python3-lgpio >/dev/null 2>&1; then
+    echo "[install] warning: python3-lgpio unavailable — using the system's existing GPIO backend"
+  fi
 fi
 
 # --- gpio access ------------------------------------------------------------

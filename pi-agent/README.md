@@ -157,6 +157,13 @@ enables two things:
   other way, the index edge is the far side of the window, which is why the
   window width is measured too.
 
+- **Home only** positioning: identical to *Servo pulses*, for builds with **no
+  shelf sensor at all**: only the index (home) sensor is wired. Calibration
+  skips the shelf-flag count, the shelf lamp is hidden, and a floating shelf
+  input is ignored. Because there is nothing to fall back to, a shelf move
+  before the first calibration is refused with a fault instead of counting a
+  dead input; jog, Home and Calibrate always work.
+
 Changing the shelf count in the app does not need a re-run: the pitch is
 recomputed from the same revolution. Re-run after mechanical changes (sprocket,
 chain, shelves added or removed).

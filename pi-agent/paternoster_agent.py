@@ -91,6 +91,9 @@ PIN_MOTOR_EN = PIN_MOTOR_A_EN
 # opposite way for the same chain direction. Flip from the app if yours is
 # wired alike (shares the "Mirror motor B" switch with the servo backend).
 DC_MIRROR_B = True
+# Largest PWM balance the app may ask for, in percent of duty taken off the
+# faster bridge. Mirrors MAX_DC_TRIM_PCT in lib/filament.ts.
+DC_TRIM_MAX_PCT = 20.0
 # Timed jog on a DC bridge. There is no step unit, so a jog is "run this motor
 # for N milliseconds" at a fixed duty; the app's step size is in ms. The duty
 # defaults to the same cruise duty as a move so a single motor reliably breaks
@@ -109,6 +112,12 @@ DC_JOG_SLICE_S = 0.01
 # pulse is what made a move of N shelves finish after N-1.
 PIN_SHELF_SENSOR = 23
 PIN_INDEX_SENSOR = 24  # inductive sensor: active only at shelf 1 (home)
+# Twin carousels (hardware only): two independent carousels on one Pi. The LEFT
+# one uses motor A and the sensors above; the RIGHT one uses motor B and its own
+# shelf + home sensors on these pins (wired exactly like 23/24).
+PIN_SHELF_SENSOR_R = 19
+PIN_INDEX_SENSOR_R = 4
+TWIN_SIDES = ("left", "right")
 
 # --------------------------------------------------------------------------
 # Servo drive mode: two StepperOnline iSV57T integrated servos on PUL/DIR.
@@ -158,6 +167,9 @@ SERVO_ENABLE_SETTLE_S = 1.2
 # with the optional supply relay wired. The app overrides this per unit via
 # `config.servoHoldTimeoutS`.
 SERVO_HOLD_TIMEOUT_S = 0
+# Upper bound for the operator's "safe move time" (config.sensorArmS): how long
+# after a move or homing run starts the sensors are ignored. 0 = off (default).
+SENSOR_ARM_MAX_S = 10.0
 
 # Pulses per motor revolution. Must equal the drive's DIP S1–S3 setting (or
 # Pr0.08 when S1–S3 are all OFF). Factory default is 4000 → 0.09° per pulse.
@@ -221,11 +233,16 @@ STOP_RAMP_SECONDS = 0.25
 # cruise-speed pitch this fraction is taken from.
 DECEL_LEG_FRACTION = 0.6
 PULSE_TIMEOUT = 8.0   # seconds to wait for the next shelf pulse before faulting
-HOME_TIMEOUT = 30.0   # seconds to find the index sensor before faulting
+HOME_TIMEOUT = 30.0   # default seconds to find the index sensor before faulting
 # The servo build turns the carousel through a 1:50 gearbox and is a good deal
 # slower between flags than the DC build these timeouts were tuned on, so give
 # it twice as long before calling a move or a homing run stuck. DC keeps 1x.
 SERVO_TIMEOUT_SCALE = 2.0
+# The operator can override the homing time per carousel from Settings →
+# Motor drive → "Homing time" (config.homeTimeoutS). The drive default is
+# HOME_TIMEOUT × the scale above (30 s DC / 60 s servo). Bounds below.
+HOME_TIMEOUT_MIN_S = 5.0
+HOME_TIMEOUT_MAX_S = 600.0
 # How often a long sensor wait re-checks for an emergency stop. Small enough to
 # feel instant to an operator, large enough not to spin the CPU.
 ABORT_POLL_SECONDS = 0.02
@@ -513,6 +530,11 @@ def save_motor_conf(conf: dict) -> None:
 # ==========================================================================
 # Hardware backends
 # ==========================================================================
+def _present(devices) -> tuple:
+    """GPIO devices that exist (twin mode leaves the other side's channel None)."""
+    return tuple(d for d in devices if d is not None)
+
+
 class RealHardware:
     """
     Drives real GPIO through gpiozero: two DC motors, each on its own BTS7960
@@ -528,11 +550,22 @@ class RealHardware:
 
     motor_mode = "dc"
 
-    def __init__(self, mirror_b: Optional[bool] = None) -> None:
+    def __init__(
+        self,
+        mirror_b: Optional[bool] = None,
+        motor_index: Optional[int] = None,
+        shelf_pin: int = PIN_SHELF_SENSOR,
+        index_pin: int = PIN_INDEX_SENSOR,
+    ) -> None:
         from gpiozero import DigitalInputDevice  # imported lazily
 
         if mirror_b is not None:
             self.mirror_b = bool(mirror_b)
+        # Twin carousels: this backend owns ONE motor (0 = A, 1 = B) and only
+        # claims that motor's pins, so a second backend can own the other one.
+        self.motor_index = motor_index if motor_index in (0, 1) else None
+        # Twin side only: run this carousel's one motor the other way round.
+        self.reverse = False
         self._init_motor()
         # An NPN (sinking) sensor pulls the line to GND when it detects a shelf,
         # so we pull the pin up and let gpiozero treat LOW as active. A PNP
@@ -540,8 +573,8 @@ class RealHardware:
         # gpiozero derives `is_active` from pull_up, so the rest of this class
         # stays level-agnostic and only this flag has to change.
         pull_up = SENSOR_TYPE.upper() == "NPN"
-        self.shelf = DigitalInputDevice(PIN_SHELF_SENSOR, pull_up=pull_up, bounce_time=SENSOR_BOUNCE)
-        self.index = DigitalInputDevice(PIN_INDEX_SENSOR, pull_up=pull_up, bounce_time=SENSOR_BOUNCE)
+        self.shelf = DigitalInputDevice(shelf_pin, pull_up=pull_up, bounce_time=SENSOR_BOUNCE)
+        self.index = DigitalInputDevice(index_pin, pull_up=pull_up, bounce_time=SENSOR_BOUNCE)
 
         # ------------------------------------------------------------------
         # Sensors are EDGE COUNTERS, never a power gate.
@@ -676,6 +709,25 @@ class RealHardware:
     # `mirror_b` is read by `_init_motor` through `getattr` so a subclass that
     # does not set it (ServoHardware has its own) still constructs cleanly.
     mirror_b: bool = DC_MIRROR_B
+    # PWM balance from the app's "Motor balance" slider, -20..+20 %. Two
+    # brushed motors never match for the same duty, so the FASTER bridge is
+    # scaled down: negative trims A, positive trims B, 0 = equal duty.
+    dc_trim_pct: float = 0.0
+
+    def _channels(self) -> tuple:
+        """Motor indexes this backend owns: both, or just its twin-side motor."""
+        mi = getattr(self, "motor_index", None)
+        return (mi,) if mi in (0, 1) else (0, 1)
+
+    def _trim_scale(self, index: int) -> float:
+        if getattr(self, "motor_index", None) is not None:
+            return 1.0  # balance only means something with two motors
+        t = max(-DC_TRIM_MAX_PCT, min(DC_TRIM_MAX_PCT, float(self.dc_trim_pct)))
+        if index == 0 and t < 0:
+            return 1.0 + t / 100.0
+        if index == 1 and t > 0:
+            return 1.0 - t / 100.0
+        return 1.0
 
     def _init_motor(self) -> None:
         from gpiozero import Motor, DigitalOutputDevice
@@ -685,37 +737,50 @@ class RealHardware:
         # drives one pin with the duty cycle and holds the other at 0.
         # Index 0 is motor A, index 1 is motor B — the same order the servo
         # backend and the `jog` command use.
-        self.motors = (
-            Motor(forward=PIN_MOTOR_A_RPWM, backward=PIN_MOTOR_A_LPWM, pwm=True),
-            Motor(forward=PIN_MOTOR_B_RPWM, backward=PIN_MOTOR_B_LPWM, pwm=True),
+        # An unowned channel (twin mode) stays None so its pins remain free.
+        pins = (
+            (PIN_MOTOR_A_RPWM, PIN_MOTOR_A_LPWM, PIN_MOTOR_A_EN),
+            (PIN_MOTOR_B_RPWM, PIN_MOTOR_B_LPWM, PIN_MOTOR_B_EN),
+        )
+        owned = self._channels()
+        self.motors = tuple(
+            Motor(forward=p[0], backward=p[1], pwm=True) if i in owned else None
+            for i, p in enumerate(pins)
         )
         # R_EN and L_EN of each bridge tied to one GPIO: HIGH arms the bridge,
         # LOW makes the outputs float. Pulling this LOW is a true hardware stop
         # that works even if a PWM pin is stuck, so the estop path uses it.
-        self.enables = (
-            DigitalOutputDevice(PIN_MOTOR_A_EN, initial_value=True),
-            DigitalOutputDevice(PIN_MOTOR_B_EN, initial_value=True),
+        self.enables = tuple(
+            DigitalOutputDevice(p[2], initial_value=True) if i in owned else None
+            for i, p in enumerate(pins)
         )
         self._motor_lock = threading.Lock()
         self._jog_abort = False
 
     def _drive_one(self, index: int, forward: bool, speed: float) -> None:
         """Run ONE bridge in the carousel's `forward` sense, honouring mirror B."""
-        bridge_forward = forward if (index == 0 or not self.mirror_b) else (not forward)
+        if self.motors[index] is None:
+            return
+        if self.motor_index is not None:
+            # Twin side: one motor, flipped by its own "Reverse" switch only.
+            bridge_forward = forward != bool(getattr(self, "reverse", False))
+        else:
+            bridge_forward = forward if (index == 0 or not self.mirror_b) else (not forward)
+        duty = max(0.0, min(1.0, float(speed) * self._trim_scale(index)))
         self.enables[index].on()  # re-arm in case an estop left the bridge disabled
         if bridge_forward:
-            self.motors[index].forward(speed)
+            self.motors[index].forward(duty)
         else:
-            self.motors[index].backward(speed)
+            self.motors[index].backward(duty)
 
     def forward(self, speed: float) -> None:
         with self._motor_lock:
-            for i in (0, 1):
+            for i in self._channels():
                 self._drive_one(i, True, speed)
 
     def backward(self, speed: float) -> None:
         with self._motor_lock:
-            for i in (0, 1):
+            for i in self._channels():
                 self._drive_one(i, False, speed)
 
     def stop(self) -> None:
@@ -724,14 +789,17 @@ class RealHardware:
         # still applied.
         with self._motor_lock:
             for m in self.motors:
-                m.stop()
+                if m is not None:
+                    m.stop()
             for en in self.enables:
-                en.off()
+                if en is not None:
+                    en.off()
 
     def _close_motor(self) -> None:
         self.stop()  # leave both bridges disarmed on exit
         for dev in (*self.motors, *self.enables):
-            dev.close()
+            if dev is not None:
+                dev.close()
 
     def jog(self, motor: str, direction: str, amount: int, speed: Optional[float] = None) -> None:
         """
@@ -745,7 +813,11 @@ class RealHardware:
         if ms == 0:
             return
         duty = DC_JOG_DUTY if speed is None else max(SLIDER_MIN_DUTY, min(1.0, float(speed)))
-        targets = (0, 1) if motor == "both" else ((0,) if motor == "a" else (1,))
+        if self.motor_index is not None:
+            # Twin side: its one motor IS the carousel, whatever was asked.
+            targets = (self.motor_index,)
+        else:
+            targets = (0, 1) if motor == "both" else ((0,) if motor == "a" else (1,))
         # Same convention as Carousel._energise: "down" is the bridge's forward.
         forward = direction == "down"
         self._jog_abort = False
@@ -764,13 +836,15 @@ class RealHardware:
     def abort_jog(self) -> None:
         self._jog_abort = True
 
-    def set_servo_params(self, mirror_b=None, **_: object) -> None:
+    def set_servo_params(self, mirror_b=None, dc_trim_pct=None, **_: object) -> None:
         """
-        Drive tuning from the app's `config`. The DC bridge only cares about
-        `mirror_b`; pulses/rate are servo-only and ignored here.
+        Drive tuning from the app's `config`. The DC bridge cares about
+        `mirror_b` and the PWM balance; pulses/rate are servo-only and ignored.
         """
         if mirror_b is not None:
             self.mirror_b = bool(mirror_b)
+        if dc_trim_pct is not None:
+            self.dc_trim_pct = max(-DC_TRIM_MAX_PCT, min(DC_TRIM_MAX_PCT, float(dc_trim_pct)))
 
     def servo_snapshot(self) -> Optional[dict]:
         """
@@ -782,6 +856,7 @@ class RealHardware:
             "type": "servo",
             "mode": "dc",
             "mirrorB": self.mirror_b,
+            "dcTrimPct": self.dc_trim_pct,
             "jogMaxMs": DC_JOG_MAX_MS,
         }
 
@@ -937,38 +1012,51 @@ class ServoHardware(RealHardware):
         max_pps: int = SERVO_MAX_PPS,
         mirror_b: bool = SERVO_MIRROR_B,
         ignore_alarm: bool = False,
+        single_motor: bool = False,
+        motor_index: Optional[int] = None,
+        shelf_pin: int = PIN_SHELF_SENSOR,
+        index_pin: int = PIN_INDEX_SENSOR,
     ) -> None:
         self.pulses_per_rev = max(1, int(pulses_per_rev))
         self.max_pps = max(SERVO_MIN_PPS, min(300_000, int(max_pps)))
         self.mirror_b = bool(mirror_b)
+        # One-servo hardware carousel: only channel A is pulsed and monitored.
+        self.single_motor = bool(single_motor)
         # ALM has a pull-up, so an UNWIRED ALM pin reads exactly like a tripped
         # drive. Builds without ALM+/ALM- connected set this to run anyway.
         self.ignore_alarm = bool(ignore_alarm)
-        super().__init__()
+        super().__init__(motor_index=motor_index, shelf_pin=shelf_pin, index_pin=index_pin)
 
     def _init_motor(self) -> None:
         from gpiozero import PWMOutputDevice, DigitalOutputDevice, DigitalInputDevice
 
-        self.pul = (
-            PWMOutputDevice(PIN_SERVO_PUL_A, frequency=SERVO_IDLE_HZ, initial_value=0),
-            PWMOutputDevice(PIN_SERVO_PUL_B, frequency=SERVO_IDLE_HZ, initial_value=0),
+        # Twin mode claims only this side's channel; the other stays None so the
+        # second backend on the same Pi can own those pins.
+        owned = self._channels()
+
+        def pair(make_a, make_b):
+            return (make_a() if 0 in owned else None, make_b() if 1 in owned else None)
+
+        self.pul = pair(
+            lambda: PWMOutputDevice(PIN_SERVO_PUL_A, frequency=SERVO_IDLE_HZ, initial_value=0),
+            lambda: PWMOutputDevice(PIN_SERVO_PUL_B, frequency=SERVO_IDLE_HZ, initial_value=0),
         )
-        self.dir = (
-            DigitalOutputDevice(PIN_SERVO_DIR_A, initial_value=False),
-            DigitalOutputDevice(PIN_SERVO_DIR_B, initial_value=False),
+        self.dir = pair(
+            lambda: DigitalOutputDevice(PIN_SERVO_DIR_A, initial_value=False),
+            lambda: DigitalOutputDevice(PIN_SERVO_DIR_B, initial_value=False),
         )
         # ALM is an opto-isolated open-collector output that CONDUCTS in normal
         # operation and goes high-impedance on a fault. With the Pi's pull-up,
         # gpiozero's `is_active` (pin LOW) therefore means "healthy".
-        self.alm = (
-            DigitalInputDevice(PIN_SERVO_ALM_A, pull_up=True, bounce_time=0.05),
-            DigitalInputDevice(PIN_SERVO_ALM_B, pull_up=True, bounce_time=0.05),
+        self.alm = pair(
+            lambda: DigitalInputDevice(PIN_SERVO_ALM_A, pull_up=True, bounce_time=0.05),
+            lambda: DigitalInputDevice(PIN_SERVO_ALM_B, pull_up=True, bounce_time=0.05),
         )
         # Start ENGAGED (holding) so power-up matches the drive's own default.
         # `active_high` folds the opto polarity in: `.on()` always means "release".
-        self.ena = (
-            DigitalOutputDevice(PIN_SERVO_ENA_A, active_high=SERVO_ENA_ACTIVE_RELEASES, initial_value=False),
-            DigitalOutputDevice(PIN_SERVO_ENA_B, active_high=SERVO_ENA_ACTIVE_RELEASES, initial_value=False),
+        self.ena = pair(
+            lambda: DigitalOutputDevice(PIN_SERVO_ENA_A, active_high=SERVO_ENA_ACTIVE_RELEASES, initial_value=False),
+            lambda: DigitalOutputDevice(PIN_SERVO_ENA_B, active_high=SERVO_ENA_ACTIVE_RELEASES, initial_value=False),
         )
         self._held = True
         self._motor_lock = threading.Lock()
@@ -1020,7 +1108,7 @@ class ServoHardware(RealHardware):
         with self._motor_lock:
             if self._held:
                 return
-            for e in self.ena:
+            for e in _present(self.ena):
                 e.off()
             time.sleep(SERVO_ENABLE_SETTLE_S)
             self._held = True
@@ -1029,16 +1117,19 @@ class ServoHardware(RealHardware):
         """De-energise both servos so the carousel can be moved by hand."""
         with self._motor_lock:
             self._odo_segment(0, 0)
-            for p in self.pul:
+            for p in _present(self.pul):
                 p.value = 0
             self._pulsing = False
-            for e in self.ena:
+            for e in _present(self.ena):
                 e.on()
             self._held = False
 
     # The motion code's "forward"/"backward" map onto DIR levels here. Motor B
     # is mirrored when the two servos face each other across the carousel.
     def _dir_levels(self, forward: bool) -> tuple[bool, bool]:
+        if self.motor_index is not None:
+            level = forward != bool(getattr(self, "reverse", False))
+            return level, level
         a = forward
         b = (not forward) if self.mirror_b else forward
         return a, b
@@ -1046,6 +1137,19 @@ class ServoHardware(RealHardware):
     def _hz_for(self, speed: float) -> int:
         speed = max(0.0, min(1.0, float(speed)))
         return max(SERVO_MIN_PPS, int(round(speed * self.max_pps)))
+
+    def _active_pul(self) -> tuple:
+        """PUL outputs that drive the carousel: A only on a one-servo build."""
+        if self.motor_index is not None:
+            return _present(self.pul)
+        return self.pul[:1] if self.single_motor else self.pul
+
+    def _set_dir(self, forward: bool) -> None:
+        a, b = self._dir_levels(forward)
+        if self.dir[0] is not None:
+            self.dir[0].value = a
+        if self.dir[1] is not None:
+            self.dir[1].value = b
 
     def _run_pulses(self, forward: bool, speed: float) -> None:
         self.engage()
@@ -1055,15 +1159,13 @@ class ServoHardware(RealHardware):
                 # Never flip DIR under a running pulse train: stop, set the
                 # direction, give it the setup time the drive asks for, resume.
                 self._odo_segment(0, 0)
-                for p in self.pul:
+                for p in _present(self.pul):
                     p.value = 0
-                a, b = self._dir_levels(forward)
-                self.dir[0].value = a
-                self.dir[1].value = b
+                self._set_dir(forward)
                 time.sleep(SERVO_DIR_SETUP_S)
-            for p in self.pul:
+            for p in self._active_pul():
                 p.frequency = hz
-            for p in self.pul:
+            for p in self._active_pul():
                 p.value = 0.5
             self._odo_segment(hz, 1 if forward else -1)
             self._pulsing = True
@@ -1078,16 +1180,16 @@ class ServoHardware(RealHardware):
     def stop(self) -> None:
         with self._motor_lock:
             self._odo_segment(0, 0)
-            for p in self.pul:
+            for p in _present(self.pul):
                 p.value = 0
             self._pulsing = False
 
     def _close_motor(self) -> None:
         self.stop()
         # Leave the drives in their power-up (enabled) state, not released.
-        for e in self.ena:
+        for e in _present(self.ena):
             e.off()
-        for dev in (*self.pul, *self.dir, *self.alm, *self.ena):
+        for dev in _present((*self.pul, *self.dir, *self.alm, *self.ena)):
             dev.close()
 
     def jog(self, motor: str, direction: str, amount: int, speed: Optional[float] = None) -> None:
@@ -1102,19 +1204,29 @@ class ServoHardware(RealHardware):
         pulses = max(0, min(SERVO_JOG_MAX_PULSES, int(amount)))
         if pulses == 0:
             return
+        if self.motor_index is not None:
+            # Twin side: its one servo IS this carousel's drive.
+            motor = "both"
+            targets = (self.motor_index,)
+        elif self.single_motor:
+            # The one servo IS the carousel drive: any jog moves the carousel,
+            # and channel B has nothing connected.
+            if motor == "b":
+                return
+            motor = "both"
+            targets = (0,)
+        else:
+            targets = (0, 1) if motor == "both" else ((0,) if motor == "a" else (1,))
         self.engage()
-        targets = (0, 1) if motor == "both" else ((0,) if motor == "a" else (1,))
         # Same convention as Carousel._energise: "down" is the bridge's forward.
         forward = direction == "down"
         half = 0.5 / SERVO_JOG_PPS
         with self._motor_lock:
             self._odo_segment(0, 0)
-            for p in self.pul:
+            for p in _present(self.pul):
                 p.value = 0
             self._pulsing = False
-            a, b = self._dir_levels(forward)
-            self.dir[0].value = a
-            self.dir[1].value = b
+            self._set_dir(forward)
             time.sleep(SERVO_DIR_SETUP_S)
             self._jog_abort = False
             sent = 0
@@ -1136,7 +1248,13 @@ class ServoHardware(RealHardware):
                     self._odo_pulses += (1 if forward else -1) * sent
 
     def set_servo_params(
-        self, pulses_per_rev=None, max_pps=None, mirror_b=None, ignore_alarm=None, **_: object
+        self,
+        pulses_per_rev=None,
+        max_pps=None,
+        mirror_b=None,
+        ignore_alarm=None,
+        single_motor=None,
+        **_: object,
     ) -> None:
         if pulses_per_rev is not None:
             self.pulses_per_rev = max(1, int(pulses_per_rev))
@@ -1146,12 +1264,22 @@ class ServoHardware(RealHardware):
             self.mirror_b = bool(mirror_b)
         if ignore_alarm is not None:
             self.ignore_alarm = bool(ignore_alarm)
+        if single_motor is not None:
+            with self._motor_lock:
+                self.single_motor = bool(single_motor)
+                if self.single_motor and self.motor_index is None and self.pul[1] is not None:
+                    self.pul[1].value = 0
 
     def alarms(self) -> tuple[bool, bool]:
         """(motor A alarm, motor B alarm) — True when the drive has tripped."""
         if self.ignore_alarm:
             return (False, False)
-        return (not self.alm[0].is_active, not self.alm[1].is_active)
+        # An unused channel has no drive on its ALM, so its pull-up would read
+        # as a permanent fault; unowned / one-servo channels never report.
+        a = self.alm[0] is not None and not self.alm[0].is_active
+        b_used = self.alm[1] is not None and not (self.single_motor and self.motor_index is None)
+        b = b_used and not self.alm[1].is_active
+        return (a, b)
 
     def servo_snapshot(self) -> Optional[dict]:
         a, b = self.alarms()
@@ -1164,6 +1292,7 @@ class ServoHardware(RealHardware):
             "pulsesPerRev": self.pulses_per_rev,
             "maxPps": self.max_pps,
             "mirrorB": self.mirror_b,
+            "singleMotor": self.single_motor,
             "held": self._held,
         }
 
@@ -1316,13 +1445,15 @@ class SimHardware:
     def abort_jog(self) -> None:
         self._jog_abort = True
 
-    def set_servo_params(self, pulses_per_rev=None, max_pps=None, mirror_b=None, **_: object) -> None:
+    def set_servo_params(self, pulses_per_rev=None, max_pps=None, mirror_b=None, dc_trim_pct=None, **_: object) -> None:
         if pulses_per_rev is not None:
             self.pulses_per_rev = max(1, int(pulses_per_rev))
         if max_pps is not None:
             self.max_pps = max(SERVO_MIN_PPS, min(300_000, int(max_pps)))
         if mirror_b is not None:
             self.mirror_b = bool(mirror_b)
+        if dc_trim_pct is not None:
+            self.dc_trim_pct = max(-DC_TRIM_MAX_PCT, min(DC_TRIM_MAX_PCT, float(dc_trim_pct)))
 
     def __getattr__(self, name: str):
         # The odometer exists only on the servo drive. In DC mode the attribute
@@ -1483,6 +1614,9 @@ class Carousel:
         # carousel can be turned by hand. 0 = hold for ever. The watcher thread
         # below applies it; moves and jogs re-engage the servos themselves.
         self.hold_timeout_s = SERVO_HOLD_TIMEOUT_S
+        self.sensor_arm_s = 0.0
+        # Operator-set homing time; None = drive default (HOME_TIMEOUT × scale).
+        self.home_timeout_s: Optional[float] = None
         self._idle_since: Optional[float] = None
 
         # How a `goto` finds its shelf. "sensor": count shelf-flag edges (the
@@ -1535,11 +1669,19 @@ class Carousel:
         self._set_command(("calibrate",))
 
     def set_position_mode(self, mode) -> bool:
-        if mode not in ("sensor", "pulses") or mode == self.position_mode:
+        if mode not in ("sensor", "pulses", "index") or mode == self.position_mode:
             return False
         self.position_mode = mode
         print(f"[agent] positioning = {mode}", flush=True)
         return True
+
+    @property
+    def shelf_sensor_fitted(self) -> bool:
+        """False in "index" mode: only the home sensor is wired, every stop is by pulses."""
+        return self.position_mode != "index"
+
+    def _shelf_lamp(self) -> Optional[bool]:
+        return bool(self.hw.shelf_active()) if self.shelf_sensor_fitted else None
 
     def restore_calibration(self, info) -> bool:
         """
@@ -1667,6 +1809,41 @@ class Carousel:
         if snap:
             self.emit(snap)
 
+    def set_sensor_arm(self, seconds) -> bool:
+        """Safe move time: seconds after a move/home starts before sensors count."""
+        if seconds is None:
+            return False
+        try:
+            value = round(max(0.0, min(SENSOR_ARM_MAX_S, float(seconds))), 2)
+        except (TypeError, ValueError):
+            return False
+        if value == self.sensor_arm_s:
+            return False
+        self.sensor_arm_s = value
+        print(f"[agent] safe move time = {value or 'off'} s", flush=True)
+        return True
+
+    def set_home_timeout(self, seconds) -> bool:
+        """Homing time: seconds to find the index flag. None/0 = drive default."""
+        if seconds is None:
+            return False
+        try:
+            raw = float(seconds)
+        except (TypeError, ValueError):
+            return False
+        value: Optional[float] = None if raw <= 0 else round(max(HOME_TIMEOUT_MIN_S, min(HOME_TIMEOUT_MAX_S, raw)), 1)
+        if value == self.home_timeout_s:
+            return False
+        self.home_timeout_s = value
+        print(f"[agent] homing time = {value if value is not None else 'drive default'} s", flush=True)
+        return True
+
+    def _home_timeout(self) -> float:
+        """Effective homing time: the operator's value, else HOME_TIMEOUT × drive scale."""
+        if self.home_timeout_s is not None:
+            return self.home_timeout_s
+        return HOME_TIMEOUT * self._timeout_scale()
+
     def set_hold_timeout(self, seconds) -> None:
         if seconds is None:
             return
@@ -1683,17 +1860,48 @@ class Carousel:
         if shelves > 0:
             self.shelves = shelves
 
-    def set_servo(self, pulses_per_rev=None, max_pps=None, mirror_b=None, ignore_alarm=None) -> None:
-        """Forward servo tuning from the app's `config` to the servo backend."""
+    @property
+    def reverse_dir(self) -> bool:
+        return bool(getattr(self.hw, "reverse", False))
+
+    def set_reverse(self, value) -> bool:
+        """Twin side: flip this carousel's one motor. Returns True if it changed."""
+        if not isinstance(value, bool) or self.reverse_dir == value:
+            return False
+        if getattr(self, "status", "idle") != "idle":
+            print("[agent] reverse change ignored while moving", flush=True)
+            return False
+        self.hw.reverse = value
+        print(f"[agent] {self.side or 'carousel'} motor direction {'REVERSED' if value else 'normal'}", flush=True)
+        return True
+
+    def set_servo(
+        self,
+        pulses_per_rev=None,
+        max_pps=None,
+        mirror_b=None,
+        ignore_alarm=None,
+        dc_trim_pct=None,
+        single_motor=None,
+    ) -> None:
+        """Forward drive tuning from the app's `config` to the live backend."""
         setter = getattr(self.hw, "set_servo_params", None)
         if setter is None:
             return
-        setter(pulses_per_rev=pulses_per_rev, max_pps=max_pps, mirror_b=mirror_b, ignore_alarm=ignore_alarm)
-        if any(v is not None for v in (pulses_per_rev, max_pps, mirror_b, ignore_alarm)):
+        setter(
+            pulses_per_rev=pulses_per_rev,
+            max_pps=max_pps,
+            mirror_b=mirror_b,
+            ignore_alarm=ignore_alarm,
+            dc_trim_pct=dc_trim_pct,
+            single_motor=single_motor,
+        )
+        if any(v is not None for v in (pulses_per_rev, max_pps, mirror_b, ignore_alarm, dc_trim_pct, single_motor)):
             print(
-                f"[agent] servo set: ppr={getattr(self.hw, 'pulses_per_rev', '?')} "
+                f"[agent] drive set: ppr={getattr(self.hw, 'pulses_per_rev', '?')} "
                 f"max_pps={getattr(self.hw, 'max_pps', '?')} mirror_b={getattr(self.hw, 'mirror_b', '?')} "
-                f"ignore_alarm={getattr(self.hw, 'ignore_alarm', '?')}",
+                f"ignore_alarm={getattr(self.hw, 'ignore_alarm', '?')} "
+                f"dc_trim_pct={getattr(self.hw, 'dc_trim_pct', '?')}",
                 flush=True,
             )
 
@@ -1704,6 +1912,8 @@ class Carousel:
             return None
         if snap and snap.get("mode") == "servo":
             snap["holdTimeoutS"] = self.hold_timeout_s
+        if snap:
+            snap["homeTimeoutS"] = round(self._home_timeout(), 1)
         return snap
 
     def set_motion(self, move_speed=None, homing_speed=None, ramp_pct=None,
@@ -2102,6 +2312,8 @@ class Carousel:
         read. Sent to each browser as it connects so a freshly opened tab shows
         the true lamp state immediately, without waiting for the next change.
         """
+        if not self.shelf_sensor_fitted:
+            return None
         try:
             return {"type": "sensor", "on": bool(self.hw.shelf_active())}
         except Exception:
@@ -2119,8 +2331,10 @@ class Carousel:
         """
         servo_last: Optional[tuple] = None
         while self._alive:
+            # Home-sensor-only builds have nothing on the shelf input; a floating
+            # pin must neither light the lamp nor un-home a released carousel.
             try:
-                val: Optional[bool] = bool(self.hw.shelf_active())
+                val: Optional[bool] = self._shelf_lamp()
             except Exception:
                 val = None
             released = self.can_release() and not getattr(self.hw, "held", True)
@@ -2326,8 +2540,16 @@ class Carousel:
             self._await_stepping(self.hw.index_clear, INDEX_CLEAR_TIMEOUT, _home_ramp_step)
             self.hw.reset_pulses()  # ignore the edge produced by leaving the flag
 
+        arm_s = self.sensor_arm_s
+
+        def _take_index_after_arm(*args, **kwargs):
+            # Safe move time: an index edge inside the window is consumed and
+            # ignored, so homing can only end on a flag reached after it.
+            got = self.hw.take_index_pulse(*args, **kwargs)
+            return bool(got) and (arm_s <= 0 or time.monotonic() - home_t0 >= arm_s)
+
         found = self._await_stepping(
-            self.hw.take_index_pulse, HOME_TIMEOUT * self._timeout_scale(), _home_ramp_step
+            _take_index_after_arm, self._home_timeout() + arm_s, _home_ramp_step
         )
         # Read the odometer BEFORE stopping: this is the datum every pulse-mode
         # position is measured from, and the index edge was taken in
@@ -2459,11 +2681,11 @@ class Carousel:
             frac = min(1.0, (time.monotonic() - t0) / ramp)
             self._energise(direction, floor + (target - floor) * frac)
 
-        scale = self._timeout_scale()
+        home_timeout = self._home_timeout()
         if self.hw.index_active():
             self._await_stepping(self.hw.index_clear, INDEX_CLEAR_TIMEOUT, ramp_step)
             self.hw.reset_pulses()
-        if not self._await_stepping(self.hw.take_index_pulse, HOME_TIMEOUT * scale, ramp_step):
+        if not self._await_stepping(self.hw.take_index_pulse, home_timeout, ramp_step):
             self._calibration_failed("Calibration: index sensor not found on the first pass.")
             return
 
@@ -2479,7 +2701,7 @@ class Carousel:
         index_window: Optional[float] = None
         index_was_active = True
         seen_inactive = not self.hw.shelf_active()
-        deadline = time.monotonic() + HOME_TIMEOUT * scale * CALIBRATE_TIMEOUT_SCALE
+        deadline = time.monotonic() + home_timeout * CALIBRATE_TIMEOUT_SCALE
         rev_raw: Optional[float] = None
 
         while True:
@@ -2533,11 +2755,15 @@ class Carousel:
             merged.append(e)
         if len(merged) > 1 and (merged[0] + rev - merged[-1]) < 0.25 * pitch:
             merged.pop()
-        flags_seen = len(merged)
+        flags_seen: Optional[int] = len(merged) if self.shelf_sensor_fitted else None
 
         message = (f"Calibrated: {rev} pulses per revolution, {round(pitch)} per shelf "
-                   f"({self.shelves} shelves). Saw {flags_seen} shelf flag{'s' if flags_seen != 1 else ''}.")
-        if flags_seen != self.shelves:
+                   f"({self.shelves} shelves).")
+        if flags_seen is None:
+            message += " Home sensor only: shelves are spaced evenly from home."
+        else:
+            message += f" Saw {flags_seen} shelf flag{'s' if flags_seen != 1 else ''}."
+        if flags_seen is not None and flags_seen != self.shelves:
             message += (f" Expected {self.shelves}: check the shelf count in the app, "
                         f"or a shelf flag the sensor misses / sees twice.")
 
@@ -2617,7 +2843,7 @@ class Carousel:
             self.status = "idle"
             self.current_shelf = target
             self.emit({"type": "arrived", "shelf": target,
-                       "onSensor": bool(self.hw.shelf_active()), "positionMode": "pulses"})
+                       "onSensor": self._shelf_lamp(), "positionMode": self.position_mode})
             return
 
         cruise = self.move_speed
@@ -2728,8 +2954,8 @@ class Carousel:
         self.status = "idle"
         self.current_shelf = target
         self.emit({"type": "arrived", "shelf": target,
-                   "onSensor": bool(self.hw.shelf_active()),
-                   "positionMode": "pulses"})
+                   "onSensor": self._shelf_lamp(),
+                   "positionMode": self.position_mode})
 
     def _do_goto(self, target: int) -> None:
         # An un-homed carousel is still allowed to move. Refusing here meant a
@@ -2743,10 +2969,18 @@ class Carousel:
             self.emit({"type": "arrived", "shelf": target})
             return
 
-        if self.position_mode == "pulses":
+        if self.position_mode in ("pulses", "index"):
             blocker = self._pulse_mode_blocker()
             if blocker is None:
                 self._do_goto_pulses(target)
+                return
+            if self.position_mode == "index":
+                # No shelf sensor is wired, so there is nothing to fall back to:
+                # counting edges on a dead input would just run to the timeout.
+                self.emit({"type": "fault",
+                           "message": f"Cannot move to a shelf: {blocker}. Only the home sensor is fitted, "
+                                      f"so the carousel positions by pulses alone. Jog and Home still work."})
+                self.emit(self.snapshot())
                 return
             self.emit({"type": "fault",
                        "message": f"Pulse positioning unavailable ({blocker}); using the shelf sensor for this move."})
@@ -3058,6 +3292,15 @@ class Carousel:
             # driver — the falling edge must not reach this queue.
             pulsed = self.hw.take_shelf_pulse(0.0)
             active = self.hw.shelf_active()
+            # SAFE MOVE TIME (operator setting, 0 = off). For this long after the
+            # motor starts the shelf sensor cannot count or stop anything: edges
+            # are discarded and the window is treated as occupied, so a flag in
+            # front of the sensor when the time runs out must still leave and the
+            # NEXT one enter before it counts.
+            if self.sensor_arm_s > 0 and time.monotonic() - ramp_started < self.sensor_arm_s:
+                pulsed = False
+                active = True
+                seen_inactive = False
 
             # ONE RULE FOR BOTH OBSERVERS: a shelf is an EMPTY->OCCUPIED
             # transition of the sensor window, and the window must have been seen
@@ -3292,41 +3535,67 @@ async def serve(args) -> None:
         "max_pps": motor_conf.get("maxPps", SERVO_MAX_PPS),
         "mirror_b": motor_conf.get("mirrorB", SERVO_MIRROR_B),
         "ignore_alarm": bool(motor_conf.get("ignoreAlarm", False)),
+        "dc_trim_pct": float(motor_conf.get("dcTrimPct", 0.0) or 0.0),
+        "single_motor": bool(motor_conf.get("singleMotor", False)),
     }
-    hold_timeout_s = motor_conf.get("holdTimeoutS", SERVO_HOLD_TIMEOUT_S)
+    # Per-carousel state (hold timeout, positioning, calibration). A normal Pi
+    # has one carousel stored at the top level; twin mode (hardware only) keeps
+    # one entry per side so each carousel keeps its own calibration.
+    single_saved = {
+        "holdTimeoutS": motor_conf.get("holdTimeoutS", SERVO_HOLD_TIMEOUT_S),
+        "sensorArmS": motor_conf.get("sensorArmS", 0),
+        "homeTimeoutS": motor_conf.get("homeTimeoutS"),
+        "positionMode": motor_conf.get("positionMode"),
+        "calibration": motor_conf.get("calibration"),
+    }
+    sides_saved: dict = dict(motor_conf.get("sides") or {}) if isinstance(motor_conf.get("sides"), dict) else {}
 
-    def build_hardware(mode: str):
-        """Return (hw, sim_reason) for the requested drive mode."""
+    def build_hardware(mode: str, side: str = ""):
+        """Return (hw, sim_reason) for the requested drive mode and twin side."""
+        twin_kw: dict = {}
+        label = ""
+        if side:
+            idx = TWIN_SIDES.index(side)
+            twin_kw = {
+                "motor_index": idx,
+                "shelf_pin": PIN_SHELF_SENSOR if idx == 0 else PIN_SHELF_SENSOR_R,
+                "index_pin": PIN_INDEX_SENSOR if idx == 0 else PIN_INDEX_SENSOR_R,
+            }
+            label = f" [{side} carousel: motor {'AB'[idx]}, shelf sensor GPIO {twin_kw['shelf_pin']}, home sensor GPIO {twin_kw['index_pin']}]"
         if args.simulate:
-            print(f"[agent] running in SIMULATION mode ({shelves} shelves, {mode} drive)", flush=True)
+            print(f"[agent] running in SIMULATION mode ({shelves} shelves, {mode} drive){label}", flush=True)
             return SimHardware(shelves, motor_mode=mode), "started with --simulate"
         try:
             if mode == "servo":
-                built = ServoHardware(**servo_params)
+                params = {k: v for k, v in servo_params.items() if k != "dc_trim_pct"}
+                if side:
+                    params["single_motor"] = False
+                built = ServoHardware(**params, **twin_kw)
+                what = (
+                    "one iSV57T servo" if side
+                    else ("ONE iSV57T servo (motor A only)" if servo_params["single_motor"] else "two iSV57T servos")
+                )
                 print(
-                    f"[agent] GPIO ready: driving two iSV57T servos on PUL/DIR "
+                    f"[agent] GPIO ready: driving {what} on PUL/DIR "
                     f"(PUL {PIN_SERVO_PUL_A}/{PIN_SERVO_PUL_B}, DIR {PIN_SERVO_DIR_A}/{PIN_SERVO_DIR_B}, "
-                    f"ALM {PIN_SERVO_ALM_A}/{PIN_SERVO_ALM_B})",
+                    f"ALM {PIN_SERVO_ALM_A}/{PIN_SERVO_ALM_B}){label}",
                     flush=True,
                 )
             else:
-                built = RealHardware(mirror_b=servo_params["mirror_b"])
+                built = RealHardware(mirror_b=servo_params["mirror_b"], **twin_kw)
+                built.dc_trim_pct = servo_params["dc_trim_pct"]
                 # flush=True matters under systemd: stdout is a pipe, not a TTY, so
                 # Python block-buffers it and this line can sit unflushed indefinitely.
-                # Without it `journalctl | grep -i gpio` returns nothing from the
-                # agent, making a perfectly healthy agent look silent and dead.
                 print(
-                    f"[agent] GPIO ready: driving two DC motors on BTS7960 bridges "
+                    f"[agent] GPIO ready: driving {'one DC motor' if side else 'two DC motors'} on BTS7960 bridges "
                     f"(A: RPWM {PIN_MOTOR_A_RPWM} LPWM {PIN_MOTOR_A_LPWM} EN {PIN_MOTOR_A_EN}; "
                     f"B: RPWM {PIN_MOTOR_B_RPWM} LPWM {PIN_MOTOR_B_LPWM} EN {PIN_MOTOR_B_EN}; "
-                    f"mirror B={servo_params['mirror_b']})",
+                    f"mirror B={servo_params['mirror_b']}){label}",
                     flush=True,
                 )
             return built, None
         except Exception as exc:
             if args.strict_gpio:
-                # Refuse to pretend. Better a dead service you can see in
-                # `systemctl status` than a live one that quietly does nothing.
                 print(
                     f"[agent] FATAL: GPIO unavailable ({exc}); --strict-gpio set, refusing to simulate",
                     flush=True,
@@ -3343,15 +3612,15 @@ async def serve(args) -> None:
             print("=" * 72, flush=True)
             return SimHardware(shelves, motor_mode=mode), f"GPIO unavailable: {exc}"
 
-    hw, sim_reason = build_hardware(motor_mode)
-    # Mutable so the WebSocket handler (a closure) can rebind them on a live
-    # mode switch without `nonlocal` gymnastics.
-    rt = {"mode": motor_mode, "sim_reason": sim_reason}
+    # Mutable so the WebSocket handler (a closure) can rebind them live.
+    rt = {"mode": motor_mode, "sim_reason": None, "twin": bool(motor_conf.get("twin", False))}
     loop = asyncio.get_running_loop()
     clients: "set[object]" = set()
 
-    def broadcast(event: dict) -> None:
+    def broadcast(event: Optional[dict]) -> None:
         """Called from the Carousel worker thread → hop back onto the loop."""
+        if event is None:
+            return
         data = json.dumps(event)
         for ws in list(clients):
             asyncio.run_coroutine_threadsafe(_safe_send(ws, data), loop)
@@ -3362,66 +3631,157 @@ async def serve(args) -> None:
         except Exception:
             pass
 
-    carousel = Carousel(hw, shelves, broadcast)
-    carousel.set_hold_timeout(hold_timeout_s)
-    carousel.set_position_mode(motor_conf.get("positionMode"))
-    carousel.restore_calibration(motor_conf.get("calibration"))
+    # One Carousel per physical carousel. Key "" = the normal single carousel;
+    # "left"/"right" = twin carousels sharing this Pi. Every event a twin side
+    # emits is tagged with its `side` so the app routes it to the right unit.
+    units: "dict[str, Carousel]" = {}
+
+    def tag(side: str, frame: Optional[dict]) -> Optional[dict]:
+        if frame is None:
+            return None
+        return {**frame, "side": side} if side else frame
+
+    def side_saved(side: str) -> dict:
+        if not side:
+            return single_saved
+        got = sides_saved.get(side)
+        return got if isinstance(got, dict) else {}
+
+    def make_unit(side: str) -> "Carousel":
+        saved = side_saved(side)
+        hw, reason = build_hardware(rt["mode"], side)
+        if reason and not rt["sim_reason"]:
+            rt["sim_reason"] = reason
+        c = Carousel(hw, shelves, lambda ev, s=side: broadcast(tag(s, ev)))
+        c.side = side
+        c.set_hold_timeout(saved.get("holdTimeoutS", SERVO_HOLD_TIMEOUT_S))
+        c.set_sensor_arm(saved.get("sensorArmS", 0))
+        c.set_home_timeout(saved.get("homeTimeoutS"))
+        c.set_position_mode(saved.get("positionMode"))
+        c.restore_calibration(saved.get("calibration"))
+        if side:
+            c.set_reverse(bool(saved.get("reverseDir", False)))
+        c.on_calibration = lambda _info: persist_motor_conf()
+        return c
+
+    def build_units() -> None:
+        rt["sim_reason"] = None
+        for s in (TWIN_SIDES if rt["twin"] else ("",)):
+            units[s] = make_unit(s)
+
+    def teardown_units() -> None:
+        for c in list(units.values()):
+            c.shutdown()
+            for fn in (c.hw.stop, c.hw.cleanup):
+                try:
+                    fn()
+                except Exception:
+                    pass
+        units.clear()
+        time.sleep(0.15)  # let the worker threads notice shutdown
+
+    def unit_snapshot(c: "Carousel") -> dict:
+        return {
+            "holdTimeoutS": c.hold_timeout_s,
+            "sensorArmS": c.sensor_arm_s,
+            "homeTimeoutS": c.home_timeout_s,
+            "positionMode": c.position_mode,
+            "calibration": c.calibration_info,
+            "reverseDir": c.reverse_dir,
+        }
 
     def persist_motor_conf(mode: Optional[str] = None) -> None:
         """Write everything the agent must know before the app reconnects."""
+        if "" in units:
+            single_saved.update(unit_snapshot(units[""]))
+        for s in TWIN_SIDES:
+            if s in units:
+                sides_saved[s] = unit_snapshot(units[s])
         save_motor_conf({
             "mode": mode if mode in ("dc", "servo") else rt["mode"],
             "pulsesPerRev": servo_params["pulses_per_rev"],
             "maxPps": servo_params["max_pps"],
             "mirrorB": servo_params["mirror_b"],
             "ignoreAlarm": bool(servo_params["ignore_alarm"]),
-            "holdTimeoutS": carousel.hold_timeout_s,
-            "positionMode": carousel.position_mode,
-            "calibration": carousel.calibration_info,
+            "dcTrimPct": servo_params["dc_trim_pct"],
+            "singleMotor": bool(servo_params["single_motor"]),
+            "twin": rt["twin"],
+            **single_saved,
+            "sides": sides_saved,
         })
 
-    carousel.on_calibration = lambda _info: persist_motor_conf()
+    build_units()
 
     def hello_frame() -> dict:
+        first = next(iter(units.values()))
         return {
             "type": "hello",
             "name": args.name,
-            "shelves": carousel.shelves,
-            "firmware": "pax-agent-1.5",
+            "shelves": first.shelves,
+            "firmware": "pax-agent-1.6",
             "role": args.role,
             "simulated": rt["sim_reason"] is not None,
             "simReason": rt["sim_reason"],
             "motorMode": rt["mode"],
+            "twin": rt["twin"],
+            "sides": list(TWIN_SIDES) if rt["twin"] else [],
         }
 
+    def state_frames() -> list:
+        """Everything a freshly connected app needs, per carousel."""
+        out: list = []
+        for side, c in units.items():
+            for f in (c.snapshot(), c.sensor_snapshot(), c.servo_snapshot(), c.calibration_frame()):
+                if f is not None:
+                    out.append(tag(side, f))
+        return out
+
+    def any_busy() -> bool:
+        return any(c.status != "idle" for c in units.values())
+
     def switch_motor_mode(mode: str) -> bool:
-        """
-        Rebuild the hardware backend for `mode` while the carousel is idle.
-        Returns False (and reports a fault) if a move is in progress — the
-        pins must not be re-assigned under a running motor.
-        """
-        if carousel.status != "idle":
-            broadcast({"type": "fault", "message": f"Motor drive change to '{mode}' ignored while the carousel is moving. Stop it first."})
+        """Rebuild every carousel's backend for `mode`, idle only."""
+        if any_busy():
+            broadcast({"type": "fault", "message": f"Motor drive change to '{mode}' ignored while a carousel is moving. Stop it first."})
             return False
-        old = carousel.hw
-        try:
-            old.stop()
-        except Exception:
-            pass
-        try:
-            old.cleanup()
-        except Exception:
-            pass
-        new_hw, reason = build_hardware(mode)
-        carousel.hw = new_hw
         rt["mode"] = mode
-        rt["sim_reason"] = reason
+        rt["sim_reason"] = None
+        for side, c in units.items():
+            for fn in (c.hw.stop, c.hw.cleanup):
+                try:
+                    fn()
+                except Exception:
+                    pass
+            new_hw, reason = build_hardware(mode, side)
+            if reason and not rt["sim_reason"]:
+                rt["sim_reason"] = reason
+            c.hw = new_hw
         print(f"[agent] motor drive switched to {mode}", flush=True)
         broadcast(hello_frame())
-        snap = carousel.servo_snapshot()
-        if snap:
-            broadcast(snap)
+        for side, c in units.items():
+            broadcast(tag(side, c.servo_snapshot()))
         return True
+
+    def set_twin(on: bool) -> bool:
+        """Split this Pi into Left/Right carousels (or merge back), idle only."""
+        if any_busy():
+            broadcast({"type": "fault", "message": "Twin carousel change ignored while a carousel is moving. Stop it first."})
+            return False
+        teardown_units()
+        rt["twin"] = bool(on)
+        build_units()
+        persist_motor_conf()
+        print(f"[agent] twin carousels {'ON (left = motor A, right = motor B)' if on else 'OFF'}", flush=True)
+        broadcast(hello_frame())
+        for f in state_frames():
+            broadcast(f)
+        return True
+
+    def unit_for(msg: dict) -> "Carousel":
+        if rt["twin"]:
+            s = msg.get("side")
+            return units[s if s in TWIN_SIDES else "left"]
+        return units[""]
 
     # ------------------------------------------------------------------
     # Networking (paxnet): fallback watchdog + net.* command family
@@ -3433,28 +3793,11 @@ async def serve(args) -> None:
         clients.add(ws)
         try:
             # Greet + send current state immediately. These MUST stay inside the
-            # try: the app closes the socket whenever its last browser tab goes
-            # away, and if that lands mid-greeting an unguarded send raises
-            # ConnectionClosedError straight out of the handler — which both
-            # prints a scary traceback and skips the `finally` below, leaking the
-            # dead socket in `clients` forever.
+            # try: the app may close the socket mid-greeting, and an unguarded
+            # send would skip the `finally` and leak the dead socket.
             await ws.send(json.dumps(hello_frame()))
-            await ws.send(json.dumps(carousel.snapshot()))
-            # Sync the live shelf-sensor lamp immediately, so a tab that opens
-            # while the level is steady doesn't wait for the next transition.
-            _sensor = carousel.sensor_snapshot()
-            if _sensor is not None:
-                await ws.send(json.dumps(_sensor))
-            # Servo alarm lamps likewise.
-            _servo = carousel.servo_snapshot()
-            if _servo is not None:
-                await ws.send(json.dumps(_servo))
-            _cal = carousel.calibration_frame()
-            if _cal is not None:
-                await ws.send(json.dumps(_cal))
-            # Same idea for the network picture: a tab that opens while we are
-            # already sitting in AP mode should see it without waiting for the
-            # watchdog's next flip.
+            for f in state_frames():
+                await ws.send(json.dumps(f))
             _net = net.cached_status()
             if _net is not None:
                 await ws.send(json.dumps(_net))
@@ -3464,47 +3807,66 @@ async def serve(args) -> None:
                 except Exception:
                     continue
                 t = msg.get("type")
+                if t == "stop":
+                    # Twin: a stop without a side is the emergency stop and
+                    # halts BOTH carousels.
+                    targets = [unit_for(msg)] if (rt["twin"] and msg.get("side") in TWIN_SIDES) else list(units.values())
+                    for c in targets:
+                        c.request_stop()
+                        c.status = "idle"
+                        broadcast(tag(c.side, c.snapshot()))
+                    continue
+                if t == "config":
+                    want_twin = msg.get("twin")
+                    if isinstance(want_twin, bool) and want_twin != rt["twin"]:
+                        set_twin(want_twin)
+                carousel = unit_for(msg)
+                side = carousel.side
                 if t == "home":
                     carousel.request_home()
                 elif t == "goto":
                     carousel.request_goto(int(msg.get("shelf", 0)))
-                elif t == "stop":
-                    carousel.request_stop()
-                    carousel.status = "idle"
-                    broadcast(carousel.snapshot())
                 elif t == "config":
                     carousel.set_shelves(int(msg.get("shelves", carousel.shelves)))
-                    # Previously this handler ignored everything except
-                    # `shelves`, so the speed and soft-start sliders were
-                    # delivered to the Pi and then silently dropped.
                     carousel.set_motion(
                         move_speed=msg.get("moveSpeed"),
                         homing_speed=msg.get("homingSpeed"),
                         ramp_pct=msg.get("rampPct"),
                         approach_speed=msg.get("approachSpeed"),
                     )
-                    # Motor drive selection + servo tuning. Persisted so the
-                    # agent boots straight into the right backend next time,
-                    # and applied live (idle only) so the wizard's choice takes
-                    # effect without a restart.
+                    # Drive selection + tuning are shared by every carousel on
+                    # this Pi (one wiring, one installer choice).
                     want = msg.get("motorMode")
                     servo_fields = {
                         "pulses_per_rev": msg.get("servoPulsesPerRev"),
                         "max_pps": msg.get("servoMaxPps"),
                         "mirror_b": msg.get("servoMirrorB"),
                         "ignore_alarm": msg.get("servoIgnoreAlarm"),
+                        "dc_trim_pct": (
+                            msg.get("dcTrimPct") if isinstance(msg.get("dcTrimPct"), (int, float)) else None
+                        ),
+                        "single_motor": (
+                            msg.get("servoSingleMotor") if isinstance(msg.get("servoSingleMotor"), bool) else None
+                        ),
                     }
-                    if any(v is not None for v in servo_fields.values()):
-                        for k, v in servo_fields.items():
-                            if v is not None:
-                                servo_params[k] = v
+                    if rt["twin"]:
+                        # Each twin side already owns exactly one motor.
+                        servo_fields["single_motor"] = None
+                        servo_fields["dc_trim_pct"] = None
+                    for k, v in servo_fields.items():
+                        if v is not None:
+                            servo_params[k] = v
                     hold = msg.get("servoHoldTimeoutS")
                     if isinstance(hold, (int, float)):
                         carousel.set_hold_timeout(hold)
-                    # Positioning: sensor counting vs calibrated pulses, and the
-                    # app's copy of the calibration (restores it after a
-                    # re-install; ignored when this agent has its own).
-                    mode_changed = carousel.set_position_mode(msg.get("positionMode"))
+                    arm = msg.get("sensorArmS")
+                    arm_changed = isinstance(arm, (int, float)) and not isinstance(arm, bool) and carousel.set_sensor_arm(arm)
+                    home_t = msg.get("homeTimeoutS")
+                    home_changed = (isinstance(home_t, (int, float)) and not isinstance(home_t, bool)
+                                    and carousel.set_home_timeout(home_t))
+                    reverse_changed = bool(side) and carousel.set_reverse(msg.get("reverseDir"))
+                    mode_changed = (carousel.set_position_mode(msg.get("positionMode")) or reverse_changed
+                                    or arm_changed or home_changed)
                     cal_restored = carousel.restore_calibration({
                         "pulsesPerRev": msg.get("servoCarouselPulses"),
                         "indexWindowPulses": msg.get("servoIndexWindowPulses"),
@@ -3514,17 +3876,16 @@ async def serve(args) -> None:
                         persist_motor_conf(want)
                     if want in ("dc", "servo") and want != rt["mode"]:
                         switch_motor_mode(want)
-                    carousel.set_servo(**servo_fields)
-                    # The alarm flags in the status come from this switch, so
-                    # the app must see the new reading right away.
-                    if hold is not None or servo_fields["ignore_alarm"] is not None:
-                        snap = carousel.servo_snapshot()
-                        if snap:
-                            broadcast(snap)
+                    for c in units.values():
+                        c.set_servo(**servo_fields)
+                    if (hold is not None or servo_fields["ignore_alarm"] is not None
+                            or servo_fields["single_motor"] is not None):
+                        for c in units.values():
+                            broadcast(tag(c.side, c.servo_snapshot()))
                     if mode_changed:
-                        broadcast(carousel.snapshot())
+                        broadcast(tag(side, carousel.snapshot()))
                     if cal_restored:
-                        broadcast(carousel.calibration_frame())
+                        broadcast(tag(side, carousel.calibration_frame()))
                 elif t == "calibrate":
                     carousel.request_calibrate()
                 elif t == "release":
@@ -3532,10 +3893,6 @@ async def serve(args) -> None:
                 elif t == "hold":
                     carousel.request_hold()
                 elif t == "jog":
-                    # The unit follows the live drive: pulses for the servo
-                    # pair, milliseconds for the DC bridges. A message carrying
-                    # the wrong unit (app and agent momentarily disagreeing on
-                    # the mode) is refused rather than guessed at.
                     if rt["mode"] == "servo":
                         amount = msg.get("pulses")
                         unit = "pulses"
@@ -3578,8 +3935,9 @@ async def serve(args) -> None:
             await asyncio.Future()  # run forever
         finally:
             net.stop()
-            carousel.shutdown()
-            carousel.hw.cleanup()  # the live backend, which may have been swapped
+            for c in units.values():
+                c.shutdown()
+                c.hw.cleanup()  # the live backend, which may have been swapped
 
 
 # ==========================================================================
