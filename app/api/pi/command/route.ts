@@ -1,12 +1,26 @@
 import type { NextRequest } from "next/server"
 import { sendCommand, isAllowedTarget } from "@/lib/server/pi-relay"
 import type { NodeCommand } from "@/lib/node-protocol"
+import { MAX_SENSOR_ARM_S, MIN_HOME_TIMEOUT_S, MAX_HOME_TIMEOUT_S } from "@/lib/filament"
 
 export const runtime = "nodejs"
 export const dynamic = "force-dynamic"
 
-/** Validate an untrusted body into a known NodeCommand (or null). */
+/**
+ * Validate an untrusted body into a known NodeCommand (or null), keeping the
+ * twin-mode `side` on motion commands and the `twin` flag on config.
+ */
 function parseCommand(body: unknown): NodeCommand | null {
+  const cmd = parseBaseCommand(body)
+  if (!cmd || cmd.type === "hello" || cmd.type.startsWith("net_")) return cmd
+  const b = body as { side?: unknown; twin?: unknown }
+  const sided = cmd as NodeCommand & { side?: "left" | "right"; twin?: boolean }
+  if (b.side === "left" || b.side === "right") sided.side = b.side
+  if (cmd.type === "config" && typeof b.twin === "boolean") sided.twin = b.twin
+  return sided
+}
+
+function parseBaseCommand(body: unknown): NodeCommand | null {
   if (!body || typeof body !== "object") return null
   const type = (body as { type?: unknown }).type
   switch (type) {
@@ -53,8 +67,12 @@ function parseCommand(body: unknown): NodeCommand | null {
         servoPulsesPerRev?: unknown
         servoMaxPps?: unknown
         servoMirrorB?: unknown
+        servoSingleMotor?: unknown
+        reverseDir?: unknown
         servoIgnoreAlarm?: unknown
         servoHoldTimeoutS?: unknown
+        sensorArmS?: unknown
+        homeTimeoutS?: unknown
         positionMode?: unknown
         servoCarouselPulses?: unknown
         servoIndexWindowPulses?: unknown
@@ -82,13 +100,29 @@ function parseCommand(body: unknown): NodeCommand | null {
       if (ppr !== undefined) cmd.servoPulsesPerRev = ppr
       if (pps !== undefined) cmd.servoMaxPps = pps
       if (typeof b.servoMirrorB === "boolean") cmd.servoMirrorB = b.servoMirrorB
+      if (typeof b.servoSingleMotor === "boolean") cmd.servoSingleMotor = b.servoSingleMotor
+      if (typeof b.reverseDir === "boolean") cmd.reverseDir = b.reverseDir
       if (typeof b.servoIgnoreAlarm === "boolean") cmd.servoIgnoreAlarm = b.servoIgnoreAlarm
       // 0 is meaningful here (= hold for ever), so it is not a "positive int".
       const hold = b.servoHoldTimeoutS
       if (typeof hold === "number" && Number.isInteger(hold) && hold >= 0 && hold <= 86_400) {
         cmd.servoHoldTimeoutS = hold
       }
-      if (b.positionMode === "sensor" || b.positionMode === "pulses") cmd.positionMode = b.positionMode
+      const arm = b.sensorArmS
+      if (typeof arm === "number" && Number.isFinite(arm) && arm >= 0 && arm <= MAX_SENSOR_ARM_S) {
+        cmd.sensorArmS = arm
+      }
+      const homeT = b.homeTimeoutS
+      if (
+        typeof homeT === "number" &&
+        Number.isFinite(homeT) &&
+        homeT >= MIN_HOME_TIMEOUT_S &&
+        homeT <= MAX_HOME_TIMEOUT_S
+      ) {
+        cmd.homeTimeoutS = homeT
+      }
+      if (b.positionMode === "sensor" || b.positionMode === "pulses" || b.positionMode === "index")
+        cmd.positionMode = b.positionMode
       const carouselPulses = posInt(b.servoCarouselPulses, 100_000_000)
       const windowPulses = posInt(b.servoIndexWindowPulses, 100_000_000)
       if (carouselPulses !== undefined) cmd.servoCarouselPulses = carouselPulses

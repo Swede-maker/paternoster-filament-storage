@@ -163,6 +163,7 @@
   }
   html {
     @apply bg-background;
+    overscroll-behavior: none;
   }
   body {
     @apply bg-background text-foreground antialiased;

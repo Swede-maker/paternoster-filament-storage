@@ -47,7 +47,18 @@ log; the page reconnects by itself when the app is back. Under the hood the app
 only writes `/var/lib/pax/update.request` — a root `pax-update` systemd service
 does the actual work by re-running this installer with your saved answers.
 
-**Running it again over SSH is also safe and smart.** The answers are saved in `/etc/pax-install.conf`,
+**One-line update over SSH.** After you push new code to GitHub, paste this on the Pi:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Swede-maker/paternoster-filament-storage/main/setup.sh | sudo bash -s -- --update
+```
+
+It asks nothing: it pulls the newest code, backs up the database, rebuilds and
+restarts with your saved setup (role, motors, shelves, hostname, hotspot password).
+Your filaments, shelves, storage units, printers, history and motor tuning are not
+touched. On a Pi where PAX is not installed yet it stops instead of installing.
+
+**Running the install command again over SSH is also safe and smart.** The answers are saved in `/etc/pax-install.conf`,
 so on an installed Pi the same command recognises the setup and asks what you want:
 
 - **Update** — newest code, same setup, no questions.
@@ -131,8 +142,104 @@ choice is saved with the unit and pushed to the agent, which persists it and
 boots straight into the matching control logic. You can change it later under
 **Settings → Units → Motor drive**, together with motor-B mirroring (both
 drives), the servo pulses/rev and top pulse rate, and the jog step size (ms or
-pulses). Wiring for both drives is in
-[`pi-agent/README.md`](pi-agent/README.md#hardware).
+pulses). The pin-by-pin wiring is in [GPIO wiring](#gpio-wiring) below; deeper
+background for both drives is in [`pi-agent/README.md`](pi-agent/README.md#hardware).
+
+---
+
+## GPIO wiring
+
+> Using an **ESP32** as a slave controller instead of a Pi? Its pins and setup
+> are in [`esp32-agent/README.md`](esp32-agent/README.md).
+
+All numbers are **BCM GPIO numbers** (what `pinout` prints as `GPIOxx`), not the
+physical header pin positions. The pins are set as constants at the top of
+`pi-agent/paternoster_agent.py` if you need to move one.
+
+**Three rules before you plug anything in:**
+
+1. **Common ground.** The Pi's GND, every motor driver's GND, the servo supply's
+   minus and every sensor's minus must all be connected together.
+2. **Never feed more than 3.3 V into a GPIO.** Sensors on 12–24 V need an
+   NPN/open-collector output (or an opto board) so the Pi only ever sees its own
+   3.3 V pull-up.
+3. **Motors get their own power supply**, never the Pi's 5 V pin.
+
+### Sensors
+
+| Sensor | Normal carousel / twin **Left** | Twin **Right** | Wire |
+| --- | --- | --- | --- |
+| Shelf sensor (one pulse per shelf) | **GPIO 23** | **GPIO 19** | Signal → GPIO, brown (+) → sensor supply, blue (−) → GND |
+| Home / index sensor (only at shelf 1) | **GPIO 24** | **GPIO 4** | Signal → GPIO, brown (+) → sensor supply, blue (−) → GND |
+
+Use **NPN (sinking) inductive sensors**: the agent turns on the Pi's internal
+pull-up, so the input reads HIGH when idle and the sensor pulls it to GND when
+metal is in front of it. If the lamp in the app is lit when nothing is there,
+the sensor is the opposite type; set `SENSOR_INVERT` at the top of the agent.
+
+**Servo carousels can skip the shelf sensor.** Choose *Settings → Hardware →
+Motor drive → Positioning → **Home only***, wire just the home sensor, and run
+**Calibrate** once. The agent measures one full turn in servo pulses and spaces
+the shelves evenly from home; every pass of the home flag corrects the position.
+Leave GPIO 23 (or 19) unconnected. Until calibrated, shelf moves are refused,
+but jogging and **Home** still work. DC motors always need the shelf sensor,
+because they have no pulse count to measure distance with.
+
+### Standard DC motors (two BTS7960 / IBT-2 bridges)
+
+| Bridge pin | Bridge **A** (motor A) | Bridge **B** (motor B) |
+| --- | --- | --- |
+| RPWM | **GPIO 12** | **GPIO 20** |
+| LPWM | **GPIO 13** | **GPIO 21** |
+| R_EN + L_EN (tie both together) | **GPIO 22** | **GPIO 27** |
+| VCC | Pi **3.3 V** (not 5 V) | Pi **3.3 V** |
+| GND | Pi GND | Pi GND |
+| R_IS / L_IS | leave unconnected | leave unconnected |
+| B+ / B− (screw terminals) | motor power supply | motor power supply |
+| M+ / M− (screw terminals) | motor A | motor B |
+
+### Integrated servo motors (two iSV57T on PUL/DIR)
+
+The iSV57T inputs want 5 V, so **PUL and DIR go through a 74AHCT125 (or
+74HCT245) level shifter** powered from the Pi's 5 V pin. Tie its `/OE` pins to
+GND.
+
+| Pi | Through | Motor **A** | Motor **B** |
+| --- | --- | --- | --- |
+| **GPIO 12** | shifter 1A → 1Y | PUL+ | — |
+| **GPIO 13** | shifter 2A → 2Y | — | PUL+ |
+| **GPIO 5** | shifter 3A → 3Y | DIR+ | — |
+| **GPIO 6** | shifter 4A → 4Y | — | DIR+ |
+| **GPIO 16** | direct | ALM+ | — |
+| **GPIO 26** | direct | — | ALM+ |
+| **GPIO 17** *(optional)* | relay IN | relay in +Vdc lead | — |
+| **GPIO 25** *(optional)* | relay IN | — | relay in +Vdc lead |
+| **GND** | shifter GND + `/OE` | PUL−, DIR−, ALM− | PUL−, DIR−, ALM− |
+| **5 V** | shifter VCC | — | — |
+
+Servo power: `VDC` → +24…36 V, `GND` → supply minus, and supply minus → Pi GND.
+The relays on GPIO 17/25 are only needed for the *Release* button / idle release;
+without them, leave *Release servos after idle* on **Always on**.
+
+### Twin carousels (one Pi, two carousels)
+
+After **Split into twin**, motor A drives the **Left** carousel and motor B the
+**Right** one, on exactly the motor pins above. Each side needs its own sensors:
+
+| | Left (motor A) | Right (motor B) |
+| --- | --- | --- |
+| Shelf sensor | GPIO 23 | GPIO 19 *(not needed with Home only)* |
+| Home sensor | GPIO 24 | GPIO 4 |
+
+If one side runs the wrong way, use **Reverse motor A/B direction** on that unit
+instead of rewiring.
+
+### Checking the wiring
+
+After installing the agent, open *Manual control*: the sensor lamps should
+light as you pass a piece of metal in front of each sensor, and the jog arrows
+should turn each motor. The agent also prints the pins it is using for every
+carousel at start-up (`journalctl -u pax-agent -f` over SSH).
 
 ---
 

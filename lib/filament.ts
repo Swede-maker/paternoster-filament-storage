@@ -275,6 +275,32 @@ export const DEFAULT_SERVO_MIRROR_B = true
 export const DEFAULT_SERVO_HOLD_TIMEOUT_S = 0
 export const MAX_SERVO_HOLD_TIMEOUT_S = 86_400
 
+// Safe move time: sensors are ignored this long after a move/home starts.
+// Mirrors SENSOR_ARM_MAX_S in the agent.
+export const MAX_SENSOR_ARM_S = 10
+export function sensorArmFor(node: { sensorArmS?: number }): number {
+  return node.sensorArmS ?? 0
+}
+
+// Homing time: how long a homing run may look for the index flag. Mirrors the
+// agent's HOME_TIMEOUT (30 s) × SERVO_TIMEOUT_SCALE (2 on servo).
+export const DEFAULT_HOME_TIMEOUT_DC_S = 30
+export const DEFAULT_HOME_TIMEOUT_SERVO_S = 60
+export const MIN_HOME_TIMEOUT_S = 5
+export const MAX_HOME_TIMEOUT_S = 600
+/** Drive default when the operator has not set a homing time. */
+export function defaultHomeTimeoutFor(node: { motorMode?: "dc" | "servo" }): number {
+  return (node.motorMode ?? "dc") === "servo" ? DEFAULT_HOME_TIMEOUT_SERVO_S : DEFAULT_HOME_TIMEOUT_DC_S
+}
+/** Effective homing time (seconds) the agent is told to use. */
+export function homeTimeoutFor(node: { motorMode?: "dc" | "servo"; homeTimeoutS?: number }): number {
+  const v = node.homeTimeoutS
+  if (typeof v === "number" && Number.isFinite(v) && v > 0) {
+    return Math.max(MIN_HOME_TIMEOUT_S, Math.min(MAX_HOME_TIMEOUT_S, v))
+  }
+  return defaultHomeTimeoutFor(node)
+}
+
 // ---- DC drive (two BTS7960 bridges) ----------------------------------------
 // A DC bridge has no step unit, so its jog is a timed run: "motor A for N ms".
 // Mirrors DC_JOG_MAX_MS in the agent.
@@ -289,9 +315,16 @@ type ServoNode = {
   servoGearRatio?: number
   servoJogPulses?: number
   dcJogMs?: number
+  dcTrimPct?: number
   servoMirrorB?: boolean
   servoIgnoreAlarm?: boolean
   servoHoldTimeoutS?: number
+  servoSingleMotor?: boolean
+  system?: "filament" | "hardware"
+}
+/** One-servo drive: only for servo-driven HARDWARE carousels, never filament. */
+export function servoSingleMotorFor(node: ServoNode): boolean {
+  return node.system === "hardware" && node.motorMode === "servo" && node.servoSingleMotor === true
 }
 export function servoIgnoreAlarmFor(node: ServoNode): boolean {
   return node.servoIgnoreAlarm === true
@@ -302,6 +335,18 @@ export function isServoNode(node: ServoNode): boolean {
 }
 export function dcJogMsFor(node: ServoNode): number {
   return node.dcJogMs ?? DEFAULT_DC_JOG_MS
+}
+/** DC PWM balance (see StorageNode.dcTrimPct): 0 = equal duty on both bridges. */
+export const DEFAULT_DC_TRIM_PCT = 0
+export const MAX_DC_TRIM_PCT = 20
+export function dcTrimPctFor(node: ServoNode): number {
+  const v = node.dcTrimPct ?? DEFAULT_DC_TRIM_PCT
+  return Math.max(-MAX_DC_TRIM_PCT, Math.min(MAX_DC_TRIM_PCT, v))
+}
+/** Duty multipliers per bridge for the node's trim; the faster motor is scaled below 1. */
+export function dcTrimScalesFor(node: ServoNode): { a: number; b: number } {
+  const t = dcTrimPctFor(node)
+  return { a: t < 0 ? 1 + t / 100 : 1, b: t > 0 ? 1 - t / 100 : 1 }
 }
 export function servoPulsesPerRevFor(node: ServoNode): number {
   return node.servoPulsesPerRev ?? DEFAULT_SERVO_PULSES_PER_REV

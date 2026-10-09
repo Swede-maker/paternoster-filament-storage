@@ -69,8 +69,10 @@ export interface CalibrateCommand {
  *   home datum, re-synchronised on every pass of the index flag. Needs a
  *   calibration run; the agent falls back to the sensor (with a `fault` note)
  *   when it cannot position by pulses.
+ * - "index": servo only — like "pulses", but only the home (index) sensor is
+ *   wired. No shelf sensor, so no fallback: an uncalibrated `goto` is refused.
  */
-export type PositionMode = "sensor" | "pulses"
+export type PositionMode = "sensor" | "pulses" | "index"
 
 /**
  * Push machine settings to the agent: shelf count plus the live motion tuning
@@ -107,6 +109,22 @@ export interface ConfigCommand {
    * to both drives (DIR line on the servos, RPWM/LPWM swap on the DC bridge).
    */
   servoMirrorB?: boolean
+  /** Servo only: drive the carousel with motor A alone (hardware carousels). */
+  servoSingleMotor?: boolean
+  /** Twin side only: flip this carousel's one motor (motor A or B). */
+  reverseDir?: boolean
+  /**
+   * Hardware twin mode: split the Pi into two carousels (see `TwinSide`). Sent
+   * on every config from a twin unit so a rebooted agent re-splits before the
+   * per-side settings arrive.
+   */
+  twin?: boolean
+  /**
+   * DC only (pax-agent-1.6+): PWM balance, −20…+20 %. The agent scales the
+   * faster bridge's duty down — motor A by (1 + v/100) when v < 0, motor B by
+   * (1 − v/100) when v > 0 — on every move, homing and jog. 0 = equal duty.
+   */
+  dcTrimPct?: number
   /** Servo only: treat the ALM inputs as healthy (ALM+/ALM− not wired). */
   servoIgnoreAlarm?: boolean
   /**
@@ -115,6 +133,10 @@ export interface ConfigCommand {
    * until the servo supply is switched off).
    */
   servoHoldTimeoutS?: number
+  /** Seconds after a move/home starts before sensors count. 0 = off. */
+  sensorArmS?: number
+  /** Homing time: seconds to find the index flag before faulting (pax-agent-1.6+). */
+  homeTimeoutS?: number
   /** Sensor counting or calibrated pulses (pax-agent-1.5+). */
   positionMode?: PositionMode
   /**
@@ -204,17 +226,41 @@ export type NetCommand =
   | NetProvisionSlavesCommand
   | NetSetApPskCommand
 
+/**
+ * Twin mode (hardware units only): one Pi drives two independent carousels,
+ * motor A + the primary sensors = "left", motor B + the R sensors = "right".
+ * Motion commands and motion events carry `side`; a frame without it means
+ * "left" (and is the only form a non-twin agent ever sees or sends).
+ */
+export type TwinSide = "left" | "right"
+export const TWIN_SIDES: readonly TwinSide[] = ["left", "right"]
+
+export interface Sided {
+  side?: TwinSide
+}
+
 export type NodeCommand =
   | HelloCommand
-  | HomeCommand
-  | GotoCommand
-  | StopCommand
-  | ReleaseCommand
-  | HoldCommand
-  | CalibrateCommand
-  | ConfigCommand
-  | JogCommand
+  | (HomeCommand & Sided)
+  | (GotoCommand & Sided)
+  | (StopCommand & Sided)
+  | (ReleaseCommand & Sided)
+  | (HoldCommand & Sided)
+  | (CalibrateCommand & Sided)
+  | (ConfigCommand & Sided)
+  | (JogCommand & Sided)
   | NetCommand
+
+/** Read the side of an incoming frame without fully parsing it as an event. */
+export function frameSide(data: string): TwinSide | undefined {
+  if (!data.includes('"side"')) return undefined
+  try {
+    const side = (JSON.parse(data) as { side?: unknown }).side
+    return side === "left" || side === "right" ? side : undefined
+  } catch {
+    return undefined
+  }
+}
 
 export type NetPin = "auto" | "router" | "ap"
 export type NetRole = "master" | "slave"
@@ -278,6 +324,8 @@ export interface ServoEvent {
   held?: boolean
   /** Servo drive: the agent's live idle auto-release timeout in seconds; 0 = never. */
   holdTimeoutS?: number
+  /** The agent's effective homing time in seconds (pax-agent-1.6+). */
+  homeTimeoutS?: number
   /** DC drive: the longest timed jog the agent accepts, in ms. */
   jogMaxMs?: number
   /** Present on the frame emitted as a jog starts. */
@@ -320,8 +368,9 @@ export interface ArrivedEvent {
    * from the counted trigger, so this never invalidates the shelf number and the
    * agent never drives the motor to "correct" it. Persistent overshoot is
    * mechanical — lower the move speed.
+   * null when no shelf sensor is fitted ("index" positioning).
    */
-  onSensor?: boolean
+  onSensor?: boolean | null
   /** Which positioning produced this stop (pax-agent-1.5+). */
   positionMode?: PositionMode
   /** Sensor mode: shelf edges the distance filter threw out as bounce/re-entry. */

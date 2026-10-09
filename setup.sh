@@ -36,6 +36,9 @@
 #   sudo ./setup.sh --role slave  --motor dc --number 1 --shelves 9 --master pax-master.local --ap-psk <pw>
 #   sudo ./setup.sh -y            # re-run with the saved answers (update only)
 #
+# One-line update over SSH (never asks anything, never installs from scratch):
+#   curl -fsSL https://raw.githubusercontent.com/OWNER/REPO/main/setup.sh | sudo bash -s -- --update
+#
 set -euo pipefail
 
 # --------------------------------------------------------------------------
@@ -59,6 +62,7 @@ AP_PSK=""
 AP_SSID=""
 ASSUME_YES=0
 RECONFIGURE=0
+UPDATE_ONLY=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -73,6 +77,7 @@ while [[ $# -gt 0 ]]; do
     --branch) PAX_BRANCH="$2"; shift 2 ;;
     --reconfigure) RECONFIGURE=1; shift ;;
     -y|--yes) ASSUME_YES=1; shift ;;
+    --update) UPDATE_ONLY=1; ASSUME_YES=1; shift ;;
     -h|--help) sed -n '2,39p' "$0"; exit 0 ;;
     *) echo "unknown option: $1" >&2; exit 2 ;;
   esac
@@ -173,7 +178,14 @@ fi
 
 # What the user is doing this run. "update" = same setup, no questions.
 ACTION="install"
-if [[ -n "$OLD_ROLE" && $RECONFIGURE -eq 0 && -z "$ROLE" ]]; then
+if [[ $UPDATE_ONLY -eq 1 ]]; then
+  # An update must never turn into a silent fresh install with default answers.
+  [[ -n "$OLD_ROLE" ]] || die "PAX is not installed on this Pi yet. Run the install command first (without --update)."
+  ACTION="update"
+  say "Updating: $(role_label "$OLD_ROLE")"
+  [[ -f "$DATA_DIR/paternoster.db" ]] && note "data: $DATA_DIR/paternoster.db — kept, backed up first"
+  printf '\n'
+elif [[ -n "$OLD_ROLE" && $RECONFIGURE -eq 0 && -z "$ROLE" ]]; then
   tty_say "${GREEN}PAX is already installed on this Pi.${RESET}"
   tty_say "    setup   : $(role_label "$OLD_ROLE")"
   [[ "$OLD_ROLE" != "app" ]] && tty_say "    motors  : $(motor_label "$OLD_MOTOR")${OLD_SHELVES:+, $OLD_SHELVES shelves}"
@@ -283,6 +295,8 @@ if [[ "$ROLE" == "app" ]]; then
   UNIT_NAME=""
 elif [[ "$ROLE" == "master" ]]; then
   HOSTNAME_NEW="pax-master"
+  # An update keeps whatever address slaves and phones already use.
+  [[ "$ACTION" == "update" && -n "$OLD_HOSTNAME" ]] && HOSTNAME_NEW="$OLD_HOSTNAME"
   # A filament-only Pi being upgraded already has an address people use;
   # keep it unless they want the standard one.
   if [[ "$ACTION" == "add-hardware" && "$CUR_HOST" != "raspberrypi" && "$CUR_HOST" != "pax-master" ]]; then
@@ -599,4 +613,5 @@ else
   printf '%s\n' "Link it in the app as ${BOLD}$HOSTNAME_NEW.local${RESET} (port $AGENT_PORT) and pick"
   printf '%s\n' "${BOLD}$(motor_label "$MOTOR")${RESET} under Motor drive for that unit."
 fi
-printf '\n%s\n' "${DIM}Update later with the same command — it recognises this install. Logs: journalctl -u pax-app -f  /  journalctl -u paternoster-agent -f${RESET}"
+printf '\n%s\n' "${DIM}Update later from Settings → Update, or over SSH:  curl -fsSL <same URL>/setup.sh | sudo bash -s -- --update"
+printf '%s\n' "${DIM} Logs: journalctl -u pax-app -f  /  journalctl -u paternoster-agent -f${RESET}"

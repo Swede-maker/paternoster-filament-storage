@@ -504,6 +504,11 @@ export interface QueueItem {
   printerId?: string
   printerSlot?: number
   /**
+   * Hardware pick stops started from a picking list: the row this stop fulfils,
+   * so the confirmed take count is recorded back onto the list.
+   */
+  pickListRef?: { listId: string; lineId: string }
+  /**
    * Source storage slot to clear on confirm. Set only for a "move" (relocating a
    * stored spool to another unit): the store item both empties `from` and fills
    * the destination slot, so the spool is never duplicated or lost.
@@ -533,6 +538,11 @@ export interface ActiveJob {
   items: QueueItem[]
   /** Index of the item currently being serviced. */
   currentIndex: number
+  /**
+   * Twin carousels: index of the item the current unit's twin sibling is
+   * servicing at the same time. Each side is confirmed independently.
+   */
+  twinIndex?: number
 }
 
 export interface Settings {
@@ -824,8 +834,30 @@ export interface StorageNode {
   servoJogPulses?: number
   /** DC only: how many milliseconds one jog tap runs the motor. */
   dcJogMs?: number
+  /**
+   * DC only: PWM balance between the two bridges, −20…+20 %. Two "identical"
+   * brushed motors never run at quite the same speed for the same duty, so one
+   * chain creeps ahead of the other. The faster side is trimmed DOWN by this
+   * much: negative slows motor A, positive slows motor B, 0 = both get the
+   * same duty. Applied by the agent to every move, homing and jog.
+   */
+  dcTrimPct?: number
   /** Invert motor B's direction (motors mounted facing each other). Both drives. */
   servoMirrorB?: boolean
+  /**
+   * Servo + HARDWARE carousels only: the carousel is driven by a single servo
+   * on channel A. Motor B's pulses and alarm are ignored and the jog panel
+   * offers one motor. Never applied to filament units (`servoSingleMotorFor`).
+   */
+  servoSingleMotor?: boolean
+  /**
+   * HARDWARE units only: this carousel is one half of a twin pair sharing a
+   * single Pi. "left" = motor A + the standard sensors, "right" = motor B + the
+   * second sensor pair. Its sibling is the other unit with the same ip:port.
+   */
+  twinSide?: "left" | "right"
+  /** Twin units only: run this carousel's one motor the other way round. */
+  twinReverse?: boolean
   /**
    * Servo only: ignore the drives' ALM inputs. The pins have a pull-up, so an
    * unwired ALM+/ALM− reads as a permanent alarm and blocks every move.
@@ -836,6 +868,17 @@ export interface StorageNode {
    * carousel can be moved by hand. 0 = hold always (until the supply is off).
    */
   servoHoldTimeoutS?: number
+  /**
+   * Safe move time: seconds after a move or homing run starts during which the
+   * shelf and home sensors are ignored. 0 = off.
+   */
+  sensorArmS?: number
+  /**
+   * Homing time: seconds a homing run may hunt for the index flag before the
+   * agent gives up and faults. Unset = the drive default (30 s on DC, 60 s on
+   * servo, which turns through a gearbox and is slower between flags).
+   */
+  homeTimeoutS?: number
   /**
    * How `goto` finds a shelf: "sensor" counts shelf-flag edges (default, and
    * the only option on DC); "pulses" (servo) drives a calibrated distance from
@@ -988,6 +1031,13 @@ export interface HardwarePart {
    * glance. Absent/null falls back to the colored tote graphic.
    */
   imageUrl?: string | null
+  /**
+   * When true the slot this box sits in is reserved for this part: taking the
+   * last piece out leaves the (now empty) box in place instead of freeing the
+   * slot, and new stock of the same part is routed back into it first. Shown
+   * and released from the "Locked slots" tab.
+   */
+  lockedSlot?: boolean
   createdAt: number
 }
 
@@ -1014,6 +1064,39 @@ export interface HardwareOrder {
   items: HardwareOrderItem[]
   /** Optional link to a saved store this order was/should be placed with. */
   storeId?: string
+}
+
+/** One row of a hardware picking list. */
+export interface PickListLine {
+  id: string
+  /** The stored part to pick. The box may be gone if the part was removed. */
+  partId: string
+  /** Snapshot of the part name so the row still reads well if the part is deleted. */
+  name: string
+  /** How many pieces the list asks for. */
+  requested: number
+  /** How many have been taken out against this row so far (may exceed requested). */
+  picked: number
+}
+
+/**
+ * A named hardware picking list. The user assembles it from the parts search,
+ * ticks the rows to pick, and runs one carousel job; each stop records what
+ * was actually taken so the list always shows picked vs. remaining.
+ */
+export interface PickList {
+  id: string
+  name: string
+  lines: PickListLine[]
+  createdAt: number
+  updatedAt: number
+  /**
+   * Set once every row is fully picked and the user has chosen to keep the list
+   * (instead of deleting it) in the completion prompt, so we don't ask again.
+   */
+  keptAfterDone?: boolean
+  /** True right after the final piece is picked until the user answers keep/remove. */
+  donePromptPending?: boolean
 }
 
 export interface AppState {
@@ -1067,6 +1150,8 @@ export interface AppState {
    * the stop, not here. Ephemeral runtime state, never persisted.
    */
   hwPickQueue: string[]
+  /** Saved hardware picking lists (shared + synced). */
+  hwPickLists: PickList[]
 }
 
 /**
@@ -1083,6 +1168,8 @@ export interface PersistedState {
   parts: Record<string, HardwarePart>
   /** Incoming hardware orders / carts (shared + synced). */
   hardwareOrders: HardwareOrder[]
+  /** Hardware picking lists (shared + synced). */
+  hwPickLists?: PickList[]
   nodes: StorageNode[]
   activeNodeId: string
   printers: Printer[]

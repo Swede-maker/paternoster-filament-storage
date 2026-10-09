@@ -1,4 +1,4 @@
-import type { AppState, HardwarePart, QueueItem, StorageNode } from "./types"
+import type { AppState, HardwarePart, PickList, QueueItem, StorageNode } from "./types"
 import type { Action } from "./store"
 import { bestSlotForNode, bestNodeSlot, type BalanceOccupant } from "./balance"
 import { getNode, nodesForSystem, orderQueueItems, partWeightGrams } from "./selectors"
@@ -23,7 +23,7 @@ function partsOccupancy(state: AppState): Record<string, BalanceOccupant> {
  * stops plus every pending job). New placements reserve these so two queued
  * parts never target the same slot and the balance math spreads them out.
  */
-function queuedReservations(state: AppState): { nodeId: string; shelf: number; slot: number }[] {
+export function queuedReservations(state: AppState): { nodeId: string; shelf: number; slot: number }[] {
   const out: { nodeId: string; shelf: number; slot: number }[] = []
   const collect = (items: { nodeId: string; shelf: number; slot: number; done?: boolean }[]) => {
     for (const it of items) if (!it.done) out.push({ nodeId: it.nodeId, shelf: it.shelf, slot: it.slot })
@@ -49,12 +49,68 @@ export function findPartLocation(
   return null
 }
 
+/** Two boxes hold "the same part" when name + category match (case-insensitive). */
+export function samePartKey(p: Pick<HardwarePart, "name" | "category">): string {
+  return `${p.name.trim().toLowerCase()}|${(p.category ?? "").trim().toLowerCase()}`
+}
+
+/**
+ * Other boxes of the same part that are sitting in a hardware slot, with their
+ * location. Locked boxes come first (emptiest first), then unlocked ones, so
+ * new stock refills reserved slots before anything else. Boxes whose slot is
+ * already the target of a queued stop are skipped.
+ */
+export function samePartBoxes(
+  state: AppState,
+  part: Pick<HardwarePart, "name" | "category">,
+  excludePartIds: string[] = [],
+  reserved: { nodeId: string; shelf: number; slot: number }[] = [],
+): { part: HardwarePart; nodeId: string; shelf: number; slot: number }[] {
+  const key = samePartKey(part)
+  const out: { part: HardwarePart; nodeId: string; shelf: number; slot: number }[] = []
+  for (const p of Object.values(state.parts ?? {})) {
+    if (excludePartIds.includes(p.id) || samePartKey(p) !== key) continue
+    const loc = findPartLocation(state, p.id)
+    if (!loc) continue
+    if (reserved.some((r) => r.nodeId === loc.nodeId && r.shelf === loc.shelf && r.slot === loc.slot)) continue
+    out.push({ part: p, ...loc })
+  }
+  return out.sort((a, b) => {
+    const la = a.part.lockedSlot ? 0 : 1
+    const lb = b.part.lockedSlot ? 0 : 1
+    return la - lb || a.part.count - b.part.count
+  })
+}
+
+export type RemainderDestination =
+  | { kind: "existing"; partId: string; nodeId: string; shelf: number; slot: number }
+  | { kind: "new"; nodeId: string; shelf: number; slot: number }
+
+/**
+ * Where leftover pieces should go when a box doesn't fully fit its slot: into
+ * another box of the same part first (locked ones before others), otherwise a
+ * fresh balanced slot. Null when the hardware storage is completely full.
+ */
+export function pickRemainderDestination(
+  state: AppState,
+  part: HardwarePart,
+  excludePartIds: string[],
+  reserved: { nodeId: string; shelf: number; slot: number }[],
+): RemainderDestination | null {
+  const sibling = samePartBoxes(state, part, excludePartIds, reserved)[0]
+  if (sibling) {
+    return { kind: "existing", partId: sibling.part.id, nodeId: sibling.nodeId, shelf: sibling.shelf, slot: sibling.slot }
+  }
+  const free = pickHardwareSlot(state, partWeightGrams(part), undefined, reserved)
+  return free ? { kind: "new", ...free } : null
+}
+
 /**
  * Choose the best-balanced empty slot for a new part box: try the unit the user
  * picked first, then spill over to the best slot across all hardware units.
  * Returns null when every hardware unit is full.
  */
-function pickHardwareSlot(
+export function pickHardwareSlot(
   state: AppState,
   weight: number,
   preferredNodeId?: string,
@@ -95,6 +151,31 @@ export function placeNewPart(
   // Reserve any slots already claimed by an in-flight placement so a part added
   // mid-operation lands in its own balanced slot instead of colliding.
   const reserved = queuedReservations(state)
+
+  // A slot locked to this same part (by name + category) takes the new stock
+  // first — that is what the lock is for. The new pieces are added to that box
+  // instead of opening a second one; if they don't all fit, the stop's partial
+  // store splits the rest onward. An explicitly tapped slot overrides this.
+  if (!target) {
+    const locked = samePartBoxes(state, part, [part.id], reserved).find((b) => b.part.lockedSlot)
+    if (locked) {
+      dispatch({
+        type: "ENQUEUE_JOB_ITEM",
+        mode: "store",
+        item: {
+          spoolId: locked.part.id,
+          occupantKind: "part",
+          nodeId: locked.nodeId,
+          shelf: locked.shelf,
+          slot: locked.slot,
+          partOp: { kind: "add", count: Math.max(1, Math.floor(part.count)) },
+          done: false,
+        },
+      })
+      return true
+    }
+  }
+
   let dest = pickHardwareSlot(state, partWeightGrams(part), preferredNodeId, reserved)
   if (target) {
     const node = getNode(state, target.nodeId)
@@ -217,6 +298,44 @@ export function takeOutParts(state: AppState, dispatch: Dispatch, partIds: strin
     shelf: it.shelf,
     slot: it.slot,
     partOp: { kind: "take", count: 0 },
+    done: false,
+  }))
+
+  dispatch({ type: "START_JOBS", jobs: [{ mode: "pick", currentIndex: 0, items }] })
+  return true
+}
+
+/**
+ * Run a picking list: one take-out job visiting every ticked row, shortest
+ * route first. Each stop is tagged with its list row so the quantity the
+ * operator confirms (which may be less or more than requested) is recorded back
+ * onto the list. Rows whose part is no longer in storage are skipped.
+ */
+export function pickFromList(state: AppState, dispatch: Dispatch, list: PickList, lineIds: string[]): boolean {
+  const located = list.lines
+    .filter((ln) => lineIds.includes(ln.id))
+    .map((ln) => {
+      const loc = findPartLocation(state, ln.partId)
+      return loc ? { partId: ln.partId, lineId: ln.id, ...loc } : null
+    })
+    .filter((x): x is { partId: string; lineId: string; nodeId: string; shelf: number; slot: number } => x != null)
+  if (located.length === 0) return false
+
+  const nodePos: Record<string, { currentShelf: number; shelves: number }> = {}
+  for (const n of nodesForSystem(state, "hardware")) {
+    if ((n.type ?? "paternoster") === "paternoster") {
+      nodePos[n.id] = { currentShelf: n.machine.currentShelf, shelves: n.storage.shelves }
+    }
+  }
+
+  const items: QueueItem[] = orderQueueItems(located, nodePos).map((it) => ({
+    spoolId: it.partId,
+    occupantKind: "part",
+    nodeId: it.nodeId,
+    shelf: it.shelf,
+    slot: it.slot,
+    partOp: { kind: "take", count: 0 },
+    pickListRef: { listId: list.id, lineId: it.lineId },
     done: false,
   }))
 

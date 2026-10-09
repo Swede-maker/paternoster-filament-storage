@@ -17,10 +17,14 @@ import { SettingsView } from "@/components/settings-view"
 import { MotionOverlay } from "@/components/motion-overlay"
 import { PositionLostDialog } from "@/components/position-lost-dialog"
 import { HomingRequiredDialog } from "@/components/homing-required-dialog"
+import { EmergencyStopBar } from "@/components/emergency-stop-bar"
 import { BottomNav, type NavTab } from "@/components/bottom-nav"
 import { AreaSwitcher } from "@/components/area-switcher"
 import { HardwareHomeView } from "@/components/hardware/hardware-home-view"
 import { HardwareInventoryView } from "@/components/hardware/hardware-inventory-view"
+import { HardwareLockedView } from "@/components/hardware/hardware-locked-view"
+import { HardwarePickingView } from "@/components/hardware/hardware-picking-view"
+import { PickListDonePrompt } from "@/components/hardware/pick-list-done-prompt"
 import { HardwareOrdersView } from "@/components/hardware/hardware-orders-view"
 import { HardwareSettingsView } from "@/components/hardware/hardware-settings-view"
 import { NodeConnection } from "@/components/node-connection"
@@ -127,7 +131,10 @@ function AppShell() {
   }
 
   return (
-    <div className="flex h-dvh flex-col overflow-hidden bg-background text-foreground">
+    // Pinned to the viewport so iOS Safari can't scroll the document itself
+    // (which dragged the bottom nav up and left empty space under it). Only
+    // <main> scrolls.
+    <div className="fixed inset-0 flex flex-col overflow-hidden overscroll-none bg-background text-foreground">
       {/* Top-level area switcher — the only place the two worlds meet. */}
       <header className="flex shrink-0 items-center justify-center border-b border-border bg-panel px-3 py-2">
         <AreaSwitcher area={area} onChange={changeArea} />
@@ -139,22 +146,29 @@ function AppShell() {
       <main
         className={
           tab === "home" && area !== "printers"
-            ? "flex min-h-0 flex-1 flex-col overflow-y-auto lg:overflow-hidden"
-            : "flex min-h-0 flex-1 flex-col overflow-y-auto"
+            ? "flex min-h-0 flex-1 flex-col overflow-y-auto overscroll-contain lg:overflow-hidden"
+            : "flex min-h-0 flex-1 flex-col overflow-y-auto overscroll-contain"
         }
       >
         {area === "printers" ? (
           <PrintersView onGoFilament={() => changeArea("filament")} />
         ) : area === "hardware" ? (
-          tab === "orders" ? (
+          <>
+          <PickListDonePrompt />
+          {tab === "orders" ? (
             <HardwareOrdersView />
           ) : tab === "inventory" ? (
-            <HardwareInventoryView />
+            <HardwareInventoryView onGoHome={() => setTab("home")} />
+          ) : tab === "locked" ? (
+            <HardwareLockedView onGoHome={() => setTab("home")} />
+          ) : tab === "picking" ? (
+            <HardwarePickingView onGoHome={() => setTab("home")} />
           ) : tab === "settings" ? (
             <HardwareSettingsView />
           ) : (
             <HardwareHomeView />
-          )
+          )}
+          </>
         ) : tab === "home" ? (
           <HomeView />
         ) : tab === "scan" ? (
@@ -181,6 +195,7 @@ function AppShell() {
       {/* Safety: a real carousel that has never been homed asks before its
           first sweep instead of spinning the moment its Pi connects. */}
       <HomingRequiredDialog />
+      <EmergencyStopBar />
     </div>
   )
 }

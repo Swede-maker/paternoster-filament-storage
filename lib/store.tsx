@@ -18,6 +18,7 @@ import type {
   FilamentUsage,
   HardwareCategory,
   HardwareOrder,
+  PickList,
   HardwareOrderItem,
   HardwarePart,
   SystemKind,
@@ -47,6 +48,7 @@ import type {
 } from "./types"
 import type { CalibrationEvent, MotorMode, NetResultEvent, NetSlave, NetStatusEvent, ServoEvent } from "./node-protocol"
 import { printerAmsUnits, printerSlotCount, rampStepMs, newId, DEFAULT_RAMP_PCT } from "./filament"
+import { pickRemainderDestination } from "./hardware-flow"
 import { shelfLabel, printerSlotLabel } from "./selectors"
 import { shortestRotation } from "./balance"
 import { pickFilamentDestination } from "./filament-flow"
@@ -142,6 +144,7 @@ function toPersisted(state: AppState): PersistedState {
     spools: state.spools,
     parts: state.parts ?? {},
     hardwareOrders: state.hardwareOrders ?? [],
+    hwPickLists: state.hwPickLists ?? [],
     // Reset live link status so a saved snapshot doesn't claim a unit is
     // online on a device that isn't actually connected to it. Also normalize the
     // volatile machine-motion fields (status/target/direction) to their idle
@@ -369,7 +372,9 @@ const NODE_TUNING_KEYS = [
   "servoGearRatio",
   "servoJogPulses",
   "dcJogMs",
+  "dcTrimPct",
   "servoMirrorB",
+  "servoSingleMotor",
   "servoIgnoreAlarm",
   "servoHoldTimeoutS",
   "motorMode",
@@ -490,6 +495,12 @@ function mergeCatalog(local: PersistedState, remote: PersistedState, baseline: P
   // rule so a locally-removed part isn't resurrected).
   const parts = mergeRecordByKey(local.parts, remote.parts, baseline?.parts)
   const hardwareOrders = mergeByKey(local.hardwareOrders, remote.hardwareOrders, baseline?.hardwareOrders, (o) => o.id)
+  const hwPickLists = mergeByKey(
+    local.hwPickLists ?? [],
+    remote.hwPickLists ?? [],
+    baseline?.hwPickLists ?? [],
+    (l) => l.id,
+  )
   // Dispense requests are keyed like orders: a request another device (or the
   // printer API) ADDED since baseline must survive our last-write-wins save,
   // while a request WE removed (after completion) stays removed. Local wins on
@@ -513,6 +524,7 @@ function mergeCatalog(local: PersistedState, remote: PersistedState, baseline: P
     spools,
     parts,
     hardwareOrders,
+    hwPickLists,
     dispenseRequests,
     apiToken,
     history,
@@ -736,6 +748,7 @@ function makeInitialState(): AppState {
     storageSnapshots: [],
     hardwareOrders: [],
     hwPickQueue: [],
+    hwPickLists: [],
   }
 }
 
@@ -797,7 +810,9 @@ export type Action =
           | "servoGearRatio"
           | "servoJogPulses"
           | "dcJogMs"
+          | "dcTrimPct"
           | "servoMirrorB"
+          | "servoSingleMotor"
           | "servoIgnoreAlarm"
           | "servoHoldTimeoutS"
           | "positionMode"
@@ -952,6 +967,11 @@ export type Action =
    * empties completely the part is removed and its slot is freed.
    */
   | { type: "HW_TAKE"; partId: string; takeCount: number }
+  | { type: "PICKLIST_UPSERT"; list: PickList }
+  | { type: "PICKLIST_DELETE"; id: string }
+  | { type: "PICKLIST_RECORD"; listId: string; lineId: string; count: number }
+  /** User answered the "everything picked" prompt with "keep the list". */
+  | { type: "PICKLIST_RESOLVE_DONE"; id: string }
   // Hardware take-out queue (assemble first, run as one job). See AppState.hwPickQueue.
   | { type: "HW_QUEUE_TAKE_ADD"; partId: string }
   | { type: "HW_QUEUE_TAKE_REMOVE"; partId: string }
@@ -1002,7 +1022,15 @@ export type Action =
    * its own job; nothing running starts a fresh job.
    */
   | { type: "ENQUEUE_JOB_ITEM"; item: QueueItem; mode: QueueMode }
-  | { type: "CONFIRM_STOP"; grams?: number; takeCount?: number }
+  /**
+   * `storeCount` (hardware place/store stops only): how many pieces actually
+   * fit in this slot. When it is less than the item's full count, the rest is
+   * split off and queued to another box of the same part (locked boxes first)
+   * or a fresh slot.
+   */
+  | { type: "CONFIRM_STOP"; grams?: number; takeCount?: number; storeCount?: number; index?: number }
+  | { type: "MAKE_TWIN"; id: string }
+  | { type: "UNTWIN"; id: string }
   /**
    * Correct a mix-up between physically identical spools: the operator scanned a
    * spool other than the one the current stop expected. Swaps which spool id the
@@ -1112,7 +1140,9 @@ function onNodeArrived(state: AppState, nodeId: string): AppState {
   if (!node) return state
   const job = state.job
   const current = job?.items[job.currentIndex]
-  const isServicing = !!current && current.nodeId === nodeId
+  const twinItem = job?.twinIndex != null ? job.items[job.twinIndex] : undefined
+  const isServicing =
+    (!!current && current.nodeId === nodeId) || (!!twinItem && !twinItem.done && twinItem.nodeId === nodeId)
   if (!isServicing) {
     // Background pre-rotation finished — park idle, ready for the user.
     return withNode(state, nodeId, (n) => ({
@@ -1139,8 +1169,89 @@ function serviceCurrentItem(state: AppState): AppState {
     ? { ...state, activeNodeId: current.nodeId }
     : state
   let next = beginNodeMoveTo(withActive, current.nodeId, current.shelf, true)
+  next = normalizeTwin(next)
   next = prefetchOtherNodes(next)
   return next
+}
+
+/** The other half of a twin pair: same Pi (ip:port + driver), opposite side. */
+export function twinSiblingOf(state: AppState, node: StorageNode): StorageNode | undefined {
+  if (!node.twinSide || node.system !== "hardware") return undefined
+  return state.nodes.find(
+    (n) =>
+      n.id !== node.id &&
+      n.system === "hardware" &&
+      !!n.twinSide &&
+      n.twinSide !== node.twinSide &&
+      n.ip === node.ip &&
+      n.port === node.port &&
+      n.driver === node.driver,
+  )
+}
+
+function rotationDistance(from: number, to: number, shelves: number): number {
+  if (shelves <= 0) return 0
+  const d = (((to - from) % shelves) + shelves) % shelves
+  return Math.min(d, shelves - d)
+}
+
+/** Undone item on `node` closest (in shelves turned) to where it is now. */
+function nearestItemOn(job: ActiveJob, node: StorageNode, exclude: Set<number>): number | undefined {
+  let best: number | undefined
+  let bestDist = Number.POSITIVE_INFINITY
+  job.items.forEach((it, i) => {
+    if (it.done || exclude.has(i) || it.nodeId !== node.id) return
+    const d = rotationDistance(node.machine.currentShelf, it.shelf, node.storage.shelves)
+    if (d < bestDist) {
+      best = i
+      bestDist = d
+    }
+  })
+  return best
+}
+
+/**
+ * Keep the twin sibling of the current stop busy: if it has queued stops of its
+ * own, give it the nearest one and start rotating so both sides of the pair
+ * work at the same time instead of one waiting for the other.
+ */
+function normalizeTwin(state: AppState): AppState {
+  const job = state.job
+  if (!job) return state
+  const primary = job.items[job.currentIndex]
+  const pNode = primary ? getNode(state, primary.nodeId) : undefined
+  const sib = pNode ? twinSiblingOf(state, pNode) : undefined
+  const clear = (): AppState => (job.twinIndex == null ? state : { ...state, job: { ...job, twinIndex: undefined } })
+  if (!sib) return clear()
+  const ti = job.twinIndex
+  if (ti != null && ti !== job.currentIndex && job.items[ti] && !job.items[ti].done && job.items[ti].nodeId === sib.id) {
+    return state
+  }
+  const idx = nearestItemOn(job, sib, new Set([job.currentIndex]))
+  if (idx == null) return clear()
+  const next: AppState = { ...state, job: { ...job, twinIndex: idx } }
+  const s = getNode(next, sib.id)!
+  if (s.machine.status !== "idle" && s.machine.status !== "moving") return next
+  return beginNodeMoveTo(next, sib.id, job.items[idx].shelf, true)
+}
+
+/**
+ * A carousel that lost its position keeps the running job and the queue behind
+ * it. Once homing re-establishes where it is, pick the job back up: if the
+ * interrupted stop is on this unit, head there again (through the normal
+ * confirm-before-rotate gate); otherwise just pre-position it for its next stop.
+ */
+function resumeJobAfterHoming(state: AppState, nodeId: string): AppState {
+  const job = state.job
+  if (!job) return state
+  const current = job.items[job.currentIndex]
+  if (!current || current.done) return state
+  if (current.nodeId === nodeId) return serviceCurrentItem(state)
+  const twinItem = job.twinIndex != null ? job.items[job.twinIndex] : undefined
+  if (twinItem && !twinItem.done && twinItem.nodeId === nodeId) {
+    return beginNodeMoveTo(state, nodeId, twinItem.shelf, true)
+  }
+  return prefetchOtherNodes(normalizeTwin(state))
 }
 
 /**
@@ -1157,6 +1268,7 @@ function prefetchOtherNodes(state: AppState): AppState {
 
   let next = state
   const handled = new Set<string>([current.nodeId])
+  if (job.twinIndex != null && job.items[job.twinIndex]) handled.add(job.items[job.twinIndex].nodeId)
   for (let i = job.currentIndex + 1; i < job.items.length; i++) {
     const upcoming = job.items[i]
     if (upcoming.done || handled.has(upcoming.nodeId)) continue
@@ -1459,8 +1571,9 @@ function coreReducer(state: AppState, action: Action): AppState {
       const part = state.parts[action.partId]
       if (!part || action.takeCount <= 0) return state
       const count = Math.max(0, part.count - Math.floor(action.takeCount))
-      if (count <= 0) {
-        // The box is now empty: remove the part and free its slot.
+      if (count <= 0 && !part.lockedSlot) {
+        // The box is now empty: remove the part and free its slot. A locked box
+        // instead stays put at 0 pcs so the slot keeps waiting for new stock.
         const parts = { ...state.parts }
         delete parts[action.partId]
         const nodes = state.nodes.map((n) => ({
@@ -1519,6 +1632,46 @@ function coreReducer(state: AppState, action: Action): AppState {
         },
       }
     }
+
+    // --- Hardware picking lists ------------------------------------------------
+    case "PICKLIST_UPSERT": {
+      const lists = state.hwPickLists ?? []
+      const exists = lists.some((l) => l.id === action.list.id)
+      const stamped = { ...action.list, updatedAt: Date.now() }
+      return {
+        ...state,
+        hwPickLists: exists ? lists.map((l) => (l.id === stamped.id ? stamped : l)) : [...lists, stamped],
+      }
+    }
+    case "PICKLIST_DELETE":
+      return { ...state, hwPickLists: (state.hwPickLists ?? []).filter((l) => l.id !== action.id) }
+    case "PICKLIST_RECORD": {
+      // Add what was actually taken to the row; when that completes the whole
+      // list, raise the keep/remove prompt (unless the user already kept it).
+      return {
+        ...state,
+        hwPickLists: (state.hwPickLists ?? []).map((l) => {
+          if (l.id !== action.listId) return l
+          const lines = l.lines.map((ln) =>
+            ln.id === action.lineId ? { ...ln, picked: Math.max(0, ln.picked + Math.floor(action.count)) } : ln,
+          )
+          const allDone = lines.length > 0 && lines.every((ln) => ln.picked >= ln.requested)
+          return {
+            ...l,
+            lines,
+            updatedAt: Date.now(),
+            donePromptPending: allDone && !l.keptAfterDone ? true : l.donePromptPending,
+          }
+        }),
+      }
+    }
+    case "PICKLIST_RESOLVE_DONE":
+      return {
+        ...state,
+        hwPickLists: (state.hwPickLists ?? []).map((l) =>
+          l.id === action.id ? { ...l, donePromptPending: false, keptAfterDone: true } : l,
+        ),
+      }
 
     case "ADD_HW_ORDER":
       return { ...state, hardwareOrders: [...state.hardwareOrders, action.order] }
@@ -2023,8 +2176,9 @@ function coreReducer(state: AppState, action: Action): AppState {
       }))
     }
 
-    case "HOME_DONE":
-      return withNode(state, action.nodeId, (n) => {
+    case "HOME_DONE": {
+      const measuringRun = getNode(state, action.nodeId)?.calibrating === true
+      const homed = withNode(state, action.nodeId, (n) => {
         // Simulated calibration, phase 2: a full turn back to shelf 0. A move
         // whose target equals its start only "arrives" after every shelf has
         // ticked past — exactly one revolution.
@@ -2044,6 +2198,8 @@ function coreReducer(state: AppState, action: Action): AppState {
           },
         }
       })
+      return measuringRun ? homed : resumeJobAfterHoming(homed, action.nodeId)
+    }
 
     case "MANUAL_MOVE": {
       const node = getNode(state, action.nodeId)
@@ -2302,10 +2458,10 @@ function coreReducer(state: AppState, action: Action): AppState {
       return onNodeArrived(snapped, action.nodeId)
     }
 
-    case "NODE_HOMED":
+    case "NODE_HOMED": {
       // Also clears a fault: when ANOTHER device homed the carousel, this one
       // hears the Pi's `homed` frame and its position-lost warning resolves.
-      return withNode(state, action.nodeId, (n) => ({
+      const homed = withNode(state, action.nodeId, (n) => ({
         ...n,
         machine: {
           ...n.machine,
@@ -2319,29 +2475,30 @@ function coreReducer(state: AppState, action: Action): AppState {
           homingRequest: null,
         },
       }))
+      return resumeJobAfterHoming(homed, action.nodeId)
+    }
 
     case "NODE_FAULT":
-      // Hardware fault: the agent has already cut the motor. Drop any job and
-      // park the node with its position UNKNOWN. Recording `fault` is what makes
-      // the "position lost" dialog appear and what blocks the power-up auto-home
-      // from ever treating this un-homed state as a fresh boot. Nothing moves
-      // again until the operator explicitly chooses to home.
-      return {
-        ...withNode(state, action.nodeId, (n) => ({
-          ...n,
-          machine: {
-            ...n.machine,
-            status: "idle",
-            homed: false,
-            targetShelf: null,
-            direction: null,
-            moveFrom: null,
-            fault: { message: action.message, at: Date.now(), acknowledged: false },
-          },
-        })),
-        job: null,
-        pendingJobs: [],
-      }
+      // Hardware fault: the agent has already cut the motor. Park the node with
+      // its position UNKNOWN. Recording `fault` is what makes the "position
+      // lost" dialog appear and what blocks the power-up auto-home from ever
+      // treating this un-homed state as a fresh boot. Nothing moves again until
+      // the operator explicitly chooses to home.
+      // The job and the queue behind it are KEPT: once homing finishes,
+      // `resumeJobAfterHoming` heads for the stop that was interrupted.
+      return withNode(state, action.nodeId, (n) => ({
+        ...n,
+        machine: {
+          ...n.machine,
+          status: "idle",
+          homed: false,
+          targetShelf: null,
+          direction: null,
+          moveFrom: null,
+          resumeStatus: null,
+          fault: { message: action.message, at: Date.now(), acknowledged: false },
+        },
+      }))
 
     case "ACK_NODE_FAULT":
       // Operator chose "Not now" in the position-lost dialog. The carousel stays
@@ -2447,11 +2604,15 @@ function coreReducer(state: AppState, action: Action): AppState {
     case "CONFIRM_STOP": {
       const job = state.job
       if (!job) return state
-      const idx = job.currentIndex
+      const idx = action.index ?? job.currentIndex
+      if (idx !== job.currentIndex && idx !== job.twinIndex) return state
       const item = job.items[idx]
-      if (!item) return state
+      if (!item || item.done) return state
 
       let next: AppState = state
+      // A hardware stop that didn't fully fit may spawn one follow-up stop for
+      // the remainder; it is appended to this job below.
+      let spilloverItem: QueueItem | null = null
 
       if (job.mode === "pick" && item.occupantKind === "part") {
         // Hardware take-out. Decrement the box; HW_TAKE itself frees the slot and
@@ -2460,6 +2621,14 @@ function coreReducer(state: AppState, action: Action): AppState {
         // back to any pre-set partOp count for older single-take flows.
         const takeCount = action.takeCount ?? (item.partOp?.kind === "take" ? item.partOp.count : 0)
         next = machineReducer(next, { type: "HW_TAKE", partId: item.spoolId, takeCount })
+        if (item.pickListRef && takeCount > 0) {
+          next = machineReducer(next, {
+            type: "PICKLIST_RECORD",
+            listId: item.pickListRef.listId,
+            lineId: item.pickListRef.lineId,
+            count: takeCount,
+          })
+        }
       } else if (job.mode === "pick") {
         next = machineReducer(next, {
           type: "SET_STORAGE_SLOT",
@@ -2476,13 +2645,66 @@ function coreReducer(state: AppState, action: Action): AppState {
             spoolId: item.spoolId,
           })
         }
-      } else if (job.mode === "store" && item.occupantKind === "part") {
-        // Hardware "store more" into an existing box: grow the count, then make
-        // sure the part id occupies the slot (it already should, but a re-set is
-        // harmless and keeps placement idempotent).
-        if (item.partOp?.kind === "add") {
-          next = machineReducer(next, { type: "HW_STORE_MORE", partId: item.spoolId, addCount: item.partOp.count })
+      } else if (item.occupantKind === "part") {
+        // Hardware place (new box) or store-more (existing box). The operator may
+        // report that only `storeCount` pieces fit: the box keeps that many and
+        // the rest is routed to another box of the same part or a fresh slot.
+        const part = next.parts[item.spoolId]
+        const isAdd = item.partOp?.kind === "add"
+        const full = isAdd ? Math.max(0, Math.floor(item.partOp!.count)) : part?.count ?? 0
+        let placed = full
+        if (part && typeof action.storeCount === "number" && Number.isFinite(action.storeCount)) {
+          placed = Math.min(full, Math.max(0, Math.round(action.storeCount)))
         }
+        const remainder = full - placed
+        if (part && remainder > 0) {
+          // The current slot is not written until below, so it must be reserved
+          // explicitly or the remainder would be offered this very slot.
+          const reserved = [
+            item,
+            ...job.items.filter((it, i) => i !== idx && !it.done),
+            ...next.pendingJobs.flatMap((j) => j.items),
+          ].map((it) => ({ nodeId: it.nodeId, shelf: it.shelf, slot: it.slot }))
+          const dest = pickRemainderDestination(next, part, [part.id], reserved)
+          if (!dest) {
+            // Nowhere to put the rest: keep everything here rather than lose it.
+            placed = full
+          } else if (dest.kind === "existing") {
+            spilloverItem = {
+              spoolId: dest.partId,
+              occupantKind: "part",
+              nodeId: dest.nodeId,
+              shelf: dest.shelf,
+              slot: dest.slot,
+              partOp: { kind: "add", count: remainder },
+              done: false,
+            }
+          } else {
+            const clone: HardwarePart = {
+              ...part,
+              id: newId("part"),
+              count: remainder,
+              lockedSlot: false,
+              createdAt: Date.now(),
+            }
+            next = machineReducer(next, { type: "UPSERT_PART", part: clone })
+            spilloverItem = {
+              spoolId: clone.id,
+              occupantKind: "part",
+              nodeId: dest.nodeId,
+              shelf: dest.shelf,
+              slot: dest.slot,
+              done: false,
+            }
+          }
+        }
+        if (part && isAdd) {
+          if (placed > 0) next = machineReducer(next, { type: "HW_STORE_MORE", partId: part.id, addCount: placed })
+        } else if (part && placed !== part.count) {
+          next = machineReducer(next, { type: "UPSERT_PART", part: { ...part, count: placed } })
+        }
+        // Make sure the part id occupies the slot (a re-set is harmless and keeps
+        // placement idempotent).
         next = machineReducer(next, {
           type: "SET_STORAGE_SLOT",
           nodeId: item.nodeId,
@@ -2521,10 +2743,8 @@ function coreReducer(state: AppState, action: Action): AppState {
           spoolId: item.spoolId,
         })
       } else {
-        // "place" mode. A hardware part carries no filament grams to write back
-        // (its count already lives in `state.parts`), so only apply a grams edit
-        // for real spools; both kinds just drop their id into the balanced slot.
-        if (item.occupantKind !== "part" && typeof action.grams === "number") {
+        // "place" mode for a filament spool (hardware parts were handled above).
+        if (typeof action.grams === "number") {
           next = machineReducer(next, { type: "UPDATE_SPOOL", id: item.spoolId, changes: { grams: action.grams } })
         }
         next = machineReducer(next, {
@@ -2543,8 +2763,8 @@ function coreReducer(state: AppState, action: Action): AppState {
       }))
 
       const items = job.items.map((it, i) => (i === idx ? { ...it, done: true } : it))
-      const nextIndex = idx + 1
-      if (nextIndex >= items.length) {
+      if (spilloverItem) items.push(spilloverItem)
+      if (!items.some((it) => !it.done)) {
         // This whole job is done. If another job is queued (e.g. take-out
         // finished, now run place-in), start it; otherwise everything is done.
         if (next.pendingJobs.length > 0) {
@@ -2554,7 +2774,36 @@ function coreReducer(state: AppState, action: Action): AppState {
         }
         return { ...next, job: null }
       }
-      const advanced = { ...next, job: { ...job, items, currentIndex: nextIndex } }
+
+      // Twin side finished its stop: the primary side carries on untouched and
+      // this side immediately takes its own nearest remaining stop.
+      if (idx === job.twinIndex) {
+        const after: AppState = { ...next, job: { ...job, items, twinIndex: undefined } }
+        return prefetchOtherNodes(normalizeTwin(after))
+      }
+
+      // Primary finished while its twin is already busy: promote the twin's stop
+      // (it is moving or waiting already), then refill the side that just freed.
+      if (job.twinIndex != null && !items[job.twinIndex].done) {
+        const promotedItem = items[job.twinIndex]
+        const promoted: AppState = {
+          ...next,
+          activeNodeId: promotedItem.nodeId,
+          job: { ...job, items, currentIndex: job.twinIndex, twinIndex: undefined },
+        }
+        return prefetchOtherNodes(normalizeTwin(promoted))
+      }
+
+      // A twin side with more stops of its own goes to its nearest one; everyone
+      // else keeps the queue order.
+      const finishedNode = getNode(next, item.nodeId)
+      let nextIndex: number | undefined =
+        finishedNode?.twinSide ? nearestItemOn({ ...job, items }, finishedNode, new Set()) : undefined
+      if (nextIndex == null) {
+        nextIndex = items.findIndex((it, i) => i > idx && !it.done)
+        if (nextIndex < 0) nextIndex = items.findIndex((it) => !it.done)
+      }
+      const advanced = { ...next, job: { ...job, items, currentIndex: nextIndex, twinIndex: undefined } }
       return serviceCurrentItem(advanced)
     }
 
@@ -2591,8 +2840,14 @@ function coreReducer(state: AppState, action: Action): AppState {
       //   * preserves currentShelf/targetShelf/direction/moveFrom so the move
       //     can pick up precisely where it left off.
       // The active job is left untouched so "Continue task" can carry on.
-      if (node.machine.status === "stopped") return state
-      return withNode(state, action.nodeId, (n) => ({
+      // Twin carousels share one Pi and one physical stop: halt both halves.
+      const sibling = twinSiblingOf(state, node)
+      if (node.machine.status === "stopped") {
+        return sibling && sibling.machine.status !== "stopped"
+          ? coreReducer(state, { type: "EMERGENCY_STOP", nodeId: sibling.id })
+          : state
+      }
+      const stoppedSelf = withNode(state, action.nodeId, (n) => ({
         ...n,
         // A measuring run cannot be resumed mid-turn; it is simply abandoned.
         calibrating: false,
@@ -2602,6 +2857,56 @@ function coreReducer(state: AppState, action: Action): AppState {
             : n.calibration,
         machine: { ...n.machine, status: "stopped", resumeStatus: n.machine.status },
       }))
+      return sibling && sibling.machine.status !== "stopped"
+        ? coreReducer(stoppedSelf, { type: "EMERGENCY_STOP", nodeId: sibling.id })
+        : stoppedSelf
+    }
+
+    case "MAKE_TWIN": {
+      const node = getNode(state, action.id)
+      if (!node || node.system !== "hardware" || node.type !== "paternoster" || node.twinSide) return state
+      const right: StorageNode = {
+        ...node,
+        id: newId("node"),
+        name: `${node.name} Right`,
+        twinSide: "right",
+        role: "slave",
+        slots: buildGrid(node.storage),
+        machine: freshMachine(),
+        calibrating: false,
+        calibration: undefined,
+        servoCarouselPulses: undefined,
+        servoIndexWindowPulses: undefined,
+        servoSingleMotor: false,
+      }
+      const withLeft = withNode(state, node.id, (n) => ({
+        ...n,
+        name: `${n.name} Left`,
+        twinSide: "left",
+        servoSingleMotor: false,
+      }))
+      const idx = withLeft.nodes.findIndex((n) => n.id === node.id)
+      const nodes = [...withLeft.nodes]
+      nodes.splice(idx + 1, 0, right)
+      return { ...withLeft, nodes }
+    }
+
+    case "UNTWIN": {
+      const node = getNode(state, action.id)
+      if (!node?.twinSide) return state
+      const sibling = twinSiblingOf(state, node)
+      const left = node.twinSide === "left" ? node : sibling
+      const right = node.twinSide === "right" ? node : sibling
+      if (state.job?.items.some((it) => !it.done && (it.nodeId === left?.id || it.nodeId === right?.id))) return state
+      // Only an empty Right carousel can be dropped; it would lose its contents.
+      if (right && right.slots.some((row) => row.some((s) => s != null))) return state
+      const nodes = state.nodes
+        .filter((n) => n.id !== right?.id)
+        .map((n) =>
+          n.id === left?.id ? { ...n, twinSide: undefined, name: n.name.replace(/ Left$/, "") } : n,
+        )
+      const activeNodeId = state.activeNodeId === right?.id ? (left?.id ?? nodes[0]?.id ?? null) : state.activeNodeId
+      return { ...state, nodes, activeNodeId }
     }
 
     case "RESUME_MOVE": {
@@ -2863,6 +3168,7 @@ function migrate(parsed: any): AppState {
     spools: parsed.spools ?? {},
     parts: parsed.parts && typeof parsed.parts === "object" ? parsed.parts : {},
     hardwareOrders: Array.isArray(parsed.hardwareOrders) ? parsed.hardwareOrders : [],
+    hwPickLists: Array.isArray(parsed.hwPickLists) ? parsed.hwPickLists : [],
     nodes,
     activeNodeId,
     // Normalise every printer so mixed-AMS (`ams`) and the legacy uniform

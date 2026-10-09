@@ -1,6 +1,6 @@
 import "server-only"
 import WebSocket from "ws"
-import { agentUrl, encodeCommand, type NodeCommand } from "@/lib/node-protocol"
+import { agentUrl, encodeCommand, TWIN_SIDES, type NodeCommand, type TwinSide } from "@/lib/node-protocol"
 
 /**
  * Server-side relay to the on-Pi agents.
@@ -105,6 +105,15 @@ interface Relay {
   lastNetSlaves: string | null
   /** Last `calibration` frame, replayed like `lastState` (sent on connect and after a run). */
   lastCalibration: string | null
+  /**
+   * Twin mode: the Pi runs two carousels on one socket. Each side gets its own
+   * replayed state/calibration and its own config, so a reconnect re-splits the
+   * agent and restores both sides instead of collapsing them into one.
+   */
+  twin: boolean
+  sideState: Partial<Record<TwinSide, string>>
+  sideCalibration: Partial<Record<TwinSide, string>>
+  sideConfig: Partial<Record<TwinSide, Extract<NodeCommand, { type: "config" }>>>
   closing: boolean
 }
 
@@ -205,24 +214,28 @@ function stopHeartbeat(relay: Relay) {
  * browser's persisted position with a guess.
  */
 function rememberState(relay: Relay, text: string): void {
-  let ev: { type?: string; status?: string; shelf?: number; homed?: boolean }
+  let ev: { type?: string; status?: string; shelf?: number; homed?: boolean; side?: unknown }
   try {
     ev = JSON.parse(text)
   } catch {
     return // not JSON (or a partial frame) — nothing to learn from it
   }
   if (!ev || typeof ev !== "object") return
+  const side: TwinSide | undefined = ev.side === "left" || ev.side === "right" ? ev.side : undefined
+  if (!relay.sideState) relay.sideState = {}
+  const cached = side ? relay.sideState[side] : relay.lastState
 
   let prev: { status?: string; shelf?: number; homed?: boolean } | null = null
-  if (relay.lastState) {
+  if (cached) {
     try {
-      prev = JSON.parse(relay.lastState)
+      prev = JSON.parse(cached)
     } catch {
       prev = null
     }
   }
 
   const snap = {
+    ...(side ? { side } : {}),
     type: "state",
     status: prev?.status ?? "idle",
     shelf: typeof prev?.shelf === "number" ? prev.shelf : 0,
@@ -254,7 +267,8 @@ function rememberState(relay: Relay, text: string): void {
       return // hello/fault/etc. carry no position
   }
 
-  relay.lastState = JSON.stringify(snap)
+  if (side) relay.sideState[side] = JSON.stringify(snap)
+  else relay.lastState = JSON.stringify(snap)
 }
 
 function rememberNet(relay: Relay, text: string): void {
@@ -272,14 +286,29 @@ function rememberNet(relay: Relay, text: string): void {
 
 function rememberCalibration(relay: Relay, text: string): void {
   if (!text.includes('"calibration"')) return
-  let ev: { type?: string; ok?: boolean }
+  let ev: { type?: string; ok?: boolean; side?: unknown }
   try {
     ev = JSON.parse(text)
   } catch {
     return
   }
   // A failed run carries no numbers; keep showing the last good one.
-  if (ev?.type === "calibration" && ev.ok === true) relay.lastCalibration = text
+  if (ev?.type !== "calibration" || ev.ok !== true) return
+  if (ev.side === "left" || ev.side === "right") {
+    if (!relay.sideCalibration) relay.sideCalibration = {}
+    relay.sideCalibration[ev.side] = text
+  } else {
+    relay.lastCalibration = text
+  }
+}
+
+/** The config frames to (re)send on open: one per side in twin mode. */
+function replayConfigs(relay: Relay): NodeCommand[] {
+  if (relay.twin && relay.sideConfig) {
+    const sides = Object.values(relay.sideConfig).filter(Boolean) as NodeCommand[]
+    if (sides.length > 0) return sides
+  }
+  return [{ type: "config", shelves: relay.shelves, ...relay.motion }]
 }
 
 /**
@@ -403,7 +432,7 @@ function openSocket(relay: Relay) {
     // reconnected (or rebooted) Pi run at default speed regardless of the
     // sliders.
     try {
-      ws.send(encodeCommand({ type: "config", shelves: relay.shelves, ...relay.motion }))
+      for (const cfg of replayConfigs(relay)) ws.send(encodeCommand(cfg))
     } catch {
       // ignore — heartbeat/reconnect will recover
     }
@@ -423,6 +452,7 @@ function openSocket(relay: Relay) {
     stopHeartbeat(relay)
     relay.ws = null
     relay.lastState = null
+    relay.sideState = {}
     // Deliberately keep lastNetStatus: when the Pi drops the socket because it
     // is switching networks, the last picture ("joining X") is the most useful
     // thing a browser can be shown while we reconnect.
@@ -476,11 +506,16 @@ function getOrCreate(ip: string, port: number, shelves: number): Relay {
       lastNetStatus: null,
       lastNetSlaves: null,
       lastCalibration: null,
+      twin: false,
+      sideState: {},
+      sideCalibration: {},
+      sideConfig: {},
       closing: false,
     }
     registry.set(key, relay)
     openSocket(relay)
-  } else if (shelves > 0 && shelves !== relay.shelves) {
+  } else if (!relay.twin && shelves > 0 && shelves !== relay.shelves) {
+    // (Twin units carry shelves in each side's own config instead.)
     // Geometry changed (layout edit) — update and re-send config if connected.
     relay.shelves = shelves
     if (relay.ws?.readyState === WebSocket.OPEN) {
@@ -513,6 +548,12 @@ export function subscribe(ip: string, port: number, shelves: number, listener: L
   if (relay.lastNetStatus) listener({ kind: "event", data: relay.lastNetStatus })
   if (relay.lastNetSlaves) listener({ kind: "event", data: relay.lastNetSlaves })
   if (relay.lastCalibration) listener({ kind: "event", data: relay.lastCalibration })
+  for (const s of TWIN_SIDES) {
+    const st = relay.sideState?.[s]
+    const cal = relay.sideCalibration?.[s]
+    if (st) listener({ kind: "event", data: st })
+    if (cal) listener({ kind: "event", data: cal })
+  }
 
   return () => {
     relay.listeners.delete(listener)
@@ -536,7 +577,15 @@ export function sendCommand(ip: string, port: number, cmd: NodeCommand): boolean
 
   // Remember motion tuning even if the socket is down right now, so it is
   // applied as soon as the Pi comes back rather than being lost.
-  if (cmd.type === "config") {
+  if (cmd.type === "config" && (cmd.twin || cmd.side)) {
+    // Twin unit: each side keeps its own full config for replay. Merged rather
+    // than replaced so a slider POST that only names one field keeps the rest.
+    relay.twin = cmd.twin === true
+    if (!relay.sideConfig) relay.sideConfig = {}
+    const side = cmd.side ?? "left"
+    relay.sideConfig[side] = { ...(relay.sideConfig[side] ?? {}), ...cmd }
+  } else if (cmd.type === "config") {
+    relay.twin = false
     // `registry` is module-level and long-lived, so a relay can predate the code
     // reading it — after a hot reload in dev, or an old object still in the map
     // across a redeploy. Such a relay has no `motion` field at all, and writing
@@ -553,6 +602,7 @@ export function sendCommand(ip: string, port: number, cmd: NodeCommand): boolean
     if (cmd.servoPulsesPerRev !== undefined) relay.motion.servoPulsesPerRev = cmd.servoPulsesPerRev
     if (cmd.servoMaxPps !== undefined) relay.motion.servoMaxPps = cmd.servoMaxPps
     if (cmd.servoMirrorB !== undefined) relay.motion.servoMirrorB = cmd.servoMirrorB
+  if (cmd.servoSingleMotor !== undefined) relay.motion.servoSingleMotor = cmd.servoSingleMotor
     if (cmd.servoIgnoreAlarm !== undefined) relay.motion.servoIgnoreAlarm = cmd.servoIgnoreAlarm
     if (cmd.servoHoldTimeoutS !== undefined) relay.motion.servoHoldTimeoutS = cmd.servoHoldTimeoutS
     if (cmd.positionMode !== undefined) relay.motion.positionMode = cmd.positionMode
