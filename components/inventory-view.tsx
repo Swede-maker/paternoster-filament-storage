@@ -17,6 +17,7 @@ import { cn } from "@/lib/utils"
 import { formatRemaining, formatGrams, spoolFill } from "@/lib/filament"
 import { SpoolDisc, discColor2 } from "./spool"
 import { Button } from "./ui/button"
+import { GoToShelfButton } from "./go-to-shelf-button"
 
 type WeightSort = "none" | "heaviest" | "lightest"
 
@@ -243,15 +244,15 @@ export function InventoryView({ onGoHome }: { onGoHome: () => void }) {
             const { spool, nodeName, shelfName, loc } = entry
             const location = `${nodeName} · ${shelfName} · Slot ${loc.slot + 1}`
             return (
-              <li key={spool.id}>
+              <li
+                key={spool.id}
+                className="flex flex-col gap-2 rounded-xl border border-border bg-card p-3 transition-colors hover:border-primary/50 sm:flex-row sm:items-center"
+              >
                 <button
                   type="button"
                   onClick={() => act(entry)}
                   disabled={!!state.job}
-                  className={cn(
-                    "flex w-full items-center gap-4 rounded-xl border border-border bg-card p-3 text-left transition-colors",
-                    "hover:border-primary/50 hover:bg-primary/5 disabled:cursor-not-allowed disabled:opacity-60",
-                  )}
+                  className="flex min-w-0 flex-1 items-center gap-4 text-left disabled:cursor-not-allowed disabled:opacity-60"
                 >
                   <SpoolDisc
                     color={spool.color}
@@ -283,6 +284,12 @@ export function InventoryView({ onGoHome }: { onGoHome: () => void }) {
                     <div className="text-xs text-muted-foreground">{formatRemaining(spool)}</div>
                   </div>
                 </button>
+                <GoToShelfButton
+                  nodeId={entry.nodeId}
+                  shelf={loc.shelf}
+                  onDone={onGoHome}
+                  className="w-full sm:w-auto"
+                />
               </li>
             )
           })}

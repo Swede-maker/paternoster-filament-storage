@@ -1,8 +1,9 @@
 "use client"
 
 import { useState } from "react"
-import { ArrowDown, ArrowUp, Hand, Loader2, Lock, ShieldAlert, ShieldCheck, X } from "lucide-react"
+import { ArrowDown, ArrowUp, ChevronDown, Hand, Loader2, Lock, ShieldAlert, ShieldCheck, X } from "lucide-react"
 import { useStore } from "@/lib/store"
+import { usePersistentBoolean } from "@/lib/use-persistent"
 import {
   MIN_SERVO_JOG_PULSES,
   MAX_SERVO_JOG_PULSES,
@@ -15,7 +16,8 @@ import {
   servoJogPulsesFor,
   servoGearRatioFor,
   servoPulsesToSprocketDegrees,
-  } from "@/lib/filament"
+  servoSingleMotorFor,
+} from "@/lib/filament"
 import type { JogCommand, ServoMotorId } from "@/lib/node-protocol"
 import type { StorageNode } from "@/lib/types"
 import { cn } from "@/lib/utils"
@@ -43,6 +45,7 @@ export function ServoJogPanel({ node }: { node: StorageNode }) {
   const [error, setError] = useState<string | null>(null)
   // Nothing selected by default so a stray tap on the big arrows does nothing.
   const [selected, setSelected] = useState<ServoMotorId | null>(null)
+  const [open, setOpen] = usePersistentBoolean("pax:jog:open", true)
 
   const servo = isServoNode(node)
   const hardware = node.driver === "hardware"
@@ -55,7 +58,8 @@ export function ServoJogPanel({ node }: { node: StorageNode }) {
   // is the same as the motor-shaft angle.
   const degrees = servoPulsesToSprocketDegrees(node, jogPulses)
   const alarmA = servo && node.servo?.alarmA === true
-  const alarmB = servo && node.servo?.alarmB === true
+  const single = servoSingleMotorFor(node)
+  const alarmB = servo && !single && node.servo?.alarmB === true
   const jogging = node.servo?.jogging === true && node.machine.status === "moving"
   // The agent must have confirmed the SAME drive we are about to jog in, or
   // the amount would be in the wrong unit. An agent that has never sent a
@@ -147,11 +151,15 @@ export function ServoJogPanel({ node }: { node: StorageNode }) {
     })
   }
 
-  const MOTORS: { id: ServoMotorId; label: string; alarm?: boolean }[] = [
-    { id: "a", label: "Motor A", alarm: alarmA },
-    { id: "b", label: "Motor B", alarm: alarmB },
-    { id: "both", label: "Both" },
-  ]
+  // One-servo hardware carousel: a single chip. It sends "both" so the agent
+  // counts the jog as carousel movement; with one servo it only pulses A.
+  const MOTORS: { id: ServoMotorId; label: string; alarm?: boolean }[] = single
+    ? [{ id: "both", label: "Servo", alarm: alarmA }]
+    : [
+        { id: "a", label: "Motor A", alarm: alarmA },
+        { id: "b", label: "Motor B", alarm: alarmB },
+        { id: "both", label: "Both" },
+      ]
   const selectedLabel = MOTORS.find((m) => m.id === selected)?.label
 
   const MotorChip = ({ id, label, alarm }: { id: ServoMotorId; label: string; alarm?: boolean }) => {
@@ -172,7 +180,7 @@ export function ServoJogPanel({ node }: { node: StorageNode }) {
         )}
       >
         <span className="whitespace-nowrap text-xs font-semibold uppercase tracking-wider">{label}</span>
-        {id === "both" ? (
+        {id === "both" && !single ? (
           <span className={cn("text-[10px]", active ? "text-primary-foreground/80" : "text-muted-foreground")}>
             A + B
           </span>
@@ -221,9 +229,21 @@ export function ServoJogPanel({ node }: { node: StorageNode }) {
   return (
     <div className="mt-4 rounded-xl border border-border bg-background/50 p-3">
       <div className="flex items-center justify-between gap-2">
-        <p className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
-          {servo ? "Servo micro-jog" : "Motor jog"}
-        </p>
+        <button
+          type="button"
+          onClick={() => setOpen((v) => !v)}
+          aria-expanded={open}
+          aria-label={open ? "Hide jog controls" : "Show jog controls"}
+          className="-my-2 -ml-1 flex min-h-11 items-center gap-1.5 rounded-md pr-2 text-muted-foreground transition-colors hover:text-foreground"
+        >
+          <ChevronDown
+            className={cn("h-4 w-4 shrink-0 transition-transform", open ? "rotate-180" : "rotate-0")}
+            aria-hidden="true"
+          />
+          <span className="text-xs font-semibold uppercase tracking-wider">
+            {servo ? "Servo micro-jog" : "Motor jog"}
+          </span>
+        </button>
         <span className="font-mono text-xs text-foreground">
           {servo
             ? `${jogPulses} p · ${degrees < 10 ? degrees.toFixed(degrees < 1 ? 2 : 1) : Math.round(degrees)}°${geared ? " sprocket" : ""}`
@@ -231,6 +251,8 @@ export function ServoJogPanel({ node }: { node: StorageNode }) {
         </span>
       </div>
 
+      {open && (
+        <>
       {hardware && online && !agentReady && (
         <p className="mt-2 text-xs leading-relaxed text-warning text-pretty">
             The Pi agent has not confirmed the {servo ? "servo" : "DC"} drive yet. It switches as soon as it is idle and
@@ -334,12 +356,18 @@ export function ServoJogPanel({ node }: { node: StorageNode }) {
         <span className="self-center text-[11px] text-muted-foreground">{unit}</span>
       </div>
       <p className="mt-1 text-[10px] leading-relaxed text-muted-foreground">
-        {servo
+        {single
+          ? "One tap sends exactly this many pulses to the servo and creeps the whole carousel."
+          : servo
           ? "One tap sends exactly this many pulses. Jog a single motor to level a shelf that hangs crooked; jog both to creep the whole carousel."
           : "One tap runs the motor for this long at the Motor speed PWM. Jog a single motor to level a shelf that hangs crooked; jog both to creep the whole carousel."}
       </p>
 
-      <div className="mt-3 grid grid-cols-3 gap-1.5" role="radiogroup" aria-label="Motor to jog">
+      <div
+        className={cn("mt-3 grid gap-1.5", single ? "grid-cols-1" : "grid-cols-3")}
+        role="radiogroup"
+        aria-label="Motor to jog"
+      >
         {MOTORS.map((m) => (
           <MotorChip key={m.id} {...m} />
         ))}
@@ -396,6 +424,8 @@ export function ServoJogPanel({ node }: { node: StorageNode }) {
             </div>
           )}
         </div>
+      )}
+        </>
       )}
       {error && <p className="mt-2 text-xs text-destructive">{error}</p>}
     </div>

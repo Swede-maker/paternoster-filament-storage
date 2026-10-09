@@ -44,6 +44,7 @@ import { Button } from "./ui/button"
 import { MotorDrivePicker, motorModeLabel } from "./motor-drive-picker"
 import { MotorDriveEditor } from "./motor-drive-editor"
 import { Field, Input, Select, Checkbox } from "./ui/field"
+import { NumberInput } from "./ui/number-input"
 import { SpoolDisc, discColor2 } from "./spool"
 import { NumField } from "./spool-form"
 import { QrCode } from "./qr-code"
@@ -534,15 +535,9 @@ function NodeEndpointEditor({ node }: { node: StorageNode }) {
           placeholder="192.168.1.42"
           aria-label="Pi IP address"
         />
-        <Input
-          className="sm:w-28"
-          type="number"
-          min={1}
-          max={65535}
-          value={port}
-          onChange={(e) => setPort(Math.max(1, Math.min(65535, Number.parseInt(e.target.value) || 8765)))}
-          aria-label="Agent port"
-        />
+        <div className="sm:w-28">
+          <NumberInput min={1} max={65535} value={port} onCommit={setPort} aria-label="Agent port" />
+        </div>
         {dirty ? (
           <Button
             size="sm"
@@ -669,13 +664,7 @@ function AddNodeRow() {
                 )}
               </Field>
               <Field label="Agent WebSocket port">
-                <Input
-                  type="number"
-                  min={1}
-                  max={65535}
-                  value={port}
-                  onChange={(e) => setPort(clamp(Number.parseInt(e.target.value) || 8765, 1, 65535))}
-                />
+                <NumberInput min={1} max={65535} value={port} onCommit={setPort} aria-label="Agent WebSocket port" />
                 <p className="mt-1 text-xs text-muted-foreground">
                   Each paternoster needs its own Pi — this address must be unique. Default agent port is 8765.
                 </p>

@@ -2,6 +2,7 @@
 
 import { useState, useEffect } from "react"
 import {
+  Columns2,
   Network,
   Server,
   Package,
@@ -36,6 +37,7 @@ import { HARDWARE_COLORS } from "@/lib/hardware"
 import type { MotorMode, StorageNode } from "@/lib/types"
 import { Button } from "../ui/button"
 import { Field, Input, Checkbox } from "../ui/field"
+import { NumberInput } from "../ui/number-input"
 import { MotorDrivePicker } from "../motor-drive-picker"
 import { MotorDriveEditor } from "../motor-drive-editor"
 import {
@@ -347,7 +349,47 @@ function NodeList() {
                   <Unlink className="h-4 w-4" /> Unlink
                 </Button>
               )}
-              {state.nodes.length > 1 && !isMaster && (
+              {nodeType === "paternoster" && !node.twinSide && (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => {
+                    if (
+                      confirm(
+                        `Split ${node.name} into twin carousels? Motor A drives the Left carousel and motor B a new Right carousel, each with its own shelf sensor, on the same Pi.`,
+                      )
+                    ) {
+                      dispatch({ type: "MAKE_TWIN", id: node.id })
+                    }
+                  }}
+                >
+                  <Columns2 className="h-4 w-4" /> Split into twin
+                </Button>
+              )}
+              {node.twinSide && (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => {
+                    const pair = state.nodes.filter(
+                      (n) => n.system === "hardware" && n.twinSide && n.ip === node.ip && n.port === node.port,
+                    )
+                    const right = pair.find((n) => n.twinSide === "right")
+                    const busy = state.job?.items.some((it) => !it.done && pair.some((n) => n.id === it.nodeId))
+                    const rightHasItems = right?.slots.some((row) => row.some((s) => s != null))
+                    if (busy || rightHasItems) {
+                      alert("Empty the Right carousel and finish any running queue on these carousels first.")
+                      return
+                    }
+                    if (confirm("Merge back into one carousel driven by both motors? The Right carousel is removed.")) {
+                      dispatch({ type: "UNTWIN", id: node.id })
+                    }
+                  }}
+                >
+                  <Columns2 className="h-4 w-4" /> Merge twin
+                </Button>
+              )}
+              {state.nodes.length > 1 && !isMaster && !node.twinSide && (
                 <Button
                   variant="ghost"
                   size="sm"
@@ -500,14 +542,7 @@ function RealLinkPanel({ node, live, onClose }: { node: StorageNode; live: Stora
         )}
       </Field>
       <Field label="Agent port">
-        <Input
-          type="number"
-          min={1}
-          max={65535}
-          value={port}
-          onChange={(e) => setPort(Math.max(1, Math.min(65535, Number.parseInt(e.target.value) || 8765)))}
-          aria-label="Agent port"
-        />
+        <NumberInput min={1} max={65535} value={port} onCommit={setPort} aria-label="Agent port" />
         <p className="mt-1 text-xs text-muted-foreground">
           Use the Pi&apos;s hostname (set when you imaged it) plus the agent port you passed to install.sh. Default port
           is 8765; give each Pi a unique hostname.

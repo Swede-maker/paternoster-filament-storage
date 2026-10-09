@@ -5,6 +5,7 @@ import { Barcode, Save, X, QrCode as QrIcon } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { useStore } from "@/lib/store"
 import { Field, Input, Label, Select } from "./ui/field"
+import { NumberInput } from "./ui/number-input"
 import { PresetCombobox } from "./preset-combobox"
 import { SpoolDisc } from "./spool"
 import { BarcodeScanner } from "./barcode-scanner"
@@ -775,13 +776,11 @@ export function SpoolForm({
             >
               −
             </button>
-            <Input
-              type="number"
-              inputMode="numeric"
+            <NumberInput
               min={1}
               max={99}
               value={value.quantity ?? 1}
-              onChange={(e) => set({ quantity: Math.max(1, Math.min(99, Number.parseInt(e.target.value) || 1)) })}
+              onCommit={(v) => set({ quantity: v })}
               className="text-center"
               aria-label="Quantity"
             />

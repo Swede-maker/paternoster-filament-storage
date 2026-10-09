@@ -11,7 +11,7 @@ import {
   ChevronDown,
   AlertTriangle,
 } from "lucide-react"
-import { useStore } from "@/lib/store"
+import { useStore, type Action } from "@/lib/store"
 import { activeNode, nodeLoadGrams } from "@/lib/selectors"
 import {
   DEFAULT_RAMP_PCT,
@@ -38,12 +38,28 @@ import { usePersistentBoolean } from "@/lib/use-persistent"
 import type { StorageNode } from "@/lib/types"
 import { ServoJogPanel } from "./servo-jog-panel"
 
-export function ManualControl({ node: nodeProp }: { node?: StorageNode } = {}) {
-  const { state, dispatch } = useStore()
+export function ManualControl({
+  node: nodeProp,
+  twin,
+}: {
+  node?: StorageNode
+  /**
+   * Twin "Both" view: every command issued from this panel (stop, jog, home,
+   * resume, speed changes) is repeated for this second carousel as well.
+   */
+  twin?: StorageNode
+} = {}) {
+  const { state, dispatch: storeDispatch } = useStore()
   // Defaults to the shared active node (filament sidebar). The hardware sidebar
   // passes its own unit explicitly so the controls always match the carousel
   // shown, even if the shared active node briefly points elsewhere.
   const node = nodeProp ?? activeNode(state)
+  const dispatch = (action: Action) => {
+    storeDispatch(action)
+    if (twin && "nodeId" in action && action.nodeId === node.id) {
+      storeDispatch({ ...action, nodeId: twin.id } as Action)
+    }
+  }
   // Speed sliders start expanded; collapsing them frees sidebar space. The
   // choice is remembered per device.
   const [speedsOpen, setSpeedsOpen] = usePersistentBoolean("pax:manual:speedsOpen", true)
@@ -62,7 +78,10 @@ export function ManualControl({ node: nodeProp }: { node?: StorageNode } = {}) {
   // carousel with a failed home completely immobile from the UI — the operator
   // could not nudge the motor to diagnose the very sensor fault that blocked
   // homing. The agent allows relative moves un-homed; the UI must not veto them.
-  const canJog = idle && !offline
+  // In the "Both" view the other carousel must be ready too, or the jog would
+  // silently move only one side.
+  const twinIdle = !twin || (twin.machine.status === "idle" && twin.link === "online")
+  const canJog = idle && !offline && twinIdle
 
   // Speed controls only apply to a motorized carousel, not manual shelf storage.
   const isCarousel = node.type !== "shelf"
@@ -112,7 +131,10 @@ export function ManualControl({ node: nodeProp }: { node?: StorageNode } = {}) {
     }
   })()
 
-  const busy = status === "homing" || status === "moving"
+  const busy =
+    status === "homing" ||
+    status === "moving" ||
+    (!!twin && (twin.machine.status === "homing" || twin.machine.status === "moving"))
   // Emergency-stopped: frozen in place until the operator resumes or re-homes.
   const stopped = isCarousel && status === "stopped"
   // What "Continue task" will pick back up, so we can label it meaningfully.
@@ -189,7 +211,6 @@ export function ManualControl({ node: nodeProp }: { node?: StorageNode } = {}) {
             className="mt-3 w-full"
             disabled={offline}
             onClick={() => {
-              if (state.job) dispatch({ type: "CANCEL_JOB" })
               dispatch({ type: "HOME_START", nodeId: node.id })
             }}
           >
@@ -219,7 +240,6 @@ export function ManualControl({ node: nodeProp }: { node?: StorageNode } = {}) {
             className="mt-3 w-full"
             disabled={offline}
             onClick={() => {
-              if (state.job) dispatch({ type: "CANCEL_JOB" })
               dispatch({ type: "HOME_START", nodeId: node.id })
             }}
           >
@@ -253,8 +273,7 @@ export function ManualControl({ node: nodeProp }: { node?: StorageNode } = {}) {
               className="w-full"
               disabled={offline}
               onClick={() => {
-                // Homing abandons any in-progress task, so clear the job too.
-                if (state.job) dispatch({ type: "CANCEL_JOB" })
+                // The queued task is kept; it picks up again once homing finishes.
                 dispatch({ type: "HOME_START", nodeId: node.id })
               }}
             >

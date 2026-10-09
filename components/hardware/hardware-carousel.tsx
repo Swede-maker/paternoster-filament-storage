@@ -1,7 +1,7 @@
 "use client"
 
 import { useCallback, useEffect, useRef, useState } from "react"
-import { ChevronLeft, ChevronRight, ChevronUp, ChevronDown } from "lucide-react"
+import { ChevronLeft, ChevronRight, ChevronUp, ChevronDown, Lock } from "lucide-react"
 import { useStore } from "@/lib/store"
 import { cn } from "@/lib/utils"
 import { PartBox, HardwareEmptySlot } from "./part-box"
@@ -88,6 +88,12 @@ export function HardwareCarousel({
   const base = Math.round(pos)
   const offsets = [-2, -1, 0, 1, 2]
 
+  const maxSlots = Math.max(1, ...node.slots.map((r) => r.length))
+  // 1 for the fullest shelf; shorter shelves grow towards filling the same width,
+  // capped so a single slot never becomes a long bar.
+  const widthFactor = (count: number) =>
+    count >= maxSlots ? 1 : Math.min(1.8, 1 + ((maxSlots / Math.max(1, count)) - 1) * 0.5)
+
   return (
     <div
       id="pax-carousel"
@@ -151,6 +157,9 @@ export function HardwareCarousel({
                 {row.map((id, slot) => {
                   const part = id ? state.parts?.[id] : null
                   const size = isCenter ? 68 : 48
+                  // Shelves with fewer slots than the fullest shelf get wider boxes so the
+                  // row does not look empty; a full row keeps its original square boxes.
+                  const width = Math.round(size * widthFactor(row.length))
                   const isHi = isCenter && highlight && highlight.shelf === shelfIndex && highlight.slot === slot
                   const low = part ? isPartLow(part) : false
                   return (
@@ -176,9 +185,9 @@ export function HardwareCarousel({
                       </span>
                       <span className="flex items-center justify-center" style={{ height: size }}>
                         {part ? (
-                          <PartBox color={part.color} size={size} imageUrl={part.imageUrl} name={part.name} />
+                          <PartBox color={part.color} size={size} width={width} imageUrl={part.imageUrl} name={part.name} />
                         ) : (
-                          <HardwareEmptySlot size={size} />
+                          <HardwareEmptySlot size={size} width={width} />
                         )}
                       </span>
                       {isCenter && (
@@ -194,6 +203,7 @@ export function HardwareCarousel({
                                   low ? "font-semibold text-warning" : "text-muted-foreground",
                                 )}
                               >
+                                {part.lockedSlot && <Lock className="mr-0.5 inline h-2.5 w-2.5 align-[-1px]" aria-label="Locked slot" />}
                                 {part.count} pcs
                               </span>
                               {part.category ? (

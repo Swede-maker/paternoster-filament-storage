@@ -3,7 +3,7 @@
 import { useEffect, useRef } from "react"
 import { useStore } from "@/lib/store"
 import type { StorageNode } from "@/lib/types"
-import { parseEvent, type NodeCommand } from "@/lib/node-protocol"
+import { frameSide, parseEvent, type NodeCommand } from "@/lib/node-protocol"
 import {
   moveDutyFor,
   homingDutyFor,
@@ -14,8 +14,12 @@ import {
   servoPulsesPerRevFor,
   servoMaxPpsFor,
   servoMirrorBFor,
+  servoSingleMotorFor,
+  dcTrimPctFor,
   servoIgnoreAlarmFor,
   servoHoldTimeoutFor,
+  sensorArmFor,
+  homeTimeoutFor,
 } from "@/lib/filament"
 import { nodeLoadGrams } from "@/lib/selectors"
 
@@ -127,8 +131,15 @@ export function NodeConnection() {
       // Pi event frames (raw agent JSON), forwarded verbatim by the relay.
       es.addEventListener("pi", (e) => {
         const conn = conns.current[nodeId]
-        const ev = parseEvent((e as MessageEvent).data)
+        const raw = (e as MessageEvent).data as string
+        const ev = parseEvent(raw)
         if (!ev) return
+        // Twin carousels share one socket: motion frames carry `side` (none
+        // means "left"). Skip the other half's frames; hello/net.* are global.
+        const self = nodesRef.current.find((n) => n.id === nodeId)
+        if (self?.twinSide && self.system === "hardware" && ev.type !== "hello" && !ev.type.startsWith("net")) {
+          if ((frameSide(raw) ?? "left") !== self.twinSide) return
+        }
         switch (ev.type) {
           case "hello":
             // The agent tells us here whether it is driving real GPIO. A
@@ -286,7 +297,11 @@ export function NodeConnection() {
       void fetch("/api/pi/command", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ ip: node.ip, port: node.port, command: cmd }),
+        body: JSON.stringify({
+          ip: node.ip,
+          port: node.port,
+          command: node.twinSide && node.system === "hardware" ? { ...cmd, side: node.twinSide } : cmd,
+        }),
       }).catch(() => {
         // Delivery failure is surfaced by the lack of a resulting Pi event; the
         // relay keeps retrying its own socket independently.
@@ -404,11 +419,17 @@ export function NodeConnection() {
         servoPulsesPerRevFor(n),
         servoMaxPpsFor(n),
         servoMirrorBFor(n),
+        servoSingleMotorFor(n),
+        dcTrimPctFor(n),
         servoIgnoreAlarmFor(n),
         servoHoldTimeoutFor(n),
+        sensorArmFor(n),
+        homeTimeoutFor(n),
         n.positionMode ?? "sensor",
         n.servoCarouselPulses ?? 0,
         n.servoIndexWindowPulses ?? 0,
+        n.twinSide ?? "",
+        n.twinReverse ? 1 : 0,
       ].join(":")
     })
     .join("|")
@@ -444,12 +465,18 @@ export function NodeConnection() {
               servoPulsesPerRev: servoPulsesPerRevFor(node),
               servoMaxPps: servoMaxPpsFor(node),
               servoMirrorB: servoMirrorBFor(node),
+              servoSingleMotor: servoSingleMotorFor(node),
+              ...(node.twinSide ? { reverseDir: node.twinReverse ?? false } : {}),
+              dcTrimPct: dcTrimPctFor(node),
               servoIgnoreAlarm: servoIgnoreAlarmFor(node),
               servoHoldTimeoutS: servoHoldTimeoutFor(node),
+              sensorArmS: sensorArmFor(node),
+              homeTimeoutS: homeTimeoutFor(node),
               positionMode: node.positionMode ?? "sensor",
               // Our copy of the calibration, for an agent that lost its own.
               ...(node.servoCarouselPulses ? { servoCarouselPulses: node.servoCarouselPulses } : {}),
               ...(node.servoIndexWindowPulses ? { servoIndexWindowPulses: node.servoIndexWindowPulses } : {}),
+              ...(node.twinSide && node.system === "hardware" ? { twin: true, side: node.twinSide } : {}),
             },
           }),
         }).catch(() => {

@@ -20,6 +20,7 @@ import {
 import { placeNewPart } from "@/lib/hardware-flow"
 import { Button } from "../ui/button"
 import { Input } from "../ui/field"
+import { GoToShelfButton } from "@/components/go-to-shelf-button"
 import { HardwareCarousel } from "./hardware-carousel"
 import { HardwareForm } from "./hardware-form"
 import { HardwareSlotDialog } from "./hardware-slot-dialog"
@@ -77,9 +78,11 @@ export function HardwareHomeView() {
   const jobTarget =
     currentItem && currentItem.nodeId === node.id ? { shelf: currentItem.shelf, slot: currentItem.slot } : null
 
-  function handleAdd(part: HardwarePart) {
+  function handleAdd(part: HardwarePart, chosenNodeId?: string) {
+    // A tapped slot pins the destination; otherwise honour the unit picked in
+    // the form (defaults to the one on screen).
     const target = targetSlot ? { nodeId: node.id, shelf: targetSlot.shelf, slot: targetSlot.slot } : undefined
-    const ok = placeNewPart(state, dispatch, part, node.id, target)
+    const ok = placeNewPart(state, dispatch, part, target ? node.id : (chosenNodeId ?? node.id), target)
     if (!ok) setPlaceError("All hardware storage is full. Add another unit in Settings, or free a slot first.")
     setTargetSlot(null)
   }
@@ -151,11 +154,11 @@ export function HardwareHomeView() {
                   {searchResults.map((entry) => {
                     const low = isPartLow(entry.part)
                     return (
-                      <li key={entry.part.id}>
+                      <li key={entry.part.id} className="flex items-center gap-2 pr-2 transition-colors hover:bg-primary/10">
                         <button
                           type="button"
                           onClick={() => openFromSearch(entry)}
-                          className="flex w-full items-center gap-3 px-3 py-2 text-left transition-colors hover:bg-primary/10"
+                          className="flex min-w-0 flex-1 items-center gap-3 px-3 py-2 text-left"
                         >
                           <PartThumb
                             color={entry.part.color}
@@ -177,10 +180,11 @@ export function HardwareHomeView() {
                               {entry.nodeName} · {entry.shelfName} · slot {entry.loc.slot + 1}
                             </p>
                           </div>
-                          <span className="shrink-0 font-mono text-xs text-muted-foreground">
+                          <span className="hidden shrink-0 font-mono text-xs text-muted-foreground sm:inline">
                             {entry.part.count} pcs · {formatGrams(partWeightGrams(entry.part))}
                           </span>
                         </button>
+                        <GoToShelfButton nodeId={entry.nodeId} shelf={entry.loc.shelf} onDone={() => setQuery("")} />
                       </li>
                     )
                   })}
@@ -278,6 +282,8 @@ export function HardwareHomeView() {
           setTargetSlot(null)
         }}
         onSubmit={handleAdd}
+        defaultNodeId={node.id}
+        lockNode={!!targetSlot}
       />
       <HardwareForm
         open={!!editPart}

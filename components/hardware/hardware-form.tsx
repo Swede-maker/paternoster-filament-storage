@@ -1,8 +1,9 @@
 "use client"
 
 import { useEffect, useMemo, useRef, useState } from "react"
-import { Plus, X, Check, ImagePlus, Trash2 } from "lucide-react"
+import { Plus, X, Check, ImagePlus, Trash2, Rows3, Package } from "lucide-react"
 import { useStore } from "@/lib/store"
+import { nodesForSystem } from "@/lib/selectors"
 import { cn } from "@/lib/utils"
 import { newId } from "@/lib/filament"
 import { Dialog, DialogFooter } from "../ui/dialog"
@@ -40,18 +41,34 @@ export function HardwareForm({
   onClose,
   onSubmit,
   initial,
+  defaultNodeId,
+  lockNode = false,
 }: {
   open: boolean
   onClose: () => void
-  onSubmit: (part: HardwarePart) => void
+  /**
+   * `nodeId` is the storage unit the user chose in the "Store in" picker (add
+   * mode only; undefined when the picker is hidden or no hardware unit exists).
+   */
+  onSubmit: (part: HardwarePart, nodeId?: string) => void
   /** When set, the form opens prefilled for editing this part. */
   initial?: HardwarePart | null
+  /** Unit preselected in the "Store in" picker — normally the one on screen. */
+  defaultNodeId?: string
+  /**
+   * Hide the unit picker and always submit `defaultNodeId`, e.g. when the form
+   * was opened by tapping a specific empty slot so the destination is fixed.
+   */
+  lockNode?: boolean
 }) {
   const { state, dispatch } = useStore()
   const categories = state.settings.hardwareCategories ?? []
   const savedColors = state.settings.hardwareColorPresets ?? []
   const swatches = savedColors.length > 0 ? savedColors : DEFAULT_SWATCHES
   const isEdit = !!initial
+  const hwNodes = useMemo(() => nodesForSystem(state, "hardware"), [state])
+  const [nodeId, setNodeId] = useState<string>("")
+  const showNodePicker = !isEdit && !lockNode && hwNodes.length > 1
 
   // Default to bin blue when nothing is chosen, per the tote fallback.
   const blue = useMemo(
@@ -73,6 +90,7 @@ export function HardwareForm({
   const [notify, setNotify] = useState(false)
   const [threshold, setThreshold] = useState("5")
   const [imageUrl, setImageUrl] = useState<string | null>(null)
+  const [lockedSlot, setLockedSlot] = useState(false)
   const fileRef = useRef<HTMLInputElement>(null)
 
   // Seed the fields whenever the dialog opens — prefilled from `initial` for an
@@ -92,6 +110,7 @@ export function HardwareForm({
       setNotify(initial.lowStockThreshold != null)
       setThreshold(initial.lowStockThreshold != null ? String(initial.lowStockThreshold) : "5")
       setImageUrl(initial.imageUrl ?? null)
+      setLockedSlot(!!initial.lockedSlot)
     } else {
       setName("")
       setCategory("")
@@ -105,7 +124,12 @@ export function HardwareForm({
       setNotify(false)
       setThreshold("5")
       setImageUrl(null)
+      setLockedSlot(false)
     }
+    // Fall back to the first hardware unit when the screen's unit isn't one
+    // (e.g. the form was opened from a filament tab).
+    const preferred = hwNodes.find((n) => n.id === defaultNodeId) ?? hwNodes[0]
+    setNodeId(preferred?.id ?? "")
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, initial])
 
@@ -163,9 +187,10 @@ export function HardwareForm({
       colorName: colorName.trim() || color,
       lowStockThreshold: notify ? Math.max(0, Math.round(Number.parseFloat(threshold) || 0)) : null,
       imageUrl: imageUrl ?? null,
+      lockedSlot,
       createdAt: initial?.createdAt ?? Date.now(),
     }
-    onSubmit(part)
+    onSubmit(part, isEdit ? undefined : nodeId || defaultNodeId)
     onClose()
   }
 
@@ -182,6 +207,46 @@ export function HardwareForm({
       className="max-w-lg"
     >
       <div className="space-y-5">
+        {/* Destination unit (add mode only) */}
+        {showNodePicker && (
+          <Field label="Store in">
+            <div role="radiogroup" aria-label="Storage unit" className="flex flex-wrap gap-2">
+              {hwNodes.map((n) => {
+                const active = n.id === nodeId
+                const type = n.type ?? "paternoster"
+                const Icon = type === "paternoster" ? Rows3 : Package
+                const free = Object.values(n.slots).flat().filter((s) => !s).length
+                return (
+                  <button
+                    key={n.id}
+                    type="button"
+                    role="radio"
+                    aria-checked={active}
+                    onClick={() => setNodeId(n.id)}
+                    className={cn(
+                      "flex items-center gap-2 rounded-xl border px-3 py-2 text-left text-sm transition-colors",
+                      active
+                        ? "border-primary bg-primary/10 text-foreground"
+                        : "border-border bg-background/50 text-muted-foreground hover:border-foreground/30 hover:text-foreground",
+                    )}
+                  >
+                    <Icon className="h-4 w-4 shrink-0" aria-hidden />
+                    <span className="flex flex-col leading-tight">
+                      <span className="font-medium">{n.name}</span>
+                      <span className="font-mono text-[10px] uppercase tracking-wide opacity-70">
+                        {type} · {free} free
+                      </span>
+                    </span>
+                  </button>
+                )
+              })}
+            </div>
+            <p className="mt-1.5 text-xs text-muted-foreground">
+              The system picks the best-balanced slot in this unit. If it is full, the part spills over to another unit.
+            </p>
+          </Field>
+        )}
+
         {/* Identity */}
         <Field label="Name">
           <Input value={name} onChange={(e) => setName(e.target.value)} placeholder="e.g. M5×40 socket screw" autoFocus />
@@ -372,6 +437,14 @@ export function HardwareForm({
             </Field>
           )}
         </div>
+
+        {/* Slot lock */}
+        <Checkbox
+          checked={lockedSlot}
+          onChange={setLockedSlot}
+          label="Lock the slot to this part"
+          description="The slot stays reserved for this part even when it runs empty, and new stock of it is placed here first. Release it from the Locked slots tab."
+        />
       </div>
 
       <DialogFooter>

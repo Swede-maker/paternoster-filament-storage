@@ -5,7 +5,7 @@ import { useStore } from "@/lib/store"
 import { shelfLabel } from "@/lib/selectors"
 import { cn } from "@/lib/utils"
 import { EmptySlot } from "../spool"
-import { ManualControl } from "../manual-control"
+import { TwinManualControl } from "./twin-manual-control"
 import { ResizableSidebar } from "../resizable-sidebar"
 import { DEFAULT_TOTE_COLOR } from "./part-box"
 import type { StorageNode } from "@/lib/types"
@@ -23,7 +23,7 @@ export function HardwareSidebar({ node }: { node: StorageNode }) {
       <ResizableSidebar
         storageKey="pax:hw-sidebar:shelfHeightV1"
         overview={<HardwareShelfOverview node={node} />}
-        control={<ManualControl node={node} />}
+        control={<TwinManualControl node={node} />}
       />
     </>
   )

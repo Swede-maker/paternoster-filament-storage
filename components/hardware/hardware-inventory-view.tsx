@@ -1,7 +1,7 @@
 "use client"
 
 import { useMemo, useState } from "react"
-import { Search, X, PackageSearch, TriangleAlert, MapPin } from "lucide-react"
+import { Search, X, PackageSearch, TriangleAlert, MapPin, Lock } from "lucide-react"
 import { useStore } from "@/lib/store"
 import { formatGrams } from "@/lib/filament"
 import { storedParts, searchParts, isPartLow, partWeightGrams, type StoredPart } from "@/lib/selectors"
@@ -11,6 +11,7 @@ import { Button } from "../ui/button"
 import { PartThumb } from "./part-box"
 import { HardwareSlotDialog } from "./hardware-slot-dialog"
 import { HardwareForm } from "./hardware-form"
+import { GoToShelfButton } from "@/components/go-to-shelf-button"
 import type { HardwarePart } from "@/lib/types"
 
 /**
@@ -19,7 +20,7 @@ import type { HardwarePart } from "@/lib/types"
  * narrows to parts at/below threshold. Tapping a row opens the slot dialog to
  * take out / store more / delete — the same carousel-driven flow as Home.
  */
-export function HardwareInventoryView() {
+export function HardwareInventoryView({ onGoHome }: { onGoHome?: () => void } = {}) {
   const { state, dispatch } = useStore()
   const [query, setQuery] = useState("")
   const [lowOnly, setLowOnly] = useState(false)
@@ -127,7 +128,7 @@ export function HardwareInventoryView() {
       ) : (
         <ul className="space-y-2">
           {results.map((entry) => (
-            <PartRow key={entry.part.id} entry={entry} onOpen={() => setSelected(entry.part)} />
+            <PartRow key={entry.part.id} entry={entry} onOpen={() => setSelected(entry.part)} onGoHome={onGoHome} />
           ))}
         </ul>
       )}
@@ -171,16 +172,24 @@ function FilterChip({ label, active, onClick }: { label: string; active: boolean
   )
 }
 
-function PartRow({ entry, onOpen }: { entry: StoredPart; onOpen: () => void }) {
+function PartRow({
+  entry,
+  onOpen,
+  onGoHome,
+}: {
+  entry: StoredPart
+  onOpen: () => void
+  onGoHome?: () => void
+}) {
   const { part, nodeName, shelfName, loc } = entry
   const low = isPartLow(part)
 
   return (
-    <li>
+    <li className="flex flex-col gap-2 rounded-xl border border-border bg-background/50 p-3 transition-colors hover:border-primary/50 sm:flex-row sm:items-center">
       <button
         type="button"
         onClick={onOpen}
-        className="flex w-full items-center gap-3 rounded-xl border border-border bg-background/50 p-3 text-left transition-colors hover:border-primary/50 hover:bg-primary/5"
+        className="flex min-w-0 flex-1 items-center gap-3 text-left"
       >
         <PartThumb color={part.color} size={44} imageUrl={part.imageUrl} name={part.name} />
         <div className="min-w-0 flex-1">
@@ -189,6 +198,11 @@ function PartRow({ entry, onOpen }: { entry: StoredPart; onOpen: () => void }) {
             {low && (
               <span className="inline-flex shrink-0 items-center gap-1 rounded-full bg-warning/15 px-1.5 py-0.5 text-[10px] font-semibold text-warning">
                 <TriangleAlert className="h-3 w-3" /> low
+              </span>
+            )}
+            {part.lockedSlot && (
+              <span className="inline-flex shrink-0 items-center gap-1 rounded-full bg-primary/10 px-1.5 py-0.5 text-[10px] font-semibold text-primary">
+                <Lock className="h-3 w-3" /> locked
               </span>
             )}
           </div>
@@ -208,6 +222,7 @@ function PartRow({ entry, onOpen }: { entry: StoredPart; onOpen: () => void }) {
           {part.count}
         </span>
       </button>
+      <GoToShelfButton nodeId={entry.nodeId} shelf={loc.shelf} onDone={onGoHome} className="w-full sm:w-auto" />
     </li>
   )
 }

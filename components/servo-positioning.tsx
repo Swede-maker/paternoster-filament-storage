@@ -1,7 +1,7 @@
 "use client"
 
 import { useState } from "react"
-import { Loader2, Ruler, ScanLine, Square } from "lucide-react"
+import { Home, Loader2, Ruler, ScanLine, Square } from "lucide-react"
 import { useStore } from "@/lib/store"
 import type { PositionMode } from "@/lib/node-protocol"
 import type { StorageNode } from "@/lib/types"
@@ -79,13 +79,18 @@ export function ServoPositioning({ node }: { node: StorageNode }) {
 
   return (
     <div className="mt-3 rounded-lg border border-border bg-secondary/30 p-3">
-      <div className="flex flex-wrap items-center justify-between gap-2">
+      <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
         <p className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">Positioning</p>
-        <div role="radiogroup" aria-label="Positioning method" className="flex rounded-md border border-border bg-background p-0.5">
+        <div
+          role="radiogroup"
+          aria-label="Positioning method"
+          className="grid grid-cols-3 rounded-md border border-border bg-background p-0.5 sm:flex"
+        >
           {(
             [
               { value: "sensor", label: "Shelf sensor", icon: ScanLine },
               { value: "pulses", label: "Servo pulses", icon: Ruler },
+              { value: "index", label: "Home only", icon: Home },
             ] as const
           ).map((opt) => {
             const active = mode === opt.value
@@ -100,7 +105,7 @@ export function ServoPositioning({ node }: { node: StorageNode }) {
                 title={disabled ? "Run a calibration first" : undefined}
                 onClick={() => setMode(opt.value)}
                 className={cn(
-                  "flex items-center gap-1.5 rounded px-2.5 py-1 text-xs font-medium transition-colors",
+                  "flex min-h-11 items-center justify-center gap-1.5 rounded px-2 py-1 text-xs font-medium transition-colors sm:min-h-8 sm:px-2.5",
                   active ? "bg-primary text-primary-foreground" : "text-muted-foreground hover:text-foreground",
                   disabled && "cursor-not-allowed opacity-50 hover:text-muted-foreground",
                 )}
@@ -116,7 +121,9 @@ export function ServoPositioning({ node }: { node: StorageNode }) {
       <p className="mt-2 text-xs leading-relaxed text-muted-foreground text-pretty">
         {mode === "sensor"
           ? "Each shelf is counted as its flag reaches the proximity sensor. Edges that arrive less than half a shelf after the previous one — a bouncing chain, or the shelf you were parked beside being dragged back in — are ignored."
-          : `Each shelf is ${pulsesPerShelf ? nf.format(pulsesPerShelf) : "…"} pulses from the next. The carousel drives that distance from the home datum and corrects its odometer every time the home flag passes the index sensor, without stopping. The shelf sensor is only reported, never used to stop.`}
+          : mode === "index"
+            ? `No shelf sensor needed: only the home sensor is wired. Calibrate once to measure a full turn; shelves are then spaced evenly${pulsesPerShelf ? ` (${nf.format(pulsesPerShelf)} pulses each)` : ""} from home, and the position is corrected every time the home flag passes. Moving to a shelf is blocked until calibrated; jogging and Home always work.`
+            : `Each shelf is ${pulsesPerShelf ? nf.format(pulsesPerShelf) : "…"} pulses from the next. The carousel drives that distance from the home datum and corrects its odometer every time the home flag passes the index sensor, without stopping. The shelf sensor is only reported, never used to stop.`}
       </p>
 
       <div className="mt-3 flex flex-wrap items-start justify-between gap-3">
@@ -137,12 +144,14 @@ export function ServoPositioning({ node }: { node: StorageNode }) {
                   {node.servoIndexWindowPulses ? `${nf.format(node.servoIndexWindowPulses)} pulses` : "—"}
                 </dd>
               </div>
-              <div>
-                <dt className="text-muted-foreground">Flags seen</dt>
-                <dd className={cn(flagsMismatch ? "text-warning" : "text-foreground")}>
-                  {typeof cal?.shelfFlagsSeen === "number" ? `${cal.shelfFlagsSeen} of ${cal.shelves ?? shelves}` : "—"}
-                </dd>
-              </div>
+              {mode !== "index" && (
+                <div>
+                  <dt className="text-muted-foreground">Flags seen</dt>
+                  <dd className={cn(flagsMismatch ? "text-warning" : "text-foreground")}>
+                    {typeof cal?.shelfFlagsSeen === "number" ? `${cal.shelfFlagsSeen} of ${cal.shelves ?? shelves}` : "—"}
+                  </dd>
+                </div>
+              )}
               <div>
                 <dt className="text-muted-foreground">Last home pass</dt>
                 <dd className="text-foreground">

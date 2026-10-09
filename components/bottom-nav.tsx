@@ -1,12 +1,34 @@
 "use client"
 
-import { Home, Settings, ShoppingCart, History, Droplets, Boxes, BarChart3, ScanLine, Printer } from "lucide-react"
+import {
+  Home,
+  Settings,
+  ShoppingCart,
+  History,
+  Droplets,
+  Boxes,
+  BarChart3,
+  ScanLine,
+  Printer,
+  Lock,
+  ClipboardList,
+} from "lucide-react"
 import { cn } from "@/lib/utils"
 import { useStore } from "@/lib/store"
 import { dueReminders, lowStockParts } from "@/lib/selectors"
 import type { TopArea } from "@/lib/types"
 
-export type NavTab = "home" | "scan" | "orders" | "history" | "drying" | "inventory" | "statistics" | "settings"
+export type NavTab =
+  | "home"
+  | "scan"
+  | "orders"
+  | "history"
+  | "drying"
+  | "inventory"
+  | "statistics"
+  | "locked"
+  | "picking"
+  | "settings"
 
 export function BottomNav({
   tab,
@@ -28,6 +50,11 @@ export function BottomNav({
   const dueCount = dueReminders(state).length
   // Hardware low-stock count drives an alert badge on the hardware nav.
   const lowCount = lowStockParts(state).length
+  const lockedCount = Object.values(state.parts ?? {}).filter((p) => p.lockedSlot).length
+  // Lists that still have something left to pick.
+  const openListCount = (state.hwPickLists ?? []).filter((l) =>
+    l.lines.some((ln) => ln.picked < ln.requested),
+  ).length
 
   const filamentItems: { id: NavTab; label: string; icon: typeof Home; badge?: number; alert?: boolean }[] = [
     { id: "home", label: "Home", icon: Home },
@@ -46,6 +73,8 @@ export function BottomNav({
     { id: "home", label: "Home", icon: Home },
     { id: "inventory", label: "All Hardware In Storage", icon: Boxes, badge: lowCount || undefined, alert: lowCount > 0 },
     { id: "orders", label: "Orders", icon: ShoppingCart, badge: hwOrderCount || undefined },
+    { id: "locked", label: "Locked slots", icon: Lock, badge: lockedCount || undefined },
+    { id: "picking", label: "Picking lists", icon: ClipboardList, badge: openListCount || undefined },
     { id: "settings", label: "Settings", icon: Settings },
   ]
 

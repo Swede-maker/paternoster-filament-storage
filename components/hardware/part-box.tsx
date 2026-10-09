@@ -22,11 +22,11 @@ function shade(hex: string, amount: number): string {
  * the filament spherical {@link EmptySlot} on the hardware side to match the
  * "bin rack" look.
  */
-export function HardwareEmptySlot({ size = 68 }: { size?: number }) {
+export function HardwareEmptySlot({ size = 68, width }: { size?: number; width?: number }) {
   return (
     <div
       aria-hidden
-      style={{ width: size, height: size }}
+      style={{ width: width ?? size, height: size }}
       className="rounded-[22%] border border-white/10 bg-black/30 shadow-inner"
     />
   )
@@ -42,12 +42,16 @@ export function HardwareEmptySlot({ size = 68 }: { size?: number }) {
 export function PartBox({
   color,
   size = 72,
+  width,
   className,
   imageUrl,
   name,
 }: {
   color?: string | null
+  /** Height in px; also the width unless `width` is given. */
   size?: number
+  /** Optional wider footprint — the tote is stretched horizontally to fill it. */
+  width?: number
   className?: string
   imageUrl?: string | null
   name?: string
@@ -57,11 +61,12 @@ export function PartBox({
   const side = shade(c, 0.34)
   const front = c
   const glyph = isLightColor(c) ? "#27272a" : "#ffffff"
-  const uid = sanitize(c) + Math.round(size)
+  const w = width ?? size
+  const uid = sanitize(c) + Math.round(size) + "x" + Math.round(w)
 
   return (
-    <div className={className} style={{ width: size, height: size, position: "relative" }} aria-hidden title={name}>
-      <svg viewBox="0 0 100 100" width={size} height={size} role="presentation">
+    <div className={className} style={{ width: w, height: size, position: "relative" }} aria-hidden title={name}>
+      <svg viewBox="0 0 100 100" width={w} height={size} preserveAspectRatio="none" role="presentation">
         <defs>
           <clipPath id={`tote-face-${uid}`}>
             {/* Front face trapezoid — used to clip an optional photo. */}

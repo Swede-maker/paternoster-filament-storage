@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useState } from "react"
 import useSWR from "swr"
-import { CheckCircle2, Download, Loader2, RefreshCw, TriangleAlert } from "lucide-react"
+import { Check, CheckCircle2, Copy, Download, Loader2, RefreshCw, Terminal, TriangleAlert } from "lucide-react"
 import { Button } from "./ui/button"
 import { cn } from "@/lib/utils"
 import type { UpdateStatus } from "@/lib/server/updater"
@@ -86,11 +86,14 @@ export function UpdateSection() {
 
   if (data && !data.available) {
     return (
-      <p className="text-sm text-muted-foreground text-pretty">
-        {data.reason}
-        {data.reason?.startsWith("The app is not running from a Pi") &&
-          " Install on a Raspberry Pi with the one-line installer to update from here."}
-      </p>
+      <div className="space-y-4">
+        <p className="text-sm text-muted-foreground text-pretty">
+          {data.reason}
+          {data.reason?.startsWith("The app is not running from a Pi") &&
+            " Install on a Raspberry Pi with the one-line installer to update from here."}
+        </p>
+        <SshUpdateCommand />
+      </div>
     )
   }
 
@@ -176,6 +179,46 @@ export function UpdateSection() {
           <TriangleAlert className="mt-0.5 h-4 w-4 shrink-0" /> {error}
         </p>
       )}
+
+      <SshUpdateCommand />
+    </div>
+  )
+}
+
+const SSH_UPDATE_COMMAND =
+  "curl -fsSL https://raw.githubusercontent.com/Swede-maker/paternoster-filament-storage/main/setup.sh | sudo bash -s -- --update"
+
+function SshUpdateCommand() {
+  const [copied, setCopied] = useState(false)
+
+  async function copy() {
+    try {
+      await navigator.clipboard.writeText(SSH_UPDATE_COMMAND)
+      setCopied(true)
+      window.setTimeout(() => setCopied(false), 2000)
+    } catch {
+      setCopied(false)
+    }
+  }
+
+  return (
+    <div className="space-y-2 rounded-lg border p-3">
+      <div className="flex items-center justify-between gap-3">
+        <p className="flex items-center gap-2 text-sm font-medium">
+          <Terminal className="h-4 w-4 text-muted-foreground" /> Update over SSH
+        </p>
+        <Button variant="outline" size="sm" className="min-h-11" onClick={copy}>
+          {copied ? <Check className="h-4 w-4" /> : <Copy className="h-4 w-4" />}
+          {copied ? "Copied" : "Copy"}
+        </Button>
+      </div>
+      <code className="block break-all rounded bg-muted p-2 font-mono text-xs leading-relaxed">
+        {SSH_UPDATE_COMMAND}
+      </code>
+      <p className="text-xs text-muted-foreground text-pretty">
+        Paste it into an SSH session on the Pi. It pulls the newest code from GitHub and keeps your setup, filaments,
+        storage units and motor tuning. A backup of the database is made first.
+      </p>
     </div>
   )
 }

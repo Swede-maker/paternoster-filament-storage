@@ -2,22 +2,26 @@
 
 import { useEffect, useMemo, useState } from "react"
 import {
+  Check,
+  Copy,
   Eye,
   EyeOff,
   KeyRound,
   Loader2,
+  Plus,
   Radio,
   RefreshCw,
   Router,
   Send,
   Smartphone,
+  Terminal,
   TriangleAlert,
   Wifi,
   WifiOff,
 } from "lucide-react"
 import { useStore } from "@/lib/store"
 import type { StorageNode } from "@/lib/types"
-import type { NetPin, WifiNetwork } from "@/lib/node-protocol"
+import type { NetPin, NetSlave, WifiNetwork } from "@/lib/node-protocol"
 import { NET_MODE_LABEL, NET_PIN_LABEL, signalBars, validatePsk, wifiQrPayload } from "@/lib/net"
 import { qrSvgMarkup } from "@/lib/qr"
 import { cn } from "@/lib/utils"
@@ -25,6 +29,7 @@ import { Button } from "../ui/button"
 import { Dialog, DialogFooter } from "../ui/dialog"
 import { Segmented } from "../ui/field"
 import { SignalBars, WifiList } from "./wifi-list"
+import { AddSlaveCarouselDialog } from "./add-slave-carousel-dialog"
 
 /**
  * Network management for the master Raspberry Pi: mode pin, live status,
@@ -34,7 +39,8 @@ import { SignalBars, WifiList } from "./wifi-list"
  * and land on `node.net` / `node.netSlaves` / `node.netResult`.
  */
 export function NetworkPanel({ node }: { node: StorageNode }) {
-  const { dispatch } = useStore()
+  const { state, dispatch } = useStore()
+  const [addingSlave, setAddingSlave] = useState<NetSlave | null>(null)
   const net = node.net ?? null
   const result = node.netResult ?? null
   const slaves = node.netSlaves ?? []
@@ -51,7 +57,6 @@ export function NetworkPanel({ node }: { node: StorageNode }) {
   const [showApPsk, setShowApPsk] = useState(false)
   const [apPsk, setApPsk] = useState<string | null>(null)
   const [busy, setBusy] = useState<string | null>(null)
-  const [changingPsk, setChangingPsk] = useState(false)
   const [newPsk, setNewPsk] = useState("")
   const [newPskError, setNewPskError] = useState<string | null>(null)
 
@@ -69,10 +74,7 @@ export function NetworkPanel({ node }: { node: StorageNode }) {
     if (result.op === "provision-slaves" || result.op === "forget") setBusy(null)
     if (result.op === "set-ap-psk") {
       setBusy(null)
-      if (result.ok) {
-        setChangingPsk(false)
-        setNewPsk("")
-      }
+      if (result.ok) setNewPsk("")
     }
   }, [result])
 
@@ -194,6 +196,8 @@ export function NetworkPanel({ node }: { node: StorageNode }) {
 
   return (
     <div className="space-y-5">
+      <MasterIdentityCard hostname={net?.hostname ?? null} apSsid={net?.apSsid ?? null} online={online} />
+
       {/* Live status */}
       <StatusStrip node={node} />
 
@@ -341,25 +345,8 @@ export function NetworkPanel({ node }: { node: StorageNode }) {
               </dd>
             </div>
             <p className="pt-1 text-xs text-muted-foreground text-pretty">
-              The password is generated once at install and kept across reinstalls (it is in{" "}
-              <span className="font-mono">/etc/paxnet.conf</span> on the master). Paste it here to get a
-              phone-scannable QR code, or set your own below.
+              Type the current password here to show a QR code phones can scan to join.
             </p>
-            <div className="pt-1">
-              <Button
-                variant="outline"
-                size="sm"
-                disabled={!online || busy === "set-ap-psk"}
-                onClick={() => {
-                  setNewPsk("")
-                  setNewPskError(null)
-                  setChangingPsk(true)
-                }}
-              >
-                <KeyRound className="mr-1.5 h-4 w-4" />
-                Change hotspot password
-              </Button>
-            </div>
           </dl>
           <div className="flex shrink-0 items-center justify-center">
             {qr ? (
@@ -379,6 +366,19 @@ export function NetworkPanel({ node }: { node: StorageNode }) {
             )}
           </div>
         </div>
+        <HotspotPasswordForm
+          apSsid={apSsid}
+          online={online}
+          hotspotLive={net?.mode === "ap"}
+          saving={busy === "set-ap-psk"}
+          value={newPsk}
+          error={newPskError}
+          onChange={(v) => {
+            setNewPsk(v)
+            if (newPskError) setNewPskError(null)
+          }}
+          onSubmit={() => void submitNewPsk()}
+        />
       </div>
 
       {/* Slaves */}
@@ -421,9 +421,38 @@ export function NetworkPanel({ node }: { node: StorageNode }) {
                     {s.ip ? ` · ${s.ip}` : ""}
                   </span>
                 </span>
+                {(() => {
+                  const linked = state.nodes.find(
+                    (n) => n.ip.toLowerCase() === `${s.hostname}.local`.toLowerCase() || (!!s.ip && n.ip === s.ip),
+                  )
+                  return linked ? (
+                    <span className="flex shrink-0 items-center gap-1 text-xs text-muted-foreground">
+                      <Check className="h-3.5 w-3.5 text-primary" aria-hidden="true" />
+                      <span className="max-w-24 truncate">{linked.name}</span>
+                    </span>
+                  ) : (
+                    <Button
+                      variant="secondary"
+                      size="sm"
+                      className="min-h-11 shrink-0"
+                      onClick={() => setAddingSlave(s)}
+                    >
+                      <Plus className="h-4 w-4" aria-hidden="true" />
+                      Add as carousel
+                    </Button>
+                  )
+                })()}
               </li>
             ))}
           </ul>
+        )}
+        {addingSlave && (
+          <AddSlaveCarouselDialog
+            key={addingSlave.hostname}
+            slave={addingSlave}
+            open
+            onClose={() => setAddingSlave(null)}
+          />
         )}
         <p className="text-xs text-muted-foreground text-pretty">
           Slaves keep this hotspot as a fallback. When you save a new router above, the master pushes it to every online
@@ -466,62 +495,209 @@ export function NetworkPanel({ node }: { node: StorageNode }) {
         </DialogFooter>
       </Dialog>
 
-      <Dialog
-        open={changingPsk}
-        onClose={() => setChangingPsk(false)}
-        title="Change hotspot password"
-        description={`New Wi-Fi password for ${apSsid}.`}
-        className="max-w-md"
-      >
-        <form
-          className="space-y-3 text-sm text-foreground"
-          onSubmit={(e) => {
-            e.preventDefault()
-            void submitNewPsk()
-          }}
+    </div>
+  )
+}
+
+const SHOW_HOTSPOT_PASSWORD_COMMAND =
+  "echo \"Master name:      $(hostname).local\"; sudo awk -F' *= *' '$1==\"ap_ssid\"{print \"Hotspot name:     \" $2} $1==\"ap_psk\"{print \"Hotspot password: \" $2}' /etc/paxnet.conf"
+
+function MasterIdentityCard({
+  hostname,
+  apSsid,
+  online,
+}: {
+  hostname: string | null
+  apSsid: string | null
+  online: boolean
+}) {
+  const pending = online ? "Waiting for the Pi…" : "Unknown while offline"
+  return (
+    <section
+      aria-label="Master identity"
+      className="flex flex-col gap-3 rounded-lg border border-primary/40 bg-primary/5 p-3"
+    >
+      <IdentityRow
+        label="Master name"
+        hint="Open this in a browser, and type it as the master address when installing a slave."
+        value={hostname ? `${hostname}.local` : null}
+        pending={pending}
+      />
+      <div className="h-px bg-border" aria-hidden="true" />
+      <IdentityRow
+        label="Hotspot name"
+        hint="The Wi-Fi network the master opens when no router is around."
+        value={apSsid}
+        pending={pending}
+      />
+    </section>
+  )
+}
+
+function IdentityRow({
+  label,
+  hint,
+  value,
+  pending,
+}: {
+  label: string
+  hint: string
+  value: string | null
+  pending: string
+}) {
+  const [copied, setCopied] = useState(false)
+  const copy = async () => {
+    if (!value) return
+    try {
+      await navigator.clipboard.writeText(value)
+      setCopied(true)
+      setTimeout(() => setCopied(false), 2000)
+    } catch {
+      // Clipboard can be blocked over plain http; the value is still selectable.
+    }
+  }
+  return (
+    <div className="flex items-center gap-3">
+      <div className="min-w-0 flex-1">
+        <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">{label}</p>
+        {value ? (
+          <p className="select-all break-all font-mono text-lg font-semibold leading-snug text-foreground">{value}</p>
+        ) : (
+          <p className="text-sm text-muted-foreground">{pending}</p>
+        )}
+        <p className="mt-0.5 text-xs leading-relaxed text-muted-foreground text-pretty">{hint}</p>
+      </div>
+      {value && (
+        <Button
+          type="button"
+          variant="outline"
+          size="icon"
+          className="h-11 w-11 shrink-0"
+          onClick={() => void copy()}
+          aria-label={copied ? `${label} copied` : `Copy ${label.toLowerCase()}`}
         >
-          <label className="block space-y-1.5">
-            <span className="text-xs font-medium text-muted-foreground">New password (8–63 characters)</span>
-            <input
-              type="text"
-              value={newPsk}
-              onChange={(e) => {
-                setNewPsk(e.target.value)
-                if (newPskError) setNewPskError(null)
-              }}
-              autoFocus
-              autoComplete="off"
-              spellCheck={false}
-              aria-invalid={newPskError ? true : undefined}
-              className={cn(
-                "h-10 w-full rounded-md border bg-background px-3 font-mono text-sm text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
-                newPskError ? "border-destructive" : "border-input",
-              )}
-            />
-            {newPskError && <span className="block text-xs text-destructive">{newPskError}</span>}
-          </label>
-          <p className="text-muted-foreground text-pretty">
-            The master first sends the new password to every online slave (so they keep a working fallback), then
-            rewrites its own hotspot. Slaves that are offline right now keep the old key until they next talk to the
-            master on the router.
+          {copied ? <Check className="h-4 w-4" /> : <Copy className="h-4 w-4" />}
+        </Button>
+      )}
+    </div>
+  )
+}
+
+function HotspotPasswordForm({
+  apSsid,
+  online,
+  hotspotLive,
+  saving,
+  value,
+  error,
+  onChange,
+  onSubmit,
+}: {
+  apSsid: string
+  online: boolean
+  hotspotLive: boolean
+  saving: boolean
+  value: string
+  error: string | null
+  onChange: (v: string) => void
+  onSubmit: () => void
+}) {
+  const [showForgot, setShowForgot] = useState(false)
+  const [copied, setCopied] = useState(false)
+
+  const copyCommand = async () => {
+    try {
+      await navigator.clipboard.writeText(SHOW_HOTSPOT_PASSWORD_COMMAND)
+      setCopied(true)
+      setTimeout(() => setCopied(false), 2000)
+    } catch {
+      setCopied(false)
+    }
+  }
+
+  return (
+    <div className="flex flex-col gap-3 rounded-lg border border-border bg-background/40 p-3">
+      <form
+        className="flex flex-col gap-2"
+        onSubmit={(e) => {
+          e.preventDefault()
+          onSubmit()
+        }}
+      >
+        <label htmlFor="new-hotspot-psk" className="text-sm font-medium text-foreground">
+          Change hotspot password
+        </label>
+        <div className="flex flex-col gap-2 sm:flex-row">
+          <input
+            id="new-hotspot-psk"
+            type="text"
+            value={value}
+            onChange={(e) => onChange(e.target.value)}
+            placeholder="New password, 8–63 characters"
+            autoComplete="off"
+            autoCapitalize="off"
+            spellCheck={false}
+            disabled={!online || saving}
+            aria-invalid={error ? true : undefined}
+            aria-describedby={error ? "new-hotspot-psk-error" : "new-hotspot-psk-help"}
+            className={cn(
+              "h-11 min-w-0 flex-1 rounded-md border bg-background px-3 font-mono text-base text-foreground placeholder:font-sans placeholder:text-muted-foreground/70 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-60",
+              error ? "border-destructive" : "border-input",
+            )}
+          />
+          <Button type="submit" className="h-11" disabled={!online || saving || value === ""}>
+            {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : <KeyRound className="h-4 w-4" />}
+            Save password
+          </Button>
+        </div>
+        {error ? (
+          <p id="new-hotspot-psk-error" className="text-xs text-destructive">
+            {error}
           </p>
-          {net?.mode === "ap" && (
-            <p className="flex items-start gap-2 rounded-lg border border-border bg-muted/40 px-3 py-2 text-muted-foreground text-pretty">
-              <TriangleAlert className="mt-0.5 h-4 w-4 shrink-0" />
-              The hotspot is live: it will restart and this device will need to rejoin with the new password.
+        ) : (
+          <p id="new-hotspot-psk-help" className="text-xs text-muted-foreground text-pretty">
+            {online
+              ? `This is the Wi-Fi password for ${apSsid}, the network the master opens when no router is around. Online slaves get the new password too.`
+              : "Connect to the master to change the password."}
+          </p>
+        )}
+        {hotspotLive && (
+          <p className="flex items-start gap-2 rounded-md bg-muted/60 px-3 py-2 text-xs text-muted-foreground text-pretty">
+            <TriangleAlert className="mt-0.5 h-4 w-4 shrink-0" />
+            The hotspot is on right now. It restarts when you save, and this phone has to rejoin with the new password.
+          </p>
+        )}
+      </form>
+
+      <div className="flex flex-col gap-2 border-t border-border pt-3">
+        <button
+          type="button"
+          onClick={() => setShowForgot((v) => !v)}
+          aria-expanded={showForgot}
+          aria-controls="forgot-hotspot-psk"
+          className="flex min-h-11 items-center gap-2 self-start rounded-md text-sm font-medium text-primary hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+        >
+          <Terminal className="h-4 w-4" />
+          {showForgot ? "Hide" : "Forgot the password?"}
+        </button>
+        {showForgot && (
+          <div id="forgot-hotspot-psk" className="flex flex-col gap-2">
+            <p className="text-xs text-muted-foreground text-pretty">
+              Log in to the master Pi over SSH, paste this line and press Enter. It prints the hotspot name and the
+              current password. Nothing is changed.
             </p>
-          )}
-          <DialogFooter>
-            <Button type="button" variant="ghost" onClick={() => setChangingPsk(false)}>
-              Cancel
-            </Button>
-            <Button type="submit" disabled={busy === "set-ap-psk"}>
-              {busy === "set-ap-psk" ? <Loader2 className="h-4 w-4 animate-spin" /> : <KeyRound className="h-4 w-4" />}
-              Save password
-            </Button>
-          </DialogFooter>
-        </form>
-      </Dialog>
+            <div className="flex flex-col gap-2 rounded-md border border-border bg-muted/40 p-2">
+              <code className="block overflow-x-auto whitespace-pre font-mono text-xs leading-relaxed text-foreground">
+                {SHOW_HOTSPOT_PASSWORD_COMMAND}
+              </code>
+              <Button type="button" variant="outline" className="h-11 self-stretch sm:self-end" onClick={() => void copyCommand()}>
+                {copied ? <Check className="h-4 w-4" /> : <Copy className="h-4 w-4" />}
+                {copied ? "Copied" : "Copy line"}
+              </Button>
+            </div>
+          </div>
+        )}
+      </div>
     </div>
   )
 }

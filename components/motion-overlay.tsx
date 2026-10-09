@@ -12,6 +12,8 @@ import {
   ScanLine,
   Plus,
   Shuffle,
+  Lock,
+  ClipboardList,
 } from "lucide-react"
 import { useStore } from "@/lib/store"
 import { Button } from "./ui/button"
@@ -19,11 +21,12 @@ import { Input, Field } from "./ui/field"
 import { SpoolDisc, discColor2 } from "./spool"
 import { PartBox } from "./hardware/part-box"
 import { HardwareForm } from "./hardware/hardware-form"
-import { placeNewPart } from "@/lib/hardware-flow"
+import { placeNewPart, pickRemainderDestination, queuedReservations } from "@/lib/hardware-flow"
 import { formatGrams, isLightColor } from "@/lib/filament"
 import { printerSlotLabel, shelfLabel, getNode, partWeightGrams } from "@/lib/selectors"
 import { findBinding, shortTagId } from "@/lib/tags"
 import { TagScanner } from "./tag-scanner"
+import { TwinStopCard } from "./twin-stop-card"
 import type { HardwarePart, Printer, Spool, StorageNode } from "@/lib/types"
 
 /**
@@ -37,6 +40,9 @@ export function MotionOverlay() {
   const [grams, setGrams] = useState<string>("")
   // How many pieces to take out at a hardware pick stop, entered live per box.
   const [takeQty, setTakeQty] = useState<string>("1")
+  // How many pieces actually fit at a hardware place/store stop (defaults to
+  // all of them; lowering it splits the rest off to another slot).
+  const [storeQty, setStoreQty] = useState<string>("")
   // Scan-to-confirm state for disambiguating identical spools (see below).
   const [scanOpen, setScanOpen] = useState(false)
   const [scanError, setScanError] = useState<string | null>(null)
@@ -66,6 +72,24 @@ export function MotionOverlay() {
     ? state.printers.find((p) => p.id === item.printerId)
     : undefined
 
+  // Full count this hardware stop wants to put in the slot: the add amount for a
+  // store-more, or the whole new box for a placement.
+  const partFull = part ? (item?.partOp?.kind === "add" ? item.partOp.count : part.count) : 0
+  useEffect(() => {
+    if (part && status === "awaiting-store-confirm") setStoreQty(String(partFull))
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [job?.currentIndex, status, part?.id])
+  const storeQtyNum = Math.max(0, Math.round(Number.parseFloat(storeQty) || 0))
+  const partPlaced = Math.min(partFull, storeQtyNum)
+  const partRemainder = partFull - partPlaced
+  // Where the leftover would go, so the operator sees the plan before confirming.
+  const remainderDest =
+    part && partRemainder > 0
+      ? // queuedReservations includes the current (not yet done) stop, so the
+        // remainder is never offered the slot being filled right now.
+        pickRemainderDestination(state, part, [part.id], queuedReservations(state))
+      : null
+
   // Other linked units that are rotating into place in the background.
   const multiNode = state.nodes.length > 1
   const prepping = multiNode
@@ -83,8 +107,18 @@ export function MotionOverlay() {
 
   // Reset the take-out quantity to 1 each time the carousel reaches a new
   // hardware pick stop, so the operator deliberately dials in the amount.
+  // A picking-list stop instead defaults to what the list still needs (capped
+  // to what's in the box) — the operator can still adjust up or down.
+  const listLine = item?.pickListRef
+    ? state.hwPickLists?.find((l) => l.id === item.pickListRef!.listId)?.lines.find((ln) => ln.id === item.pickListRef!.lineId)
+    : undefined
+  const listName = item?.pickListRef ? state.hwPickLists?.find((l) => l.id === item.pickListRef!.listId)?.name : undefined
+  const listRemaining = listLine ? Math.max(0, listLine.requested - listLine.picked) : 0
   useEffect(() => {
-    if (status === "awaiting-pick-confirm" && part) setTakeQty("1")
+    if (status === "awaiting-pick-confirm" && part) {
+      setTakeQty(String(listLine ? Math.max(1, Math.min(part.count, listRemaining)) : 1))
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [status, part?.id])
 
   // When the machine stops at a shelf awaiting a pick/store confirm, bring the
@@ -133,8 +167,8 @@ export function MotionOverlay() {
   // Queue another hardware part behind the running operation. placeNewPart
   // reserves already-queued slots, so the new box gets its own balanced slot and
   // is appended to the current place job (or runs right after a pick/store one).
-  const handleQueue = (part: HardwarePart) => {
-    const ok = placeNewPart(state, dispatch, part, item?.nodeId)
+  const handleQueue = (part: HardwarePart, chosenNodeId?: string) => {
+    const ok = placeNewPart(state, dispatch, part, chosenNodeId ?? item?.nodeId)
     setQueueError(ok ? null : "All hardware storage is full. Free a slot or add a unit first.")
   }
 
@@ -180,8 +214,13 @@ export function MotionOverlay() {
 
   return (
     <>
-      <div className="pointer-events-none fixed inset-x-0 bottom-0 z-50 flex justify-center p-3 pb-[max(0.75rem,env(safe-area-inset-bottom))]">
-      <div className="pointer-events-auto max-h-[58vh] w-full max-w-md overflow-y-auto rounded-2xl border border-primary/30 bg-card/95 p-5 shadow-2xl backdrop-blur-md scrollbar-thin lg:max-h-[85vh]">
+      {/*
+        Docked bottom-LEFT on wide screens (over the sidebar) so the card never
+        covers the carousel's flashing target slot; centered on phones where the
+        sidebar isn't shown.
+      */}
+      <div className="pointer-events-none fixed inset-x-0 bottom-14 z-50 flex justify-center p-3 pb-[max(0.75rem,env(safe-area-inset-bottom))] lg:inset-x-auto lg:left-0 lg:justify-start">
+      <div className="pointer-events-auto max-h-[58vh] w-full max-w-md overflow-y-auto rounded-2xl border border-primary/30 bg-card/95 p-5 shadow-2xl backdrop-blur-md scrollbar-thin lg:max-h-[80vh] lg:w-[26rem]">
         {/* progress */}
         <div className="mb-4 flex items-center justify-between text-xs text-muted-foreground">
           <span className="uppercase tracking-wider">
@@ -236,6 +275,9 @@ export function MotionOverlay() {
             </div>
           </div>
         )}
+
+        {/* the other twin carousel's stop, worked in parallel */}
+        <TwinStopCard />
 
         {/* hardware part identity */}
         {part && (
@@ -294,6 +336,17 @@ export function MotionOverlay() {
                 const capped = Math.min(qty, part.count)
                 return (
                   <>
+                    {listLine && (
+                      <div className="mb-3 flex items-center justify-between gap-3 rounded-lg border border-border bg-background/50 px-3 py-2 text-left text-xs">
+                        <span className="flex items-center gap-1.5 text-muted-foreground">
+                          <ClipboardList className="h-3.5 w-3.5 shrink-0" aria-hidden />
+                          <span className="truncate">{listName ?? "Picking list"}</span>
+                        </span>
+                        <span className="shrink-0 font-mono text-foreground">
+                          {listLine.picked} / {listLine.requested} picked · {listRemaining} left
+                        </span>
+                      </div>
+                    )}
                     <Field label={`How many to take out? (max ${part.count})`} className="mb-4 text-left">
                       <Input
                         type="number"
@@ -306,8 +359,15 @@ export function MotionOverlay() {
                       />
                       <p className="mt-1.5 text-xs text-muted-foreground">
                         Leaves <span className="font-mono text-foreground">{Math.max(0, part.count - capped)}</span> pcs.
-                        Taking all empties the slot.
+                        {part.lockedSlot ? " The slot stays locked to this part." : " Taking all empties the slot."}
                       </p>
+                      {listLine && capped !== listRemaining && (
+                        <p className="mt-1 text-xs text-warning text-pretty">
+                          {capped < listRemaining
+                            ? `${listRemaining - capped} pcs will stay open on the list to pick later.`
+                            : `${capped - listRemaining} more than the list asks for.`}
+                        </p>
+                      )}
                     </Field>
                     <Button
                       size="lg"
@@ -401,13 +461,72 @@ export function MotionOverlay() {
                 </p>
               </Field>
             )}
+            {isPart && part && (
+              <Field label={`How many fit in this slot? (of ${partFull})`} className="mb-4">
+                <Input
+                  type="number"
+                  inputMode="numeric"
+                  min={1}
+                  max={partFull}
+                  value={storeQty}
+                  onChange={(e) => setStoreQty(e.target.value)}
+                />
+                {partRemainder > 0 ? (
+                  remainderDest ? (
+                    <p className="mt-1.5 text-xs text-muted-foreground text-pretty">
+                      The other <span className="font-mono text-foreground">{partRemainder}</span> pcs will be queued
+                      as the next stop:{" "}
+                      {(() => {
+                        const n = getNode(state, remainderDest.nodeId)
+                        const where = `${multiNode && n ? `${n.name} · ` : ""}${
+                          n ? shelfLabel(n, remainderDest.shelf) : `Shelf ${remainderDest.shelf + 1}`
+                        } · Slot ${remainderDest.slot + 1}`
+                        return remainderDest.kind === "existing" ? (
+                          <>
+                            added to the existing {state.parts[remainderDest.partId]?.lockedSlot ? "locked " : ""}
+                            box in <span className="font-mono text-foreground">{where}</span>.
+                          </>
+                        ) : (
+                          <>
+                            a new box in <span className="font-mono text-foreground">{where}</span>.
+                          </>
+                        )
+                      })()}
+                    </p>
+                  ) : (
+                    <p className="mt-1.5 text-xs font-medium text-warning text-pretty">
+                      No free slot for the remaining {partRemainder} pcs — all hardware storage is full.
+                    </p>
+                  )
+                ) : (
+                  <p className="mt-1.5 text-xs text-muted-foreground">
+                    Lower this if the slot is too small; the rest gets its own slot.
+                  </p>
+                )}
+                {part.lockedSlot && (
+                  <p className="mt-1.5 flex items-center gap-1 text-xs text-muted-foreground">
+                    <Lock className="h-3 w-3" aria-hidden /> This slot is locked to {part.name}.
+                  </p>
+                )}
+              </Field>
+            )}
             <Button
               size="lg"
               variant={ambiguous ? "outline" : "primary"}
               className="w-full"
-              onClick={commitStore}
+              disabled={isPart && (partPlaced < 1 || (partRemainder > 0 && !remainderDest))}
+              onClick={() =>
+                isPart
+                  ? dispatch({ type: "CONFIRM_STOP", storeCount: partPlaced })
+                  : commitStore()
+              }
             >
-              <CheckCircle2 className="h-5 w-5" /> {ambiguous ? "Confirm without scanning" : "Confirm store"}
+              <CheckCircle2 className="h-5 w-5" />{" "}
+              {ambiguous
+                ? "Confirm without scanning"
+                : isPart && partRemainder > 0
+                ? `Store ${partPlaced} here & continue`
+                : "Confirm store"}
             </Button>
             {/* The offered slot may be physically too tight for this spool. Let
                 the operator ask for another one; slots already turned down are
@@ -467,7 +586,7 @@ export function MotionOverlay() {
       />
 
       {/* Queue-another-part form, launched from the + in the progress row. */}
-      <HardwareForm open={addOpen} onClose={() => setAddOpen(false)} onSubmit={handleQueue} />
+      <HardwareForm open={addOpen} onClose={() => setAddOpen(false)} onSubmit={handleQueue} defaultNodeId={item?.nodeId} />
     </>
   )
 }

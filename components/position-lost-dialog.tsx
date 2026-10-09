@@ -37,7 +37,6 @@ export function PositionLostDialog() {
 
   function home() {
     if (!node) return
-    if (state.job) dispatch({ type: "CANCEL_JOB" })
     dispatch({ type: "HOME_START", nodeId: node.id })
   }
 

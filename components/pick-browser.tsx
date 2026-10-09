@@ -7,6 +7,7 @@ import { cn } from "@/lib/utils"
 import { Dialog, DialogHeader, DialogBody } from "./ui/dialog"
 import { Input } from "./ui/field"
 import { SpoolDisc, discColor2 } from "./spool"
+import { GoToShelfButton } from "./go-to-shelf-button"
 import { storedSpools, searchSpools, loadedSpools, searchLoadedSpools } from "@/lib/selectors"
 import { formatGrams, isLightColor, spoolFill } from "@/lib/filament"
 import type { Spool } from "@/lib/types"
@@ -171,6 +172,9 @@ export function PickBrowser({
                     {shelfName} · Slot {loc.slot + 1}
                   </span>
                 </button>
+                {!onPick && (
+                  <GoToShelfButton nodeId={nodeId} shelf={loc.shelf} onDone={onClose} className="mt-1.5 w-full" />
+                )}
               </li>
             ))}
                 </ul>
