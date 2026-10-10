@@ -128,19 +128,22 @@ export function Checkbox({
   onChange,
   label,
   description,
+  disabled = false,
 }: {
   checked: boolean
   onChange: (v: boolean) => void
   label: string
   description?: string
+  disabled?: boolean
 }) {
   return (
     <button
       type="button"
       role="switch"
       aria-checked={checked}
+      disabled={disabled}
       onClick={() => onChange(!checked)}
-      className="flex w-full items-start gap-3 rounded-lg border border-border bg-background/40 p-3 text-left hover:border-primary/40"
+      className="flex w-full items-start gap-3 rounded-lg border border-border bg-background/40 p-3 text-left hover:border-primary/40 disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:border-border"
     >
       <span
         className={cn(

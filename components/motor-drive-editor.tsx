@@ -29,17 +29,14 @@ import {
   servoPulsesPerRevFor,
   servoRpmFor,
   dcTrimPctFor,
-  dcTrimScalesFor,
-  MAX_DC_TRIM_PCT,
+  dcTrimUpPctFor,
+  dcTrimPerDirectionFor,
   shelfTimeoutFor,
   defaultShelfTimeoutFor,
   DEFAULT_SHELF_TIMEOUT_DC_S,
   DEFAULT_SHELF_TIMEOUT_SERVO_S,
   MIN_SHELF_TIMEOUT_S,
   MAX_SHELF_TIMEOUT_S,
-  DC_TRIM_STEP_PCT,
-  roundDcTrimPct,
-  formatDcTrimPct,
   chainSyncEnabledFor,
   chainSyncToleranceFor,
   chainSyncShelfSideFor,
@@ -58,6 +55,7 @@ import { NumberInput } from "./ui/number-input"
 import { MotorDrivePicker } from "./motor-drive-picker"
 import { ServoPositioning } from "./servo-positioning"
 import { MotorBalanceCalibrate } from "./motor-balance-calibrate"
+import { DIRECTION_ARROW, DIRECTION_LABEL, MotorTrimSlider } from "./motor-trim-slider"
 
 /** iSV57T DIP S1–S3 table (manual §4.1). "Pr0.08" = all OFF, software value. */
 const DIP_PULSES = [1600, 2000, 3200, 4000, 5000, 6400, 8000]
@@ -118,6 +116,8 @@ export function MotorDriveEditor({ node }: { node: StorageNode }) {
         | "homeTimeoutS"
         | "shelfTimeoutS"
         | "dcTrimPct"
+        | "dcTrimUpPct"
+        | "dcTrimPerDirection"
         | "chainSyncEnabled"
         | "chainSyncToleranceMs"
         | "chainSyncMaxWaitS"
@@ -128,10 +128,8 @@ export function MotorDriveEditor({ node }: { node: StorageNode }) {
   ) => dispatch({ type: "UPDATE_NODE", id: node.id, changes })
 
   const trimPct = dcTrimPctFor(node)
-  const trimScales = dcTrimScalesFor(node)
-  const setTrim = (value: number) =>
-    update({ dcTrimPct: Math.max(-MAX_DC_TRIM_PCT, Math.min(MAX_DC_TRIM_PCT, roundDcTrimPct(value))) })
-  const fmtTrim = formatDcTrimPct
+  const trimUpPct = dcTrimUpPctFor(node)
+  const trimPerDirection = dcTrimPerDirectionFor(node)
   const chainSyncOn = chainSyncEnabledFor(node)
   const chainSyncTol = chainSyncToleranceFor(node)
   const chainSyncWait = chainSyncMaxWaitFor(node)
@@ -232,96 +230,36 @@ export function MotorDriveEditor({ node }: { node: StorageNode }) {
 
       {mode === "dc" && (
         <div className="mt-3 rounded-lg border border-border bg-secondary/30 p-3">
-          <div className="flex items-center justify-between gap-2">
-            <label htmlFor={`trim-${node.id}`} className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
-              Motor balance
-            </label>
-            <span className="font-mono text-xs text-foreground">
-              {trimPct === 0
-                ? "equal"
-                : trimPct < 0
-                  ? `A −${fmtTrim(trimPct)} %`
-                  : `B −${fmtTrim(trimPct)} %`}
-            </span>
-          </div>
-          <div className="mt-2 flex items-center gap-3">
-            <span className="w-14 shrink-0 text-right font-mono text-[11px] text-muted-foreground">Slow A</span>
-            <input
-              id={`trim-${node.id}`}
-              type="range"
-              aria-label="PWM balance between motor A and motor B, percent"
-              aria-valuetext={
-                trimPct === 0
-                  ? "Equal duty on both motors"
-                  : trimPct < 0
-                    ? `Motor A runs at ${(trimScales.a * 100).toFixed(1)} percent of the PWM duty`
-                    : `Motor B runs at ${(trimScales.b * 100).toFixed(1)} percent of the PWM duty`
-              }
-              min={-MAX_DC_TRIM_PCT}
-              max={MAX_DC_TRIM_PCT}
-              step={DC_TRIM_STEP_PCT}
-              list={`trim-ticks-${node.id}`}
-              value={trimPct}
+          <MotorTrimSlider
+            id={`trim-${node.id}`}
+            node={node}
+            label={trimPerDirection ? `Motor balance · ${DIRECTION_LABEL.down} ${DIRECTION_ARROW.down}` : "Motor balance"}
+            value={trimPct}
+            onChange={(v) => update({ dcTrimPct: v })}
+            disabled={busy}
+            testDirection={trimPerDirection ? "down" : undefined}
+          />
+          {trimPerDirection && (
+            <div className="mt-3 border-t border-border pt-3">
+              <MotorTrimSlider
+                id={`trim-up-${node.id}`}
+                node={node}
+                label={`Motor balance · ${DIRECTION_LABEL.up} ${DIRECTION_ARROW.up}`}
+                value={trimUpPct}
+                onChange={(v) => update({ dcTrimUpPct: v })}
+                disabled={busy}
+                testDirection="up"
+              />
+            </div>
+          )}
+          <div className="mt-3 border-t border-border pt-3">
+            <Checkbox
+              checked={trimPerDirection}
+              onChange={(v) => update({ dcTrimPerDirection: v })}
               disabled={busy}
-              onChange={(e) => setTrim(Number(e.target.value))}
-              className="h-2 flex-1 cursor-pointer appearance-none rounded-full bg-secondary accent-primary disabled:cursor-not-allowed disabled:opacity-50"
+              label="Separate balance for each direction"
+              description={`Off: one slider trims both ways. On: the ${DIRECTION_LABEL.down} slider applies when the carousel runs ${DIRECTION_ARROW.down} and the ${DIRECTION_LABEL.up} slider when it runs ${DIRECTION_ARROW.up} (the homing direction). Whether that is clockwise or counter-clockwise depends on how your motors are mounted — press Test next to a slider to run the carousel that way for 1.5 s and see.`}
             />
-            <datalist id={`trim-ticks-${node.id}`}>
-              <option value={0} label="equal" />
-            </datalist>
-            <span className="w-14 shrink-0 font-mono text-[11px] text-muted-foreground">Slow B</span>
-          </div>
-          <div className="mt-2 flex flex-wrap items-center justify-between gap-2">
-            <div className="flex items-center gap-2">
-              <label htmlFor={`trim-num-${node.id}`} className="font-mono text-[11px] text-muted-foreground">
-                Exact
-              </label>
-              <div className="w-24">
-                <NumberInput
-                  id={`trim-num-${node.id}`}
-                  min={-MAX_DC_TRIM_PCT}
-                  max={MAX_DC_TRIM_PCT}
-                  integer={false}
-                  step={DC_TRIM_STEP_PCT}
-                  unit="%"
-                  value={trimPct}
-                  disabled={busy}
-                  onCommit={setTrim}
-                  aria-label="Motor balance in percent: negative slows motor A, positive slows motor B, to 0.001"
-                />
-              </div>
-              <span className="font-mono text-[11px] text-muted-foreground">
-                % · A × {trimScales.a.toFixed(3)} · B × {trimScales.b.toFixed(3)}
-              </span>
-            </div>
-            <div className="flex items-center gap-1">
-              <button
-                type="button"
-                onClick={() => setTrim(trimPct - DC_TRIM_STEP_PCT)}
-                disabled={busy || trimPct <= -MAX_DC_TRIM_PCT}
-                aria-label="Slow motor A by 0.1 percent more"
-                className="rounded-md border border-border px-2 py-0.5 font-mono text-[11px] text-muted-foreground transition-colors hover:text-foreground disabled:cursor-not-allowed disabled:opacity-40"
-              >
-                A −0.1
-              </button>
-              <button
-                type="button"
-                onClick={() => setTrim(trimPct + DC_TRIM_STEP_PCT)}
-                disabled={busy || trimPct >= MAX_DC_TRIM_PCT}
-                aria-label="Slow motor B by 0.1 percent more"
-                className="rounded-md border border-border px-2 py-0.5 font-mono text-[11px] text-muted-foreground transition-colors hover:text-foreground disabled:cursor-not-allowed disabled:opacity-40"
-              >
-                B −0.1
-              </button>
-              <button
-                type="button"
-                onClick={() => setTrim(0)}
-                disabled={busy || trimPct === 0}
-                className="rounded-md border border-border px-2 py-0.5 font-mono text-[11px] text-muted-foreground transition-colors hover:text-foreground disabled:cursor-not-allowed disabled:opacity-40"
-              >
-                Reset
-              </button>
-            </div>
           </div>
           <p className="mt-2 text-xs leading-relaxed text-muted-foreground text-pretty">
             Two brushed motors never run at exactly the same speed for the same PWM, so one chain creeps ahead and
