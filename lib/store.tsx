@@ -382,6 +382,8 @@ const NODE_TUNING_KEYS = [
   "servoJogPulses",
   "dcJogMs",
   "dcTrimPct",
+  "dcTrimUpPct",
+  "dcTrimPerDirection",
   "servoMirrorB",
   "servoSingleMotor",
   "servoIgnoreAlarm",
@@ -820,6 +822,8 @@ export type Action =
           | "servoJogPulses"
           | "dcJogMs"
           | "dcTrimPct"
+          | "dcTrimUpPct"
+          | "dcTrimPerDirection"
           | "servoMirrorB"
           | "servoSingleMotor"
           | "servoIgnoreAlarm"
@@ -2491,7 +2495,8 @@ function coreReducer(state: AppState, action: Action): AppState {
         // The agent has already applied and saved the measured trim; mirror it
         // so the slider, the Exact box and the next `config` all agree.
         if (ev?.phase === "done" && typeof ev.trimPct === "number" && Number.isFinite(ev.trimPct)) {
-          next.dcTrimPct = ev.trimPct
+          if (ev.direction === "up" && n.dcTrimPerDirection === true) next.dcTrimUpPct = ev.trimPct
+          else next.dcTrimPct = ev.trimPct
         }
         return next
       })

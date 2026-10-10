@@ -43,9 +43,13 @@ function parseBaseCommand(body: unknown): NodeCommand | null {
     case "calibrate":
       return { type }
     case "balance_calibrate": {
-      const turns = (body as { turns?: unknown }).turns
+      const { turns, direction } = body as { turns?: unknown; direction?: unknown }
       const n = typeof turns === "number" && Number.isInteger(turns) && turns >= 1 && turns <= 10 ? turns : 3
-      return { type: "balance_calibrate", turns: n }
+      return {
+        type: "balance_calibrate",
+        turns: n,
+        ...(direction === "up" || direction === "down" ? { direction } : {}),
+      }
     }
     case "goto": {
       const shelf = (body as { shelf?: unknown }).shelf
@@ -87,6 +91,8 @@ function parseBaseCommand(body: unknown): NodeCommand | null {
         reverseDir?: unknown
         servoIgnoreAlarm?: unknown
         dcTrimPct?: unknown
+        dcTrimUpPct?: unknown
+        dcTrimPerDirection?: unknown
         servoHoldTimeoutS?: unknown
         sensorArmS?: unknown
         homeTimeoutS?: unknown
@@ -131,6 +137,11 @@ function parseBaseCommand(body: unknown): NodeCommand | null {
       if (typeof trim === "number" && Number.isFinite(trim) && Math.abs(trim) <= 20) {
         cmd.dcTrimPct = roundDcTrimPct(trim)
       }
+      const trimUp = b.dcTrimUpPct
+      if (typeof trimUp === "number" && Number.isFinite(trimUp) && Math.abs(trimUp) <= 20) {
+        cmd.dcTrimUpPct = roundDcTrimPct(trimUp)
+      }
+      if (typeof b.dcTrimPerDirection === "boolean") cmd.dcTrimPerDirection = b.dcTrimPerDirection
       if (typeof b.chainSyncEnabled === "boolean") cmd.chainSyncEnabled = b.chainSyncEnabled
       const tol = b.chainSyncToleranceMs
       if (

@@ -421,10 +421,30 @@ export function balanceTrimFromTimes(aMs: number, bMs: number, previousTrimPct: 
   const ideal = perDutyA > perDutyB ? -(1 - perDutyB / perDutyA) * 100 : (1 - perDutyA / perDutyB) * 100
   return roundDcTrimPct(Math.max(-MAX_DC_TRIM_PCT, Math.min(MAX_DC_TRIM_PCT, ideal)))
 }
-/** Duty multipliers per bridge for the node's trim; the faster motor is scaled below 1. */
-export function dcTrimScalesFor(node: ServoNode): { a: number; b: number } {
-  const t = dcTrimPctFor(node)
+/** Duty multipliers per bridge for a trim value; the faster motor is scaled below 1. */
+export function dcTrimScalesFromPct(t: number): { a: number; b: number } {
   return { a: t < 0 ? 1 + t / 100 : 1, b: t > 0 ? 1 - t / 100 : 1 }
+}
+/** Duty multipliers per bridge for the node's (down / shared) trim. */
+export function dcTrimScalesFor(node: ServoNode): { a: number; b: number } {
+  return dcTrimScalesFromPct(dcTrimPctFor(node))
+}
+export type TravelDirection = "up" | "down"
+/** The direction homing runs in; a calibration without an explicit direction uses it too. */
+export const HOMING_TRAVEL_DIRECTION: TravelDirection = "up"
+export function dcTrimPerDirectionFor(node: { dcTrimPerDirection?: boolean }): boolean {
+  return node.dcTrimPerDirection === true
+}
+export function dcTrimUpPctFor(node: ServoNode & { dcTrimUpPct?: number }): number {
+  const v = node.dcTrimUpPct ?? DEFAULT_DC_TRIM_PCT
+  return Math.max(-MAX_DC_TRIM_PCT, Math.min(MAX_DC_TRIM_PCT, roundDcTrimPct(v)))
+}
+/** The trim the agent applies for travel in `direction`, honouring the per-direction switch. */
+export function dcTrimPctForDirection(
+  node: ServoNode & { dcTrimUpPct?: number; dcTrimPerDirection?: boolean },
+  direction: TravelDirection,
+): number {
+  return direction === "up" && dcTrimPerDirectionFor(node) ? dcTrimUpPctFor(node) : dcTrimPctFor(node)
 }
 export function servoPulsesPerRevFor(node: ServoNode): number {
   return node.servoPulsesPerRev ?? DEFAULT_SERVO_PULSES_PER_REV

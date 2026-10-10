@@ -76,6 +76,12 @@ export interface BalanceCalibrateCommand {
   type: "balance_calibrate"
   /** Full turns to time over, 1–10 (default 3). */
   turns?: number
+  /**
+   * Which way to run (pax-agent-1.8+). Omitted = the homing direction, so a
+   * calibration turns the same way the operator sees homing turn. With
+   * `dcTrimPerDirection` on, the result is stored for this direction only.
+   */
+  direction?: "up" | "down"
 }
 
 /**
@@ -141,6 +147,10 @@ export interface ConfigCommand {
    * (1 − v/100) when v > 0 — on every move, homing and jog. 0 = equal duty.
    */
   dcTrimPct?: number
+  /** DC only (pax-agent-1.8+): balance for "up" travel when `dcTrimPerDirection` is on. */
+  dcTrimUpPct?: number
+  /** DC only (pax-agent-1.8+): `dcTrimPct` for "down" travel, `dcTrimUpPct` for "up". */
+  dcTrimPerDirection?: boolean
   /** Servo only: treat the ALM inputs as healthy (ALM+/ALM− not wired). */
   servoIgnoreAlarm?: boolean
   /**
@@ -452,6 +462,8 @@ export interface BalanceEvent {
   trimPct?: number | null
   /** The ideal trim exceeded ±20 % and was clamped. */
   clamped?: boolean
+  /** Which way the carousel ran; the trim applies to this direction when per-direction balance is on. */
+  direction?: "up" | "down"
 }
 
 /**

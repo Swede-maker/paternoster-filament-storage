@@ -843,6 +843,15 @@ export interface StorageNode {
    * same duty. Applied by the agent to every move, homing and jog.
    */
   dcTrimPct?: number
+  /**
+   * DC only: a second balance used when the carousel travels "up" (the
+   * homing direction). Brushed motors and gearboxes often differ more one way
+   * than the other, so each direction can carry its own trim. Only applied
+   * when `dcTrimPerDirection` is on; otherwise `dcTrimPct` serves both ways.
+   */
+  dcTrimUpPct?: number
+  /** DC only: use `dcTrimPct` for "down" travel and `dcTrimUpPct` for "up". */
+  dcTrimPerDirection?: boolean
   /** Invert motor B's direction (motors mounted facing each other). Both drives. */
   servoMirrorB?: boolean
   /**
