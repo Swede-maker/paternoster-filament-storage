@@ -39,6 +39,7 @@ import {
   MAX_SHELF_TIMEOUT_S,
   DC_TRIM_STEP_PCT,
   roundDcTrimPct,
+  formatDcTrimPct,
   chainSyncEnabledFor,
   chainSyncToleranceFor,
   chainSyncShelfSideFor,
@@ -56,6 +57,7 @@ import { Field, Checkbox } from "./ui/field"
 import { NumberInput } from "./ui/number-input"
 import { MotorDrivePicker } from "./motor-drive-picker"
 import { ServoPositioning } from "./servo-positioning"
+import { MotorBalanceCalibrate } from "./motor-balance-calibrate"
 
 /** iSV57T DIP S1–S3 table (manual §4.1). "Pr0.08" = all OFF, software value. */
 const DIP_PULSES = [1600, 2000, 3200, 4000, 5000, 6400, 8000]
@@ -129,7 +131,7 @@ export function MotorDriveEditor({ node }: { node: StorageNode }) {
   const trimScales = dcTrimScalesFor(node)
   const setTrim = (value: number) =>
     update({ dcTrimPct: Math.max(-MAX_DC_TRIM_PCT, Math.min(MAX_DC_TRIM_PCT, roundDcTrimPct(value))) })
-  const fmtTrim = (v: number) => Math.abs(v).toFixed(1)
+  const fmtTrim = formatDcTrimPct
   const chainSyncOn = chainSyncEnabledFor(node)
   const chainSyncTol = chainSyncToleranceFor(node)
   const chainSyncWait = chainSyncMaxWaitFor(node)
@@ -285,7 +287,7 @@ export function MotorDriveEditor({ node }: { node: StorageNode }) {
                   value={trimPct}
                   disabled={busy}
                   onCommit={setTrim}
-                  aria-label="Motor balance in percent: negative slows motor A, positive slows motor B, in steps of 0.1"
+                  aria-label="Motor balance in percent: negative slows motor A, positive slows motor B, to 0.001"
                 />
               </div>
               <span className="font-mono text-[11px] text-muted-foreground">
@@ -327,6 +329,7 @@ export function MotorDriveEditor({ node }: { node: StorageNode }) {
             slider, type an exact value, or nudge in 0.1 % steps; the other motor keeps the full Motor speed setting.
             The trim rides on top of every move, homing and jog, and goes to the Pi with the next config.
           </p>
+          <MotorBalanceCalibrate node={node} busy={busy} />
         </div>
       )}
 

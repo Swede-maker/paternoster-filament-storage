@@ -232,6 +232,10 @@ export function NodeConnection() {
             // accompanies a success clears the command state.
             dispatch({ type: "NODE_CALIBRATION", nodeId, calibration: ev })
             break
+          case "balance":
+            // Motor balance auto-calibration progress / result.
+            dispatch({ type: "NODE_BALANCE", nodeId, balance: ev })
+            break
           case "sync":
             dispatch({ type: "NODE_SYNC", nodeId, driftPulses: ev.driftPulses })
             break

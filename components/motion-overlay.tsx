@@ -27,6 +27,7 @@ import { printerSlotLabel, shelfLabel, getNode, partWeightGrams } from "@/lib/se
 import { findBinding, shortTagId } from "@/lib/tags"
 import { TagScanner } from "./tag-scanner"
 import { TwinStopCard } from "./twin-stop-card"
+import { NoSlotLeft } from "./no-slot-left"
 import type { HardwarePart, Printer, Spool, StorageNode } from "@/lib/types"
 
 /**
@@ -135,7 +136,15 @@ export function MotionOverlay() {
   const total = job.items.length
   const step = job.currentIndex + 1
   const isStore = job.mode === "store" || job.mode === "place"
-
+  // When the last "Doesn't fit" found nowhere to go, the item is left on the
+  // slot it just rejected — so "current slot is in the rejected list" means
+  // the system has run out of slots to offer.
+  const slotsExhausted =
+    !!item &&
+    (item.rejectedSlots ?? []).some(
+      (r) => r.nodeId === item.nodeId && r.shelf === item.shelf && r.slot === item.slot,
+    )
+  
   // --- Identical-spool disambiguation ---------------------------------------
   // When several physically identical spools (same material + colour) are being
   // stored in one job, the operator can't tell which one a given slot wants. We
@@ -531,7 +540,8 @@ export function MotionOverlay() {
             {/* The offered slot may be physically too tight for this spool. Let
                 the operator ask for another one; slots already turned down are
                 remembered on the item so the same one is never offered again. */}
-            {!isPart && (
+            {!isPart && slotsExhausted && <NoSlotLeft item={item} />}
+            {!isPart && !slotsExhausted && (
               <>
                 <Button
                   size="md"
