@@ -1676,7 +1676,16 @@ class Carousel:
         self._set_command(("calibrate",))
 
     def set_position_mode(self, mode) -> bool:
-        if mode not in ("sensor", "pulses", "index") or mode == self.position_mode:
+        if mode not in ("sensor", "pulses", "index"):
+            return False
+        # A DC bridge has no pulse counter, so "pulses"/"index" (a stale servo
+        # setting replayed by the app) cannot be honoured. Fall back to the shelf
+        # sensor here, once, instead of faulting on every single goto.
+        if mode != "sensor" and self._odometer() is None:
+            if mode != self.position_mode:
+                print(f"[agent] positioning '{mode}' needs a pulse counter; this drive has none -> sensor", flush=True)
+            mode = "sensor"
+        if mode == self.position_mode:
             return False
         self.position_mode = mode
         print(f"[agent] positioning = {mode}", flush=True)
@@ -2989,8 +2998,11 @@ class Carousel:
                                       f"so the carousel positions by pulses alone. Jog and Home still work."})
                 self.emit(self.snapshot())
                 return
-            self.emit({"type": "fault",
-                       "message": f"Pulse positioning unavailable ({blocker}); using the shelf sensor for this move."})
+            # Falling back to the shelf sensor is a safe, fully positioned move,
+            # not a lost position. A `fault` here made the app show "Carousel
+            # stopped - position lost" and abandon the goto that then completed.
+            print(f"[agent] pulse positioning unavailable ({blocker}); using the shelf sensor for this move",
+                  flush=True)
 
         self.status = "moving"
         self.emit(self.snapshot())
@@ -3054,7 +3066,7 @@ class Carousel:
         # slider effective on short moves. That inverted the priority: it forced
         # cruise up to the full requested duty, which made `approach == speed`, so
         # the changeover in the loop found nothing to change and the single most
-        # common move on the machine — step to the next shelf — took its target
+        # common move on the machine �� step to the next shelf — took its target
         # flag at full speed. Measured on the reversal harness: the carousel
         # arrived at duty 0.45 and coasted 0.392 of a pitch past the flag, while
         # the same move at the arrival duty stops within 0.1.
