@@ -1,6 +1,7 @@
 // Core domain types for the PAX paternoster filament storage system.
 
 import type {
+  BalanceEvent,
   CalibrationEvent,
   MotorMode,
   NetResultEvent,
@@ -925,6 +926,8 @@ export interface StorageNode {
   calibration?: CalibrationEvent | null
   /** True from pressing Calibrate until the agent answers. Runtime only. */
   calibrating?: boolean
+  /** Last `balance` frame (motor balance auto-calibration progress/result). Runtime only. */
+  balance?: BalanceEvent | null
   storage: StorageConfig
   /** shelf -> slot -> spoolId | null */
   slots: (string | null)[][]

@@ -42,6 +42,11 @@ function parseBaseCommand(body: unknown): NodeCommand | null {
     case "hold":
     case "calibrate":
       return { type }
+    case "balance_calibrate": {
+      const turns = (body as { turns?: unknown }).turns
+      const n = typeof turns === "number" && Number.isInteger(turns) && turns >= 1 && turns <= 10 ? turns : 3
+      return { type: "balance_calibrate", turns: n }
+    }
     case "goto": {
       const shelf = (body as { shelf?: unknown }).shelf
       if (typeof shelf !== "number" || !Number.isInteger(shelf) || shelf < 0) return null

@@ -63,6 +63,22 @@ export interface CalibrateCommand {
 }
 
 /**
+ * DC only (pax-agent-1.7+): measure the two chains against each other and set
+ * the Motor balance from the result. Start with the shelf-side chain parked on
+ * shelf 1's flag (shelf sensor lit) and the other chain on the home flag (home
+ * sensor lit). Both bridges run `turns` full carousel turns at Motor speed;
+ * each sensor is timed to the trigger that completes its chain's last turn, the
+ * first chain to finish is held until the other arrives, and the trim that
+ * equalises the two times is applied and persisted. Progress and the result
+ * arrive as `balance` frames.
+ */
+export interface BalanceCalibrateCommand {
+  type: "balance_calibrate"
+  /** Full turns to time over, 1–10 (default 3). */
+  turns?: number
+}
+
+/**
  * How a `goto` finds its shelf.
  * - "sensor": count shelf-flag edges on the proximity sensor (the only option on DC).
  * - "pulses": servo only — drive a calibrated number of pulses per shelf from the
@@ -254,6 +270,7 @@ export type NodeCommand =
   | (ReleaseCommand & Sided)
   | (HoldCommand & Sided)
   | (CalibrateCommand & Sided)
+  | (BalanceCalibrateCommand & Sided)
   | (ConfigCommand & Sided)
   | (JogCommand & Sided)
   | NetCommand
@@ -415,6 +432,29 @@ export interface CalibrationEvent {
 }
 
 /**
+ * Progress and result of a `balance_calibrate` run (DC). `running` frames
+ * carry the laps completed per motor; `done` carries both times and the trim
+ * the agent has applied; `failed` explains why nothing was changed.
+ */
+export interface BalanceEvent {
+  type: "balance"
+  phase: "running" | "done" | "failed"
+  message: string
+  turns?: number
+  lapsA?: number
+  lapsB?: number
+  /** Time to each chain's last trigger, ms. */
+  aMs?: number | null
+  bMs?: number | null
+  /** Trim the run was made under, percent (negative slows A). */
+  previousTrimPct?: number | null
+  /** Trim now applied by the agent, percent, to 0.001. */
+  trimPct?: number | null
+  /** The ideal trim exceeded ±20 % and was clamped. */
+  clamped?: boolean
+}
+
+/**
  * Pulse mode: the index flag passed the sensor mid-move and the odometer was
  * corrected by `driftPulses` without stopping. Small values are normal; more
  * than half a `pulsesPerShelf` also raises a `fault`.
@@ -531,6 +571,7 @@ export type NodeEvent =
   | ServoEvent
   | FaultEvent
   | CalibrationEvent
+  | BalanceEvent
   | SyncEvent
   | NetEvent
 
@@ -571,6 +612,7 @@ export function parseEvent(data: string): NodeEvent | null {
     case "servo":
     case "fault":
     case "calibration":
+    case "balance":
     case "sync":
     case "net.status":
     case "net.scan":

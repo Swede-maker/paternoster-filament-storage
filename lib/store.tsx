@@ -46,10 +46,18 @@ import type {
   TagBinding,
   RfidReader,
 } from "./types"
-import type { CalibrationEvent, MotorMode, NetResultEvent, NetSlave, NetStatusEvent, ServoEvent } from "./node-protocol"
+import type {
+  BalanceEvent,
+  CalibrationEvent,
+  MotorMode,
+  NetResultEvent,
+  NetSlave,
+  NetStatusEvent,
+  ServoEvent,
+} from "./node-protocol"
 import { printerAmsUnits, printerSlotCount, rampStepMs, newId, DEFAULT_RAMP_PCT } from "./filament"
 import { pickRemainderDestination } from "./hardware-flow"
-import { shelfLabel, printerSlotLabel } from "./selectors"
+import { shelfLabel, printerSlotLabel, nodeSystem } from "./selectors"
 import { shortestRotation } from "./balance"
 import { pickFilamentDestination } from "./filament-flow"
 import { getSystemVersion, loadSystemState, saveSystemState } from "@/app/actions/system-state"
@@ -180,6 +188,7 @@ function toPersisted(state: AppState): PersistedState {
         // separately as servoCarouselPulses / servoIndexWindowPulses.
         calibration: _calibration,
         calibrating: _calibrating,
+        balance: _balance,
         ...n
       }) => ({
         ...n,
@@ -844,6 +853,7 @@ export type Action =
   | { type: "NODE_CALIBRATION"; nodeId: string; calibration: CalibrationEvent }
   /** Calibrate pressed locally; cleared by the agent's answer. */
   | { type: "NODE_CALIBRATING"; nodeId: string; on: boolean }
+  | { type: "NODE_BALANCE"; nodeId: string; balance: BalanceEvent | null }
   /**
    * Simulated unit: run the calibration the Pi would — home, one full turn
    * through every shelf, stop at home — and produce a result from the servo
@@ -1011,6 +1021,13 @@ export type Action =
    * rejected before), and re-drive the carousel there. Filament store/place only.
    */
   | { type: "REJECT_STORE_SLOT" }
+  /**
+   * Operator's way out when every offered slot was rejected: send the current
+   * store item to a specific unit (a library is allowed here because the user
+   * named it), or create a new library and send it there.
+   */
+  | { type: "RETARGET_STORE_ITEM"; nodeId: string }
+  | { type: "RETARGET_STORE_ITEM"; newLibraryName: string }
   // Jobs
   | { type: "START_JOB"; job: ActiveJob }
   /** Queue several jobs to run back-to-back (first runs now, rest wait). */
@@ -1155,6 +1172,52 @@ function onNodeArrived(state: AppState, nodeId: string): AppState {
     ...n,
     machine: { ...n.machine, status, targetShelf: null, direction: null, moveFrom: null },
   }))
+}
+
+/**
+ * Move the current store item (a spool) to a fresh slot, preferring
+ * `preferredNodeId`. `rejected` is the full list of slots the operator has
+ * turned down; it is written back onto the item so none is offered again. If
+ * nothing is free the item is left where it is with the rejections recorded.
+ */
+function retargetCurrentStoreItem(
+  state: AppState,
+  rejected: { nodeId: string; shelf: number; slot: number }[],
+  preferredNodeId: string,
+): AppState {
+  const job = state.job
+  if (!job) return state
+  const item = job.items[job.currentIndex]
+  if (!item) return state
+  const spool = state.spools[item.spoolId]
+  if (!spool) return state
+  // Never land on a slot another queued item is heading for either.
+  const reservedByOthers = job.items
+    .filter((it, i) => i !== job.currentIndex && !it.done)
+    .map((it) => ({ nodeId: it.nodeId, shelf: it.shelf, slot: it.slot }))
+  const dest = pickFilamentDestination(
+    state,
+    item.grams ?? spool.grams,
+    [...rejected, ...reservedByOthers],
+    preferredNodeId,
+    spool.containerId,
+  )
+  const retargeted: QueueItem = dest
+    ? { ...item, nodeId: dest.nodeId, shelf: dest.shelf, slot: dest.slot, rejectedSlots: rejected }
+    : { ...item, rejectedSlots: rejected }
+  const items = job.items.map((it, i) => (i === job.currentIndex ? retargeted : it))
+  const withJob: AppState = { ...state, job: { ...job, items } }
+  if (!dest) return withJob
+  // Same shelf on the same unit → just a different slot; the carousel is
+  // already there, so stay at the confirm step. Otherwise park this unit and
+  // rotate (or, for a shelf/library, arrive instantly) at the new one.
+  const sameStop = dest.nodeId === item.nodeId && dest.shelf === item.shelf
+  if (sameStop) return withJob
+  const parked = withNode(withJob, item.nodeId, (n) => ({
+    ...n,
+    machine: { ...n.machine, status: "idle", targetShelf: null, direction: null, moveFrom: null },
+  }))
+  return serviceCurrentItem(parked)
 }
 
 /** Kick off servicing the current job item, and pre-rotate the other nodes. */
@@ -2421,6 +2484,19 @@ function coreReducer(state: AppState, action: Action): AppState {
     case "NODE_CALIBRATING":
       return withNode(state, action.nodeId, (n) => ({ ...n, calibrating: action.on }))
 
+    case "NODE_BALANCE": {
+      const ev = action.balance
+      return withNode(state, action.nodeId, (n) => {
+        const next: StorageNode = { ...n, balance: ev }
+        // The agent has already applied and saved the measured trim; mirror it
+        // so the slider, the Exact box and the next `config` all agree.
+        if (ev?.phase === "done" && typeof ev.trimPct === "number" && Number.isFinite(ev.trimPct)) {
+          next.dcTrimPct = ev.trimPct
+        }
+        return next
+      })
+    }
+
     case "SIM_CALIBRATE_START": {
       const node = getNode(state, action.nodeId)
       if (!node || node.driver === "hardware" || node.machine.status !== "idle" || state.job) return state
@@ -2568,37 +2644,36 @@ function coreReducer(state: AppState, action: Action): AppState {
       if (!spool) return state
 
       const rejected = [...(item.rejectedSlots ?? []), { nodeId: item.nodeId, shelf: item.shelf, slot: item.slot }]
-      // Never land on a slot another queued item is heading for either.
-      const reservedByOthers = job.items
-        .filter((it, i) => i !== job.currentIndex && !it.done)
-        .map((it) => ({ nodeId: it.nodeId, shelf: it.shelf, slot: it.slot }))
-      const dest = pickFilamentDestination(
-        state,
-        item.grams ?? spool.grams,
-        [...rejected, ...reservedByOthers],
-        // Stay in the unit the operator chose unless it has nothing else to offer.
-        item.nodeId,
-        spool.containerId,
-      )
-      // Nowhere else to go: keep the item as is (the UI explains) but still record
-      // the rejection so the message is accurate.
-      const retargeted: QueueItem = dest
-        ? { ...item, nodeId: dest.nodeId, shelf: dest.shelf, slot: dest.slot, rejectedSlots: rejected }
-        : { ...item, rejectedSlots: rejected }
-      const items = job.items.map((it, i) => (i === job.currentIndex ? retargeted : it))
-      const withJob: AppState = { ...state, job: { ...job, items } }
-      if (!dest) return withJob
+      // Stay in the unit the operator chose unless it has nothing else to offer.
+      // Nowhere else to go: the item keeps its (rejected) slot, which the UI
+      // reads as "no slot left that fits" and offers another unit or a library.
+      return retargetCurrentStoreItem(state, rejected, item.nodeId)
+    }
 
-      // Same shelf on the same unit → just a different slot; the carousel is
-      // already there, so stay at the confirm step. Otherwise rotate to the new
-      // shelf (the normal confirm gate applies).
-      const sameStop = dest.nodeId === item.nodeId && dest.shelf === item.shelf
-      if (sameStop) return withJob
-      const parked = withNode(withJob, item.nodeId, (n) => ({
-        ...n,
-        machine: { ...n.machine, status: "idle", targetShelf: null, direction: null, moveFrom: null },
-      }))
-      return serviceCurrentItem(parked)
+    case "RETARGET_STORE_ITEM": {
+      const job = state.job
+      if (!job || job.mode === "pick") return state
+      const item = job.items[job.currentIndex]
+      if (!item || item.occupantKind === "part") return state
+      let next = state
+      let targetId: string
+      if ("newLibraryName" in action) {
+        const lib = makeNode({
+          name: action.newLibraryName.trim() || "Library",
+          ip: "127.0.0.1",
+          role: "slave",
+          type: "library",
+          system: "filament",
+          storage: { shelves: 1, slotsPerShelf: 1 },
+        })
+        next = { ...state, nodes: [...state.nodes, lib] }
+        targetId = lib.id
+      } else {
+        const target = getNode(state, action.nodeId)
+        if (!target || nodeSystem(target) !== "filament") return state
+        targetId = action.nodeId
+      }
+      return retargetCurrentStoreItem(next, item.rejectedSlots ?? [], targetId)
     }
 
     case "CONFIRM_STOP": {

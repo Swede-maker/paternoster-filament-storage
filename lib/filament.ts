@@ -359,10 +359,22 @@ export function dcJogMsFor(node: ServoNode): number {
 /** DC PWM balance (see StorageNode.dcTrimPct): 0 = equal duty on both bridges. */
 export const DEFAULT_DC_TRIM_PCT = 0
 export const MAX_DC_TRIM_PCT = 20
-/** Motor balance is tuned in tenths of a percent. */
+/** The slider and nudge buttons move the balance in tenths of a percent. */
 export const DC_TRIM_STEP_PCT = 0.1
+/**
+ * Stored to a thousandth of a percent so the auto-calibration can land exactly.
+ * Rounding via integer scaling, not `round(v / step) * step`: that produced
+ * -2.4000000000000004 for -2.4 and the artefact showed up in the Exact box.
+ */
+export const DC_TRIM_DECIMALS = 3
 export function roundDcTrimPct(v: number): number {
-  return Math.round(v / DC_TRIM_STEP_PCT) * DC_TRIM_STEP_PCT
+  const f = 10 ** DC_TRIM_DECIMALS
+  return Math.round(v * f) / f
+}
+/** "2.4", "2.437", "0.0" — magnitude only; callers add the A/B sign. */
+export function formatDcTrimPct(v: number): string {
+  const s = Math.abs(v).toFixed(DC_TRIM_DECIMALS).replace(/0+$/, "")
+  return s.endsWith(".") ? `${s}0` : s
 }
 export function dcTrimPctFor(node: ServoNode): number {
   const v = node.dcTrimPct ?? DEFAULT_DC_TRIM_PCT
@@ -395,6 +407,19 @@ export function chainSyncMaxWaitFor(node: { chainSyncMaxWaitS?: number }): numbe
 }
 export function chainSyncShelfSideFor(node: { chainSyncShelfSide?: "a" | "b" }): "a" | "b" {
   return node.chainSyncShelfSide === "b" ? "b" : "a"
+}
+/**
+ * The trim that equalises two chains timed over the same number of turns under
+ * `previousTrimPct`. Mirrors the agent's calculation; used by the simulator.
+ * Negative slows A, positive slows B, clamped to ±MAX_DC_TRIM_PCT.
+ */
+export function balanceTrimFromTimes(aMs: number, bMs: number, previousTrimPct: number): number {
+  const scaleA = previousTrimPct < 0 ? 1 + previousTrimPct / 100 : 1
+  const scaleB = previousTrimPct > 0 ? 1 - previousTrimPct / 100 : 1
+  const perDutyA = 1 / (aMs * scaleA)
+  const perDutyB = 1 / (bMs * scaleB)
+  const ideal = perDutyA > perDutyB ? -(1 - perDutyB / perDutyA) * 100 : (1 - perDutyA / perDutyB) * 100
+  return roundDcTrimPct(Math.max(-MAX_DC_TRIM_PCT, Math.min(MAX_DC_TRIM_PCT, ideal)))
 }
 /** Duty multipliers per bridge for the node's trim; the faster motor is scaled below 1. */
 export function dcTrimScalesFor(node: ServoNode): { a: number; b: number } {
