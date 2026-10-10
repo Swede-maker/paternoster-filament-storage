@@ -152,6 +152,29 @@ export function NodeConnection() {
               simulated: ev.simulated === true,
               reason: ev.simReason ?? undefined,
             })
+            // The drive the Pi is physically wired for is decided at install
+            // time (`install.sh --motor dc|servo` writes motor.json) and the
+            // agent reports it here. The app used to push its own remembered
+            // choice back on every connect, so a Pi reinstalled as DC was
+            // silently flipped back to the servo backend by a stale setting.
+            // The installer wins: adopt what the agent runs, and drop a
+            // pulse-based positioning mode that a DC bridge cannot provide.
+            if (ev.motorMode === "dc" || ev.motorMode === "servo") {
+              const node = stateRef.current.nodes.find((n) => n.id === nodeId)
+              const storedMode = node?.motorMode ?? "dc"
+              const storedPos = node?.positionMode ?? "sensor"
+              const needsPosReset = ev.motorMode === "dc" && storedPos !== "sensor"
+              if (node && (storedMode !== ev.motorMode || needsPosReset)) {
+                dispatch({
+                  type: "UPDATE_NODE",
+                  id: nodeId,
+                  changes: {
+                    motorMode: ev.motorMode,
+                    ...(needsPosReset ? { positionMode: "sensor" as const } : {}),
+                  },
+                })
+              }
+            }
             // An agent without `role` predates paxnet: it will never send a
             // net.status and drops net.* on the floor. Say so instead of
             // leaving the network panel on "waiting" forever.
@@ -388,7 +411,7 @@ export function NodeConnection() {
   // running on its built-in defaults.
   //
   // Keyed on the values themselves, so it re-sends whenever a slider moves and
-  // also right after (re)connecting — a restarted Pi comes back on defaults and
+  // also right after (re)connecting ��� a restarted Pi comes back on defaults and
   // must be told the current settings again.
   //
   // The link state MUST come from the store (`n.link`), not from
