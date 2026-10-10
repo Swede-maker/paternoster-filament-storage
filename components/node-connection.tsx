@@ -20,6 +20,11 @@ import {
   servoHoldTimeoutFor,
   sensorArmFor,
   homeTimeoutFor,
+  shelfTimeoutFor,
+  chainSyncEnabledFor,
+  chainSyncToleranceFor,
+  chainSyncMaxWaitFor,
+  chainSyncShelfSideFor,
 } from "@/lib/filament"
 import { nodeLoadGrams } from "@/lib/selectors"
 
@@ -448,6 +453,11 @@ export function NodeConnection() {
         servoHoldTimeoutFor(n),
         sensorArmFor(n),
         homeTimeoutFor(n),
+        shelfTimeoutFor(n),
+        chainSyncEnabledFor(n),
+        chainSyncToleranceFor(n),
+        chainSyncMaxWaitFor(n),
+        chainSyncShelfSideFor(n),
         n.positionMode ?? "sensor",
         n.servoCarouselPulses ?? 0,
         n.servoIndexWindowPulses ?? 0,
@@ -495,6 +505,11 @@ export function NodeConnection() {
               servoHoldTimeoutS: servoHoldTimeoutFor(node),
               sensorArmS: sensorArmFor(node),
               homeTimeoutS: homeTimeoutFor(node),
+              shelfTimeoutS: shelfTimeoutFor(node),
+              chainSyncEnabled: chainSyncEnabledFor(node),
+              chainSyncToleranceMs: chainSyncToleranceFor(node),
+              chainSyncMaxWaitS: chainSyncMaxWaitFor(node),
+              chainSyncShelfSide: chainSyncShelfSideFor(node),
               positionMode: node.positionMode ?? "sensor",
               // Our copy of the calibration, for an agent that lost its own.
               ...(node.servoCarouselPulses ? { servoCarouselPulses: node.servoCarouselPulses } : {}),
