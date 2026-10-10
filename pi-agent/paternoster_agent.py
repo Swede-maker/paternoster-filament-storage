@@ -262,6 +262,17 @@ CHAIN_SYNC_MAX_TOLERANCE_MS = 5000.0
 CHAIN_SYNC_MAX_WAIT_S = 3.0
 CHAIN_SYNC_MIN_WAIT_S = 0.5
 CHAIN_SYNC_MAX_WAIT_LIMIT_S = 60.0
+# Motor balance auto-calibration: full carousel turns each chain is timed over.
+# More turns average out sensor jitter; three is plenty for a 0.01 % result on
+# a lap of a minute.
+BALANCE_CAL_DEFAULT_TURNS = 3
+BALANCE_CAL_MAX_TURNS = 10
+# Once the first chain has finished its turns, the other may need this fraction
+# of the first chain's time (plus a floor) to catch up. ±20 % of trim can only
+# fix a 25 % speed difference, so anything slower than that is a mechanical
+# problem, not a balance problem, and the run is cut.
+BALANCE_CAL_CATCH_UP_FRACTION = 0.25
+BALANCE_CAL_CATCH_UP_FLOOR_S = 3.0
 # How often a long sensor wait re-checks for an emergency stop. Small enough to
 # feel instant to an operator, large enough not to spin the CPU.
 ABORT_POLL_SECONDS = 0.02
@@ -1593,6 +1604,17 @@ class SimHardware:
         with self._lock:
             return self._index_window_active()
 
+    # The simulator has one shared position, so "holding" a bridge changes
+    # nothing; these exist so the chain-sync and balance routines can run.
+    def can_chain_sync(self) -> bool:
+        return self.motor_mode == "dc"
+
+    def hold_one(self, index: int) -> None:
+        return None
+
+    def release_one(self, index: int, forward: bool, speed: float) -> None:
+        return None
+
     def shelf_clear(self, timeout: float) -> bool:
         deadline = time.monotonic() + timeout
         while self.shelf_active():
@@ -1693,6 +1715,9 @@ class Carousel:
         self.last_sync_drift: Optional[int] = None
         # Set by the server to persist a fresh calibration.
         self.on_calibration: Optional[Callable[[dict], None]] = None
+        # Set by the server to persist a trim found by the balance calibration.
+        self.on_balance: Optional[Callable[[float], None]] = None
+        self.last_balance: Optional[dict] = None
 
         self._cmd: Optional[tuple] = None
         self._abort = threading.Event()
@@ -1720,6 +1745,12 @@ class Carousel:
 
     def request_calibrate(self) -> None:
         self._set_command(("calibrate",))
+
+    def request_balance_calibrate(self, turns=None) -> None:
+        n = BALANCE_CAL_DEFAULT_TURNS
+        if isinstance(turns, (int, float)) and not isinstance(turns, bool):
+            n = max(1, min(BALANCE_CAL_MAX_TURNS, int(turns)))
+        self._set_command(("balance_calibrate", n))
 
     def set_position_mode(self, mode) -> bool:
         if mode not in ("sensor", "pulses", "index"):
@@ -1986,6 +2017,223 @@ class Carousel:
                 f"not stuck, then level the chains by hand (Jog) and Home before moving again."
             ),
         })
+        self.emit(self.snapshot())
+
+    # ---- motor balance auto-calibration (DC, two bridges) ----
+    def _balance_frame(self, phase: str, message: str, **extra) -> dict:
+        frame = {"type": "balance", "phase": phase, "message": message}
+        frame.update(extra)
+        return frame
+
+    def _balance_fail(self, message: str, **extra) -> None:
+        self.hw.stop()
+        self.status = "idle"
+        print(f"[agent] balance calibration failed: {message}", flush=True)
+        self.last_balance = self._balance_frame("failed", message, **extra)
+        self.emit(self.last_balance)
+        self.emit(self.snapshot())
+
+    def _do_balance_calibrate(self, turns: int) -> None:
+        """
+        Measure the two chains against each other and set the Motor balance.
+
+        Start condition: motor A's chain parked with the shelf flag in the shelf
+        sensor and motor B's chain with the home flag in the home sensor (or the
+        other way round if the shelf sensor is on motor B). Both bridges then run
+        `turns` full carousel turns at Motor speed. Each sensor is timed to the
+        rising edge that completes ITS chain's last turn: `turns × shelves` shelf
+        flags for the shelf sensor, `turns` home flags for the home sensor. The
+        chain that finishes first is held while the other catches up, so both
+        end where they started. The ratio of the two times, with the trim they
+        ran under, gives the trim that makes them equal.
+        """
+        hw = self.hw
+        can = getattr(hw, "can_chain_sync", None)
+        if can is None or not can() or not all(hasattr(hw, n) for n in ("hold_one", "index_active", "shelf_active")):
+            self._balance_fail(
+                "Motor balance calibration needs the Standard DC drive with both bridges on this agent."
+            )
+            return
+
+        shelf_idx = 0 if self.chain_sync_shelf_side == "a" else 1
+        home_idx = 1 - shelf_idx
+        shelf_motor, home_motor = "AB"[shelf_idx], "AB"[home_idx]
+        shelf_on = bool(hw.shelf_active())
+        home_on = bool(hw.index_active())
+        if not (shelf_on and home_on):
+            missing = []
+            if not shelf_on:
+                missing.append(f"the shelf sensor (jog motor {shelf_motor} until shelf 1's flag lights it)")
+            if not home_on:
+                missing.append(f"the home sensor (jog motor {home_motor} until the home flag lights it)")
+            self._balance_fail(
+                "Not ready: both chains must start on their trigger point. Still dark: " + " and ".join(missing) + "."
+            )
+            return
+
+        turns = max(1, min(BALANCE_CAL_MAX_TURNS, int(turns)))
+        need = {shelf_idx: turns * self.shelves, home_idx: turns}
+        counts = {0: 0, 1: 0}
+        # Each sensor starts ON its flag, so the first thing it must see is the
+        # flag leaving; only rising edges after that count.
+        armed = {shelf_idx: False, home_idx: False}
+        was_on = {shelf_idx: True, home_idx: True}
+        finished_at = {0: None, 1: None}
+        held: Optional[int] = None
+        prev_trim = float(getattr(hw, "dc_trim_pct", 0.0) or 0.0)
+        duty = self.move_speed
+
+        def sensor(idx: int) -> bool:
+            return bool(hw.shelf_active()) if idx == shelf_idx else bool(hw.index_active())
+
+        def progress(message: str) -> None:
+            self.emit(self._balance_frame(
+                "running", message, turns=turns,
+                lapsA=counts[0] // (self.shelves if shelf_idx == 0 else 1),
+                lapsB=counts[1] // (self.shelves if shelf_idx == 1 else 1),
+                previousTrimPct=prev_trim,
+            ))
+
+        self.status = "calibrating"
+        self.emit(self.snapshot())
+        print(
+            f"[agent] balance calibration: {turns} turn(s) at duty {duty:.2f}, current trim {prev_trim:+.3f} %, "
+            f"shelf sensor on motor {shelf_motor}",
+            flush=True,
+        )
+        progress(f"Both motors running {turns} turn{'s' if turns != 1 else ''} at Motor speed…")
+
+        # Soft start handled inline so no sensor edge is missed during the ramp.
+        ramp = self._ramp_seconds()
+        floor = min(MIN_DUTY, duty)
+        t0 = time.monotonic()
+        self._energise("down", floor if ramp > 0 else duty)
+        last_duty = floor if ramp > 0 else duty
+        # Silence guards: a shelf flag must come at least once per shelf time,
+        # a home flag once per lap. Scaled for the duty like the move's guard.
+        scale = MOVE_SPEED / max(0.01, duty)
+        silence = {
+            shelf_idx: self._shelf_timeout() * scale + ramp,
+            home_idx: self._home_timeout() * scale + ramp,
+        }
+        last_edge = {0: t0, 1: t0}
+        catch_up_deadline: Optional[float] = None
+        POLL = 0.001
+
+        while True:
+            if self._abort.is_set():
+                hw.stop()
+                self.status = "idle"
+                self.last_balance = self._balance_frame("failed", "Balance calibration stopped.", turns=turns)
+                self.emit(self.last_balance)
+                self.emit(self.snapshot())
+                return
+            now = time.monotonic()
+            if ramp > 0 and held is None and last_duty < duty:
+                frac = min(1.0, (now - t0) / ramp)
+                step_duty = floor + (duty - floor) * frac
+                if step_duty - last_duty >= 0.005 or frac >= 1.0:
+                    self._energise("down", step_duty)
+                    last_duty = step_duty
+
+            for idx in (0, 1):
+                if finished_at[idx] is not None:
+                    continue
+                on = sensor(idx)
+                if not armed[idx]:
+                    if not on:
+                        armed[idx] = True
+                        last_edge[idx] = now
+                elif on and not was_on[idx]:
+                    counts[idx] += 1
+                    last_edge[idx] = now
+                    per_lap = self.shelves if idx == shelf_idx else 1
+                    if counts[idx] % per_lap == 0:
+                        lap = counts[idx] // per_lap
+                        if counts[idx] < need[idx]:
+                            progress(f"Motor {'AB'[idx]}: lap {lap} of {turns}")
+                    if counts[idx] >= need[idx]:
+                        finished_at[idx] = now - t0
+                        other = 1 - idx
+                        if finished_at[other] is None:
+                            hw.hold_one(idx)
+                            held = idx
+                            catch_up_deadline = now + max(
+                                BALANCE_CAL_CATCH_UP_FLOOR_S, BALANCE_CAL_CATCH_UP_FRACTION * finished_at[idx]
+                            )
+                            progress(
+                                f"Motor {'AB'[idx]} finished in {finished_at[idx]:.3f} s and is held; "
+                                f"waiting for motor {'AB'[other]}…"
+                            )
+                was_on[idx] = on
+
+            if finished_at[0] is not None and finished_at[1] is not None:
+                break
+
+            for idx in (0, 1):
+                if finished_at[idx] is None and now - last_edge[idx] > silence[idx]:
+                    name = "shelf" if idx == shelf_idx else "home"
+                    self._balance_fail(
+                        f"Safety stop: the {name} sensor did not trigger for {now - last_edge[idx]:.0f} s "
+                        f"while motor {'AB'[idx]} was running. Check the sensor and that the chain is not stuck.",
+                        turns=turns,
+                    )
+                    self.homed = False
+                    return
+            if catch_up_deadline is not None and now > catch_up_deadline:
+                self._balance_fail(
+                    f"Safety stop: motor {'AB'[1 - held]} needed more than "
+                    f"{BALANCE_CAL_CATCH_UP_FRACTION * 100:.0f} % longer than motor {'AB'[held]} to finish. "
+                    "That is more than the balance can correct; check both chains and sensors.",
+                    turns=turns,
+                )
+                self.homed = False
+                return
+            time.sleep(POLL)
+
+        hw.stop()
+        # Both chains are back on their flags give or take the coast of the
+        # second one; the shelf count during the held phase is not trustworthy,
+        # so the position is dropped and the operator homes before the next move.
+        self.homed = False
+        t_a, t_b = finished_at[0], finished_at[1]
+        scale_a = 1.0 + prev_trim / 100.0 if prev_trim < 0 else 1.0
+        scale_b = 1.0 - prev_trim / 100.0 if prev_trim > 0 else 1.0
+        # Speed per unit duty is inversely proportional to time taken at that duty.
+        per_duty_a = 1.0 / (t_a * scale_a)
+        per_duty_b = 1.0 / (t_b * scale_b)
+        if per_duty_a > per_duty_b:
+            ideal = -(1.0 - per_duty_b / per_duty_a) * 100.0
+        else:
+            ideal = (1.0 - per_duty_a / per_duty_b) * 100.0
+        new_trim = max(-DC_TRIM_MAX_PCT, min(DC_TRIM_MAX_PCT, ideal))
+        clamped = abs(ideal) > DC_TRIM_MAX_PCT
+        new_trim = round(new_trim, 3)
+        self.set_servo(dc_trim_pct=new_trim)
+        if self.on_balance is not None:
+            try:
+                self.on_balance(new_trim)
+            except Exception as exc:  # pragma: no cover
+                print(f"[agent] could not persist balance: {exc}", flush=True)
+        self.status = "idle"
+        slower = "A" if t_a > t_b else "B"
+        diff_ms = abs(t_a - t_b) * 1000.0
+        if new_trim == 0:
+            verdict = "both chains ran equal: balance left at 0."
+        else:
+            verdict = f"balance set to {'A' if new_trim < 0 else 'B'} −{abs(new_trim):.3f} %."
+        message = (
+            f"Motor A {t_a:.3f} s, motor B {t_b:.3f} s over {turns} turn{'s' if turns != 1 else ''} "
+            f"(motor {slower} slower by {diff_ms:.0f} ms): {verdict}"
+            + (" The ideal value was beyond ±20 % and has been clamped; check the mechanics." if clamped else "")
+            + " Home before the next move."
+        )
+        print(f"[agent] balance calibration: {message}", flush=True)
+        self.last_balance = self._balance_frame(
+            "done", message, turns=turns, aMs=round(t_a * 1000.0, 1), bMs=round(t_b * 1000.0, 1),
+            previousTrimPct=prev_trim, trimPct=new_trim, clamped=clamped,
+        )
+        self.emit(self.last_balance)
         self.emit(self.snapshot())
 
     def _shelf_timeout(self) -> float:
@@ -2573,6 +2821,8 @@ class Carousel:
                     self._do_goto(cmd[1])
                 elif cmd[0] == "calibrate":
                     self._do_calibrate()
+                elif cmd[0] == "balance_calibrate":
+                    self._do_balance_calibrate(cmd[1])
                 elif cmd[0] == "jog":
                     self._do_jog(cmd[1], cmd[2], cmd[3], cmd[4] if len(cmd) > 4 else None)
             except Exception as exc:  # pragma: no cover - hardware faults
@@ -4019,6 +4269,12 @@ async def serve(args) -> None:
         if side:
             c.set_reverse(bool(saved.get("reverseDir", False)))
         c.on_calibration = lambda _info: persist_motor_conf()
+
+        def adopt_balance(pct: float) -> None:
+            servo_params["dc_trim_pct"] = float(pct)
+            persist_motor_conf()
+
+        c.on_balance = adopt_balance
         return c
 
     def build_units() -> None:
@@ -4261,6 +4517,8 @@ async def serve(args) -> None:
                         broadcast(tag(side, carousel.calibration_frame()))
                 elif t == "calibrate":
                     carousel.request_calibrate()
+                elif t == "balance_calibrate":
+                    carousel.request_balance_calibrate(msg.get("turns"))
                 elif t == "release":
                     carousel.request_release()
                 elif t == "hold":
