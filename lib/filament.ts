@@ -282,6 +282,26 @@ export function sensorArmFor(node: { sensorArmS?: number }): number {
   return node.sensorArmS ?? 0
 }
 
+// Shelf timeout: how long a move may run without the shelf sensor counting a
+// flag before the agent stops with "Jam? No shelf pulse". Mirrors the agent's
+// PULSE_TIMEOUT (8 s) × SERVO_TIMEOUT_SCALE (2 on servo). The agent still adds
+// the Motor speed scaling, the ramp and the Safe move time on top of this
+// base, so Safe move time never shortens it.
+export const DEFAULT_SHELF_TIMEOUT_DC_S = 8
+export const DEFAULT_SHELF_TIMEOUT_SERVO_S = 16
+export const MIN_SHELF_TIMEOUT_S = 2
+export const MAX_SHELF_TIMEOUT_S = 300
+export function defaultShelfTimeoutFor(node: { motorMode?: "dc" | "servo" }): number {
+  return (node.motorMode ?? "dc") === "servo" ? DEFAULT_SHELF_TIMEOUT_SERVO_S : DEFAULT_SHELF_TIMEOUT_DC_S
+}
+export function shelfTimeoutFor(node: { motorMode?: "dc" | "servo"; shelfTimeoutS?: number }): number {
+  const v = node.shelfTimeoutS
+  if (typeof v === "number" && Number.isFinite(v) && v > 0) {
+    return Math.max(MIN_SHELF_TIMEOUT_S, Math.min(MAX_SHELF_TIMEOUT_S, v))
+  }
+  return defaultShelfTimeoutFor(node)
+}
+
 // Homing time: how long a homing run may look for the index flag. Mirrors the
 // agent's HOME_TIMEOUT (30 s) × SERVO_TIMEOUT_SCALE (2 on servo).
 export const DEFAULT_HOME_TIMEOUT_DC_S = 30
@@ -339,9 +359,42 @@ export function dcJogMsFor(node: ServoNode): number {
 /** DC PWM balance (see StorageNode.dcTrimPct): 0 = equal duty on both bridges. */
 export const DEFAULT_DC_TRIM_PCT = 0
 export const MAX_DC_TRIM_PCT = 20
+/** Motor balance is tuned in tenths of a percent. */
+export const DC_TRIM_STEP_PCT = 0.1
+export function roundDcTrimPct(v: number): number {
+  return Math.round(v / DC_TRIM_STEP_PCT) * DC_TRIM_STEP_PCT
+}
 export function dcTrimPctFor(node: ServoNode): number {
   const v = node.dcTrimPct ?? DEFAULT_DC_TRIM_PCT
-  return Math.max(-MAX_DC_TRIM_PCT, Math.min(MAX_DC_TRIM_PCT, v))
+  return Math.max(-MAX_DC_TRIM_PCT, Math.min(MAX_DC_TRIM_PCT, roundDcTrimPct(v)))
+}
+
+// Chain sync (see StorageNode.chainSyncEnabled).
+export const DEFAULT_CHAIN_SYNC_TOLERANCE_MS = 150
+export const MIN_CHAIN_SYNC_TOLERANCE_MS = 0
+export const MAX_CHAIN_SYNC_TOLERANCE_MS = 5000
+export function chainSyncEnabledFor(node: { chainSyncEnabled?: boolean }): boolean {
+  return node.chainSyncEnabled === true
+}
+export function chainSyncToleranceFor(node: { chainSyncToleranceMs?: number }): number {
+  const v = node.chainSyncToleranceMs
+  if (typeof v === "number" && Number.isFinite(v)) {
+    return Math.max(MIN_CHAIN_SYNC_TOLERANCE_MS, Math.min(MAX_CHAIN_SYNC_TOLERANCE_MS, Math.round(v)))
+  }
+  return DEFAULT_CHAIN_SYNC_TOLERANCE_MS
+}
+export const DEFAULT_CHAIN_SYNC_MAX_WAIT_S = 3
+export const MIN_CHAIN_SYNC_MAX_WAIT_S = 0.5
+export const MAX_CHAIN_SYNC_MAX_WAIT_S = 60
+export function chainSyncMaxWaitFor(node: { chainSyncMaxWaitS?: number }): number {
+  const v = node.chainSyncMaxWaitS
+  if (typeof v === "number" && Number.isFinite(v)) {
+    return Math.max(MIN_CHAIN_SYNC_MAX_WAIT_S, Math.min(MAX_CHAIN_SYNC_MAX_WAIT_S, Math.round(v * 10) / 10))
+  }
+  return DEFAULT_CHAIN_SYNC_MAX_WAIT_S
+}
+export function chainSyncShelfSideFor(node: { chainSyncShelfSide?: "a" | "b" }): "a" | "b" {
+  return node.chainSyncShelfSide === "b" ? "b" : "a"
 }
 /** Duty multipliers per bridge for the node's trim; the faster motor is scaled below 1. */
 export function dcTrimScalesFor(node: ServoNode): { a: number; b: number } {

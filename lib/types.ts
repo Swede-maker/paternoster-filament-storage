@@ -880,6 +880,27 @@ export interface StorageNode {
    */
   homeTimeoutS?: number
   /**
+   * Shelf timeout: seconds a move may run without the shelf sensor counting
+   * a flag before the agent stops with "Jam? No shelf pulse". Unset = the
+   * drive default (8 s on DC, 16 s on servo). Safe move time is added on top
+   * of this, never subtracted from it.
+   */
+  shelfTimeoutS?: number
+  /**
+   * Chain sync (DC, two motors): shelf 1 carries both the shelf flag and the
+   * home flag, so the two sensors should fire together as it passes. When on,
+   * every pass of shelf 1 is driven at Approach speed and, if one sensor leads
+   * the other by more than `chainSyncToleranceMs`, the leading side's motor is
+   * paused until the lagging sensor fires — realigning the chains each lap.
+   */
+  chainSyncEnabled?: boolean
+  /** Lead one sensor may have over the other before a correction starts (ms). */
+  chainSyncToleranceMs?: number
+  /** Safety stop: seconds the lagging sensor may stay silent (one motor driving alone) before both are cut. */
+  chainSyncMaxWaitS?: number
+  /** Which motor's chain carries the SHELF sensor ("a" default); the home sensor is on the other. */
+  chainSyncShelfSide?: "a" | "b"
+  /**
    * How `goto` finds a shelf: "sensor" counts shelf-flag edges (default, and
    * the only option on DC); "pulses" (servo) drives a calibrated distance from
    * the home datum and re-syncs on every index pass.

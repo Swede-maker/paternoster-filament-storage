@@ -137,6 +137,13 @@ export interface ConfigCommand {
   sensorArmS?: number
   /** Homing time: seconds to find the index flag before faulting (pax-agent-1.6+). */
   homeTimeoutS?: number
+  /** Shelf timeout: seconds without a shelf flag before a move faults (pax-agent-1.7+). */
+  shelfTimeoutS?: number
+  /** Chain sync at shelf 1 (DC, two motors; pax-agent-1.7+). */
+  chainSyncEnabled?: boolean
+  chainSyncToleranceMs?: number
+  chainSyncMaxWaitS?: number
+  chainSyncShelfSide?: "a" | "b"
   /** Sensor counting or calibrated pulses (pax-agent-1.5+). */
   positionMode?: PositionMode
   /**
@@ -326,6 +333,13 @@ export interface ServoEvent {
   holdTimeoutS?: number
   /** The agent's effective homing time in seconds (pax-agent-1.6+). */
   homeTimeoutS?: number
+  /** The agent's effective shelf timeout base in seconds (pax-agent-1.7+). */
+  shelfTimeoutS?: number
+  /** Measured seconds between two consecutive shelf flags at cruise, once learned. */
+  shelfPitchS?: number | null
+  /** Last chain-sync pass at shelf 1: signed lead in ms (+ = shelf sensor first) and whether it corrected. */
+  chainSyncLastLeadMs?: number | null
+  chainSyncLastCorrected?: boolean
   /** DC drive: the longest timed jog the agent accepts, in ms. */
   jogMaxMs?: number
   /** Present on the frame emitted as a jog starts. */

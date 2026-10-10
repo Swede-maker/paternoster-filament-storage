@@ -1,7 +1,18 @@
 import type { NextRequest } from "next/server"
 import { sendCommand, isAllowedTarget } from "@/lib/server/pi-relay"
 import type { NodeCommand } from "@/lib/node-protocol"
-import { MAX_SENSOR_ARM_S, MIN_HOME_TIMEOUT_S, MAX_HOME_TIMEOUT_S } from "@/lib/filament"
+import {
+  MAX_SENSOR_ARM_S,
+  MIN_HOME_TIMEOUT_S,
+  MAX_HOME_TIMEOUT_S,
+  MIN_SHELF_TIMEOUT_S,
+  MAX_SHELF_TIMEOUT_S,
+  MIN_CHAIN_SYNC_TOLERANCE_MS,
+  MAX_CHAIN_SYNC_TOLERANCE_MS,
+  MIN_CHAIN_SYNC_MAX_WAIT_S,
+  MAX_CHAIN_SYNC_MAX_WAIT_S,
+  roundDcTrimPct,
+} from "@/lib/filament"
 
 export const runtime = "nodejs"
 export const dynamic = "force-dynamic"
@@ -74,6 +85,11 @@ function parseBaseCommand(body: unknown): NodeCommand | null {
         servoHoldTimeoutS?: unknown
         sensorArmS?: unknown
         homeTimeoutS?: unknown
+        shelfTimeoutS?: unknown
+        chainSyncEnabled?: unknown
+        chainSyncToleranceMs?: unknown
+        chainSyncMaxWaitS?: unknown
+        chainSyncShelfSide?: unknown
         positionMode?: unknown
         servoCarouselPulses?: unknown
         servoIndexWindowPulses?: unknown
@@ -108,8 +124,28 @@ function parseBaseCommand(body: unknown): NodeCommand | null {
       // be forwarded too, otherwise a reset never reaches the Pi.
       const trim = b.dcTrimPct
       if (typeof trim === "number" && Number.isFinite(trim) && Math.abs(trim) <= 20) {
-        cmd.dcTrimPct = Math.round(trim)
+        cmd.dcTrimPct = roundDcTrimPct(trim)
       }
+      if (typeof b.chainSyncEnabled === "boolean") cmd.chainSyncEnabled = b.chainSyncEnabled
+      const tol = b.chainSyncToleranceMs
+      if (
+        typeof tol === "number" &&
+        Number.isFinite(tol) &&
+        tol >= MIN_CHAIN_SYNC_TOLERANCE_MS &&
+        tol <= MAX_CHAIN_SYNC_TOLERANCE_MS
+      ) {
+        cmd.chainSyncToleranceMs = Math.round(tol)
+      }
+      const wait = b.chainSyncMaxWaitS
+      if (
+        typeof wait === "number" &&
+        Number.isFinite(wait) &&
+        wait >= MIN_CHAIN_SYNC_MAX_WAIT_S &&
+        wait <= MAX_CHAIN_SYNC_MAX_WAIT_S
+      ) {
+        cmd.chainSyncMaxWaitS = Math.round(wait * 10) / 10
+      }
+      if (b.chainSyncShelfSide === "a" || b.chainSyncShelfSide === "b") cmd.chainSyncShelfSide = b.chainSyncShelfSide
       // 0 is meaningful here (= hold for ever), so it is not a "positive int".
       const hold = b.servoHoldTimeoutS
       if (typeof hold === "number" && Number.isInteger(hold) && hold >= 0 && hold <= 86_400) {
@@ -127,6 +163,15 @@ function parseBaseCommand(body: unknown): NodeCommand | null {
         homeT <= MAX_HOME_TIMEOUT_S
       ) {
         cmd.homeTimeoutS = homeT
+      }
+      const shelfT = b.shelfTimeoutS
+      if (
+        typeof shelfT === "number" &&
+        Number.isFinite(shelfT) &&
+        shelfT >= MIN_SHELF_TIMEOUT_S &&
+        shelfT <= MAX_SHELF_TIMEOUT_S
+      ) {
+        cmd.shelfTimeoutS = shelfT
       }
       if (b.positionMode === "sensor" || b.positionMode === "pulses" || b.positionMode === "index")
         cmd.positionMode = b.positionMode
