@@ -272,6 +272,9 @@ BALANCE_CAL_MAX_TURNS = 10
 # fix a 25 % speed difference, so anything slower than that is a mechanical
 # problem, not a balance problem, and the run is cut.
 BALANCE_CAL_CATCH_UP_FRACTION = 0.25
+# The home sensor only fires once per lap during calibration, and the chains
+# start on the flag, so its silence guard must cover a whole lap plus slack.
+BALANCE_CAL_LAP_GUARD_MARGIN = 1.5
 BALANCE_CAL_CATCH_UP_FLOOR_S = 3.0
 # How often a long sensor wait re-checks for an emergency stop. Small enough to
 # feel instant to an operator, large enough not to spin the CPU.
@@ -523,6 +526,16 @@ SENSOR_INVERT = True
 HOMING_DIRECTION = "down"
 
 
+def home_travel_direction() -> str:
+    """
+    The carousel direction ("up"/"down") the homing sweep runs in. The balance
+    calibration defaults to the same direction so the operator sees both turn
+    the same way, and so a single shared balance is measured where it matters
+    most: on the homing pass that levels the chains.
+    """
+    return "up" if HOMING_DIRECTION == "down" else "down"
+
+
 # ==========================================================================
 # Persisted motor-drive selection
 # ==========================================================================
@@ -743,16 +756,29 @@ class RealHardware:
     # brushed motors never match for the same duty, so the FASTER bridge is
     # scaled down: negative trims A, positive trims B, 0 = equal duty.
     dc_trim_pct: float = 0.0
+    # Optional second balance for "up" travel (the homing direction). Gearboxes
+    # and brushes rarely drag the same amount both ways, so when
+    # `dc_trim_per_dir` is on, "down" uses dc_trim_pct and "up" uses this one.
+    dc_trim_up_pct: float = 0.0
+    dc_trim_per_dir: bool = False
 
     def _channels(self) -> tuple:
         """Motor indexes this backend owns: both, or just its twin-side motor."""
         mi = getattr(self, "motor_index", None)
         return (mi,) if mi in (0, 1) else (0, 1)
 
-    def _trim_scale(self, index: int) -> float:
+    def trim_for_direction(self, direction: str) -> float:
+        """The balance in force for carousel travel `direction` ("up"/"down")."""
+        if direction == "up" and self.dc_trim_per_dir:
+            return float(self.dc_trim_up_pct)
+        return float(self.dc_trim_pct)
+
+    def _trim_scale(self, index: int, forward: bool = True) -> float:
         if getattr(self, "motor_index", None) is not None:
             return 1.0  # balance only means something with two motors
-        t = max(-DC_TRIM_MAX_PCT, min(DC_TRIM_MAX_PCT, float(self.dc_trim_pct)))
+        # Bridge "forward" is carousel "down" (see Carousel._energise and jog).
+        t = self.trim_for_direction("down" if forward else "up")
+        t = max(-DC_TRIM_MAX_PCT, min(DC_TRIM_MAX_PCT, t))
         if index == 0 and t < 0:
             return 1.0 + t / 100.0
         if index == 1 and t > 0:
@@ -796,7 +822,7 @@ class RealHardware:
             bridge_forward = forward != bool(getattr(self, "reverse", False))
         else:
             bridge_forward = forward if (index == 0 or not self.mirror_b) else (not forward)
-        duty = max(0.0, min(1.0, float(speed) * self._trim_scale(index)))
+        duty = max(0.0, min(1.0, float(speed) * self._trim_scale(index, forward)))
         self.enables[index].on()  # re-arm in case an estop left the bridge disabled
         if bridge_forward:
             self.motors[index].forward(duty)
@@ -882,19 +908,41 @@ class RealHardware:
     def abort_jog(self) -> None:
         self._jog_abort = True
 
-    def set_servo_params(self, mirror_b=None, dc_trim_pct=None, **_: object) -> None:
+    def set_servo_params(
+        self, mirror_b=None, dc_trim_pct=None, dc_trim_up_pct=None, dc_trim_per_dir=None, **_: object
+    ) -> None:
         """
         Drive tuning from the app's `config`. The DC bridge cares about
         `mirror_b` and the PWM balance; pulses/rate are servo-only and ignored.
         """
         if mirror_b is not None:
             self.mirror_b = bool(mirror_b)
+        changed = False
         if dc_trim_pct is not None:
             new_trim = max(-DC_TRIM_MAX_PCT, min(DC_TRIM_MAX_PCT, float(dc_trim_pct)))
             if new_trim != self.dc_trim_pct:
                 self.dc_trim_pct = new_trim
+                changed = True
+        if dc_trim_up_pct is not None:
+            new_up = max(-DC_TRIM_MAX_PCT, min(DC_TRIM_MAX_PCT, float(dc_trim_up_pct)))
+            if new_up != self.dc_trim_up_pct:
+                self.dc_trim_up_pct = new_up
+                changed = True
+        if dc_trim_per_dir is not None and bool(dc_trim_per_dir) != self.dc_trim_per_dir:
+            self.dc_trim_per_dir = bool(dc_trim_per_dir)
+            changed = True
+        if changed:
+            if self.dc_trim_per_dir:
                 print(
-                    f"[agent] motor balance = {new_trim:+.1f} % "
+                    f"[agent] motor balance down = {self.dc_trim_pct:+.3f} % "
+                    f"(A x{self._trim_scale(0, True):.3f} / B x{self._trim_scale(1, True):.3f}), "
+                    f"up = {self.dc_trim_up_pct:+.3f} % "
+                    f"(A x{self._trim_scale(0, False):.3f} / B x{self._trim_scale(1, False):.3f})",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"[agent] motor balance = {self.dc_trim_pct:+.3f} % both directions "
                     f"(A x{self._trim_scale(0):.3f} / B x{self._trim_scale(1):.3f})",
                     flush=True,
                 )
@@ -910,6 +958,8 @@ class RealHardware:
             "mode": "dc",
             "mirrorB": self.mirror_b,
             "dcTrimPct": self.dc_trim_pct,
+            "dcTrimUpPct": self.dc_trim_up_pct,
+            "dcTrimPerDirection": self.dc_trim_per_dir,
             "jogMaxMs": DC_JOG_MAX_MS,
         }
 
@@ -1716,7 +1766,7 @@ class Carousel:
         # Set by the server to persist a fresh calibration.
         self.on_calibration: Optional[Callable[[dict], None]] = None
         # Set by the server to persist a trim found by the balance calibration.
-        self.on_balance: Optional[Callable[[float], None]] = None
+        self.on_balance: Optional[Callable[[float, str], None]] = None
         self.last_balance: Optional[dict] = None
 
         self._cmd: Optional[tuple] = None
@@ -1746,11 +1796,12 @@ class Carousel:
     def request_calibrate(self) -> None:
         self._set_command(("calibrate",))
 
-    def request_balance_calibrate(self, turns=None) -> None:
+    def request_balance_calibrate(self, turns=None, direction=None) -> None:
         n = BALANCE_CAL_DEFAULT_TURNS
         if isinstance(turns, (int, float)) and not isinstance(turns, bool):
             n = max(1, min(BALANCE_CAL_MAX_TURNS, int(turns)))
-        self._set_command(("balance_calibrate", n))
+        d = direction if direction in ("up", "down") else None
+        self._set_command(("balance_calibrate", n, d))
 
     def set_position_mode(self, mode) -> bool:
         if mode not in ("sensor", "pulses", "index"):
@@ -2033,9 +2084,14 @@ class Carousel:
         self.emit(self.last_balance)
         self.emit(self.snapshot())
 
-    def _do_balance_calibrate(self, turns: int) -> None:
+    def _do_balance_calibrate(self, turns: int, direction: Optional[str] = None) -> None:
         """
         Measure the two chains against each other and set the Motor balance.
+
+        `direction` is the carousel travel to run in ("up"/"down"); omitted =
+        the homing direction, so the calibration turns the same way homing
+        does. With per-direction balance on, only that direction's trim is
+        measured and replaced; otherwise the single shared trim is.
 
         Start condition: motor A's chain parked with the shelf flag in the shelf
         sensor and motor B's chain with the home flag in the home sensor (or the
@@ -2072,6 +2128,8 @@ class Carousel:
             return
 
         turns = max(1, min(BALANCE_CAL_MAX_TURNS, int(turns)))
+        direction = direction if direction in ("up", "down") else home_travel_direction()
+        per_dir = bool(getattr(hw, "dc_trim_per_dir", False))
         need = {shelf_idx: turns * self.shelves, home_idx: turns}
         counts = {0: 0, 1: 0}
         # Each sensor starts ON its flag, so the first thing it must see is the
@@ -2080,7 +2138,8 @@ class Carousel:
         was_on = {shelf_idx: True, home_idx: True}
         finished_at = {0: None, 1: None}
         held: Optional[int] = None
-        prev_trim = float(getattr(hw, "dc_trim_pct", 0.0) or 0.0)
+        trim_for = getattr(hw, "trim_for_direction", None)
+        prev_trim = float(trim_for(direction) if trim_for else getattr(hw, "dc_trim_pct", 0.0) or 0.0)
         duty = self.move_speed
 
         def sensor(idx: int) -> bool:
@@ -2088,7 +2147,7 @@ class Carousel:
 
         def progress(message: str) -> None:
             self.emit(self._balance_frame(
-                "running", message, turns=turns,
+                "running", message, turns=turns, direction=direction,
                 lapsA=counts[0] // (self.shelves if shelf_idx == 0 else 1),
                 lapsB=counts[1] // (self.shelves if shelf_idx == 1 else 1),
                 previousTrimPct=prev_trim,
@@ -2097,24 +2156,32 @@ class Carousel:
         self.status = "calibrating"
         self.emit(self.snapshot())
         print(
-            f"[agent] balance calibration: {turns} turn(s) at duty {duty:.2f}, current trim {prev_trim:+.3f} %, "
+            f"[agent] balance calibration: {turns} turn(s) {direction} at duty {duty:.2f}, "
+            f"current trim {prev_trim:+.3f} % ({'per-direction' if per_dir else 'shared'}), "
             f"shelf sensor on motor {shelf_motor}",
             flush=True,
         )
-        progress(f"Both motors running {turns} turn{'s' if turns != 1 else ''} at Motor speed…")
+        progress(f"Both motors running {turns} turn{'s' if turns != 1 else ''} {direction} at Motor speed…")
 
         # Soft start handled inline so no sensor edge is missed during the ramp.
         ramp = self._ramp_seconds()
         floor = min(MIN_DUTY, duty)
         t0 = time.monotonic()
-        self._energise("down", floor if ramp > 0 else duty)
+        self._energise(direction, floor if ramp > 0 else duty)
         last_duty = floor if ramp > 0 else duty
         # Silence guards: a shelf flag must come at least once per shelf time,
         # a home flag once per lap. Scaled for the duty like the move's guard.
+        # Both chains start ON their flag, so the home sensor's first edge is a
+        # whole lap away. The homing time only has to cover the half lap homing
+        # needs on average, so it is far too short here; a lap is bounded by
+        # one shelf time per shelf, and the lap guard takes the longer of the two
+        # with a half-lap margin on top.
         scale = MOVE_SPEED / max(0.01, duty)
+        shelf_silence = self._shelf_timeout() * scale
+        lap_bound = max(self._home_timeout() * scale, shelf_silence * self.shelves)
         silence = {
-            shelf_idx: self._shelf_timeout() * scale + ramp,
-            home_idx: self._home_timeout() * scale + ramp,
+            shelf_idx: shelf_silence + ramp,
+            home_idx: lap_bound * BALANCE_CAL_LAP_GUARD_MARGIN + ramp,
         }
         last_edge = {0: t0, 1: t0}
         catch_up_deadline: Optional[float] = None
@@ -2124,7 +2191,9 @@ class Carousel:
             if self._abort.is_set():
                 hw.stop()
                 self.status = "idle"
-                self.last_balance = self._balance_frame("failed", "Balance calibration stopped.", turns=turns)
+                self.last_balance = self._balance_frame(
+                    "failed", "Balance calibration stopped.", turns=turns, direction=direction
+                )
                 self.emit(self.last_balance)
                 self.emit(self.snapshot())
                 return
@@ -2133,7 +2202,7 @@ class Carousel:
                 frac = min(1.0, (now - t0) / ramp)
                 step_duty = floor + (duty - floor) * frac
                 if step_duty - last_duty >= 0.005 or frac >= 1.0:
-                    self._energise("down", step_duty)
+                    self._energise(direction, step_duty)
                     last_duty = step_duty
 
             for idx in (0, 1):
@@ -2176,7 +2245,7 @@ class Carousel:
                     self._balance_fail(
                         f"Safety stop: the {name} sensor did not trigger for {now - last_edge[idx]:.0f} s "
                         f"while motor {'AB'[idx]} was running. Check the sensor and that the chain is not stuck.",
-                        turns=turns,
+                        turns=turns, direction=direction,
                     )
                     self.homed = False
                     return
@@ -2185,7 +2254,7 @@ class Carousel:
                     f"Safety stop: motor {'AB'[1 - held]} needed more than "
                     f"{BALANCE_CAL_CATCH_UP_FRACTION * 100:.0f} % longer than motor {'AB'[held]} to finish. "
                     "That is more than the balance can correct; check both chains and sensors.",
-                    turns=turns,
+                    turns=turns, direction=direction,
                 )
                 self.homed = False
                 return
@@ -2209,28 +2278,36 @@ class Carousel:
         new_trim = max(-DC_TRIM_MAX_PCT, min(DC_TRIM_MAX_PCT, ideal))
         clamped = abs(ideal) > DC_TRIM_MAX_PCT
         new_trim = round(new_trim, 3)
-        self.set_servo(dc_trim_pct=new_trim)
+        # Per-direction balance: an "up" run only touches the up trim. Shared
+        # balance (or a "down" run) replaces dc_trim_pct, which serves both ways.
+        store_up = per_dir and direction == "up"
+        if store_up:
+            self.set_servo(dc_trim_up_pct=new_trim)
+        else:
+            self.set_servo(dc_trim_pct=new_trim)
         if self.on_balance is not None:
             try:
-                self.on_balance(new_trim)
+                self.on_balance(new_trim, "up" if store_up else "down")
             except Exception as exc:  # pragma: no cover
                 print(f"[agent] could not persist balance: {exc}", flush=True)
         self.status = "idle"
         slower = "A" if t_a > t_b else "B"
         diff_ms = abs(t_a - t_b) * 1000.0
+        which = f"{direction} balance" if per_dir else "balance"
         if new_trim == 0:
-            verdict = "both chains ran equal: balance left at 0."
+            verdict = f"both chains ran equal: {which} left at 0."
         else:
-            verdict = f"balance set to {'A' if new_trim < 0 else 'B'} −{abs(new_trim):.3f} %."
+            verdict = f"{which} set to {'A' if new_trim < 0 else 'B'} −{abs(new_trim):.3f} %."
         message = (
-            f"Motor A {t_a:.3f} s, motor B {t_b:.3f} s over {turns} turn{'s' if turns != 1 else ''} "
+            f"Motor A {t_a:.3f} s, motor B {t_b:.3f} s over {turns} turn{'s' if turns != 1 else ''} {direction} "
             f"(motor {slower} slower by {diff_ms:.0f} ms): {verdict}"
             + (" The ideal value was beyond ±20 % and has been clamped; check the mechanics." if clamped else "")
             + " Home before the next move."
         )
         print(f"[agent] balance calibration: {message}", flush=True)
         self.last_balance = self._balance_frame(
-            "done", message, turns=turns, aMs=round(t_a * 1000.0, 1), bMs=round(t_b * 1000.0, 1),
+            "done", message, turns=turns, direction=direction,
+            aMs=round(t_a * 1000.0, 1), bMs=round(t_b * 1000.0, 1),
             previousTrimPct=prev_trim, trimPct=new_trim, clamped=clamped,
         )
         self.emit(self.last_balance)
@@ -2281,6 +2358,8 @@ class Carousel:
         ignore_alarm=None,
         dc_trim_pct=None,
         single_motor=None,
+        dc_trim_up_pct=None,
+        dc_trim_per_dir=None,
     ) -> None:
         """Forward drive tuning from the app's `config` to the live backend."""
         setter = getattr(self.hw, "set_servo_params", None)
@@ -2293,13 +2372,19 @@ class Carousel:
             ignore_alarm=ignore_alarm,
             dc_trim_pct=dc_trim_pct,
             single_motor=single_motor,
+            dc_trim_up_pct=dc_trim_up_pct,
+            dc_trim_per_dir=dc_trim_per_dir,
         )
-        if any(v is not None for v in (pulses_per_rev, max_pps, mirror_b, ignore_alarm, dc_trim_pct, single_motor)):
+        if any(v is not None for v in (
+            pulses_per_rev, max_pps, mirror_b, ignore_alarm, dc_trim_pct, single_motor, dc_trim_up_pct, dc_trim_per_dir
+        )):
             print(
                 f"[agent] drive set: ppr={getattr(self.hw, 'pulses_per_rev', '?')} "
                 f"max_pps={getattr(self.hw, 'max_pps', '?')} mirror_b={getattr(self.hw, 'mirror_b', '?')} "
                 f"ignore_alarm={getattr(self.hw, 'ignore_alarm', '?')} "
-                f"dc_trim_pct={getattr(self.hw, 'dc_trim_pct', '?')}",
+                f"dc_trim_pct={getattr(self.hw, 'dc_trim_pct', '?')} "
+                f"dc_trim_up_pct={getattr(self.hw, 'dc_trim_up_pct', '?')} "
+                f"per_dir={getattr(self.hw, 'dc_trim_per_dir', '?')}",
                 flush=True,
             )
 
@@ -2822,7 +2907,7 @@ class Carousel:
                 elif cmd[0] == "calibrate":
                     self._do_calibrate()
                 elif cmd[0] == "balance_calibrate":
-                    self._do_balance_calibrate(cmd[1])
+                    self._do_balance_calibrate(cmd[1], cmd[2] if len(cmd) > 2 else None)
                 elif cmd[0] == "jog":
                     self._do_jog(cmd[1], cmd[2], cmd[3], cmd[4] if len(cmd) > 4 else None)
             except Exception as exc:  # pragma: no cover - hardware faults
@@ -2919,7 +3004,7 @@ class Carousel:
         # The ramp is stepped from the sensor-watching loops below rather than by
         # the blocking `_drive`, so the motor is never accelerating with nobody
         # reading the index sensor. See `_await_stepping`.
-        home_direction = "up" if HOMING_DIRECTION == "down" else "down"
+        home_direction = home_travel_direction()
         home_target = self.homing_speed
         home_ramp = self._ramp_seconds()
         # Never start ABOVE the requested duty: at a homing setting below
@@ -3206,7 +3291,7 @@ class Carousel:
         datum; the shelf sensor plays no part in the stop.
 
         The index flag is still watched. Every time it passes the sensor the
-        odometer is corrected to the datum ON THE FLY — the move keeps going and
+        odometer is corrected to the datum ON THE FLY ��� the move keeps going and
         simply re-aims at the target on the corrected grid — so an odometer that
         is off by a fraction of a percent, or a calibration that is a few pulses
         short, can never accumulate into a shelf of error. The correction is
@@ -4131,8 +4216,11 @@ async def serve(args) -> None:
         "mirror_b": motor_conf.get("mirrorB", SERVO_MIRROR_B),
         "ignore_alarm": bool(motor_conf.get("ignoreAlarm", False)),
         "dc_trim_pct": float(motor_conf.get("dcTrimPct", 0.0) or 0.0),
+        "dc_trim_up_pct": float(motor_conf.get("dcTrimUpPct", 0.0) or 0.0),
+        "dc_trim_per_dir": bool(motor_conf.get("dcTrimPerDirection", False)),
         "single_motor": bool(motor_conf.get("singleMotor", False)),
     }
+    DC_ONLY_PARAMS = ("dc_trim_pct", "dc_trim_up_pct", "dc_trim_per_dir")
     # Per-carousel state (hold timeout, positioning, calibration). A normal Pi
     # has one carousel stored at the top level; twin mode (hardware only) keeps
     # one entry per side so each carousel keeps its own calibration.
@@ -4167,7 +4255,7 @@ async def serve(args) -> None:
             return SimHardware(shelves, motor_mode=mode), "started with --simulate"
         try:
             if mode == "servo":
-                params = {k: v for k, v in servo_params.items() if k != "dc_trim_pct"}
+                params = {k: v for k, v in servo_params.items() if k not in DC_ONLY_PARAMS}
                 if side:
                     params["single_motor"] = False
                 built = ServoHardware(**params, **twin_kw)
@@ -4184,6 +4272,8 @@ async def serve(args) -> None:
             else:
                 built = RealHardware(mirror_b=servo_params["mirror_b"], **twin_kw)
                 built.dc_trim_pct = servo_params["dc_trim_pct"]
+                built.dc_trim_up_pct = servo_params["dc_trim_up_pct"]
+                built.dc_trim_per_dir = servo_params["dc_trim_per_dir"]
                 # flush=True matters under systemd: stdout is a pipe, not a TTY, so
                 # Python block-buffers it and this line can sit unflushed indefinitely.
                 print(
@@ -4270,8 +4360,8 @@ async def serve(args) -> None:
             c.set_reverse(bool(saved.get("reverseDir", False)))
         c.on_calibration = lambda _info: persist_motor_conf()
 
-        def adopt_balance(pct: float) -> None:
-            servo_params["dc_trim_pct"] = float(pct)
+        def adopt_balance(pct: float, direction: str = "down") -> None:
+            servo_params["dc_trim_up_pct" if direction == "up" else "dc_trim_pct"] = float(pct)
             persist_motor_conf()
 
         c.on_balance = adopt_balance
@@ -4323,6 +4413,8 @@ async def serve(args) -> None:
             "mirrorB": servo_params["mirror_b"],
             "ignoreAlarm": bool(servo_params["ignore_alarm"]),
             "dcTrimPct": servo_params["dc_trim_pct"],
+            "dcTrimUpPct": servo_params["dc_trim_up_pct"],
+            "dcTrimPerDirection": bool(servo_params["dc_trim_per_dir"]),
             "singleMotor": bool(servo_params["single_motor"]),
             "twin": rt["twin"],
             **single_saved,
@@ -4337,7 +4429,7 @@ async def serve(args) -> None:
             "type": "hello",
             "name": args.name,
             "shelves": first.shelves,
-            "firmware": "pax-agent-1.6",
+            "firmware": "pax-agent-1.8",
             "role": args.role,
             "simulated": rt["sim_reason"] is not None,
             "simReason": rt["sim_reason"],
@@ -4464,6 +4556,12 @@ async def serve(args) -> None:
                         "dc_trim_pct": (
                             msg.get("dcTrimPct") if isinstance(msg.get("dcTrimPct"), (int, float)) else None
                         ),
+                        "dc_trim_up_pct": (
+                            msg.get("dcTrimUpPct") if isinstance(msg.get("dcTrimUpPct"), (int, float)) else None
+                        ),
+                        "dc_trim_per_dir": (
+                            msg.get("dcTrimPerDirection") if isinstance(msg.get("dcTrimPerDirection"), bool) else None
+                        ),
                         "single_motor": (
                             msg.get("servoSingleMotor") if isinstance(msg.get("servoSingleMotor"), bool) else None
                         ),
@@ -4471,7 +4569,8 @@ async def serve(args) -> None:
                     if rt["twin"]:
                         # Each twin side already owns exactly one motor.
                         servo_fields["single_motor"] = None
-                        servo_fields["dc_trim_pct"] = None
+                        for k in DC_ONLY_PARAMS:
+                            servo_fields[k] = None
                     for k, v in servo_fields.items():
                         if v is not None:
                             servo_params[k] = v
@@ -4518,7 +4617,7 @@ async def serve(args) -> None:
                 elif t == "calibrate":
                     carousel.request_calibrate()
                 elif t == "balance_calibrate":
-                    carousel.request_balance_calibrate(msg.get("turns"))
+                    carousel.request_balance_calibrate(msg.get("turns"), msg.get("direction"))
                 elif t == "release":
                     carousel.request_release()
                 elif t == "hold":
