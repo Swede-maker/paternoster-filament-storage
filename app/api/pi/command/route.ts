@@ -70,6 +70,7 @@ function parseBaseCommand(body: unknown): NodeCommand | null {
         servoSingleMotor?: unknown
         reverseDir?: unknown
         servoIgnoreAlarm?: unknown
+        dcTrimPct?: unknown
         servoHoldTimeoutS?: unknown
         sensorArmS?: unknown
         homeTimeoutS?: unknown
@@ -103,6 +104,12 @@ function parseBaseCommand(body: unknown): NodeCommand | null {
       if (typeof b.servoSingleMotor === "boolean") cmd.servoSingleMotor = b.servoSingleMotor
       if (typeof b.reverseDir === "boolean") cmd.reverseDir = b.reverseDir
       if (typeof b.servoIgnoreAlarm === "boolean") cmd.servoIgnoreAlarm = b.servoIgnoreAlarm
+      // Motor balance (DC): -20..+20 %. 0 is meaningful (= equal duty) and must
+      // be forwarded too, otherwise a reset never reaches the Pi.
+      const trim = b.dcTrimPct
+      if (typeof trim === "number" && Number.isFinite(trim) && Math.abs(trim) <= 20) {
+        cmd.dcTrimPct = Math.round(trim)
+      }
       // 0 is meaningful here (= hold for ever), so it is not a "positive int".
       const hold = b.servoHoldTimeoutS
       if (typeof hold === "number" && Number.isInteger(hold) && hold >= 0 && hold <= 86_400) {
