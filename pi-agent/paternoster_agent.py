@@ -243,6 +243,25 @@ SERVO_TIMEOUT_SCALE = 2.0
 # HOME_TIMEOUT × the scale above (30 s DC / 60 s servo). Bounds below.
 HOME_TIMEOUT_MIN_S = 5.0
 HOME_TIMEOUT_MAX_S = 600.0
+# Motor drive → "Shelf timeout" (config.shelfTimeoutS). Replaces the
+# PULSE_TIMEOUT × drive-scale base of the move's jam guard; speed scaling, ramp
+# and Safe move time are still added on top.
+SHELF_TIMEOUT_MIN_S = 2.0
+SHELF_TIMEOUT_MAX_S = 300.0
+# Motor drive → "Auto-correct chains at shelf 1" (DC, two bridges). Shelf 1
+# carries both the shelf flag and the home flag, so the two sensors should fire
+# together as it passes. If one leads the other by more than the tolerance, the
+# leading side's bridge is paused until the lagging sensor fires.
+CHAIN_SYNC_DEFAULT_TOLERANCE_MS = 150.0
+CHAIN_SYNC_MAX_TOLERANCE_MS = 5000.0
+# Longest a paused bridge waits for the other sensor before the move is cut
+# with a safety-stop fault, so a dead sensor or a stuck chain can never leave
+# the carousel driving on one chain for a lap. The chains are then out of level
+# and the operator must jog them straight and re-home. Operator-adjustable per
+# carousel ("Safety stop after"); this is the default and the allowed range.
+CHAIN_SYNC_MAX_WAIT_S = 3.0
+CHAIN_SYNC_MIN_WAIT_S = 0.5
+CHAIN_SYNC_MAX_WAIT_LIMIT_S = 60.0
 # How often a long sensor wait re-checks for an emergency stop. Small enough to
 # feel instant to an operator, large enough not to spin the CPU.
 ABORT_POLL_SECONDS = 0.02
@@ -795,6 +814,22 @@ class RealHardware:
                 if en is not None:
                     en.off()
 
+    def can_chain_sync(self) -> bool:
+        """Two bridges owned by this process: the chain-sync pause has a motor to hold."""
+        return getattr(self, "motor_index", None) is None and all(m is not None for m in self.motors)
+
+    def hold_one(self, index: int) -> None:
+        """Pause ONE bridge (coast) while the other keeps driving; the enable stays armed."""
+        with self._motor_lock:
+            m = self.motors[index]
+            if m is not None:
+                m.stop()
+
+    def release_one(self, index: int, forward: bool, speed: float) -> None:
+        """Run a paused bridge again at the current duty, in the carousel's `forward` sense."""
+        with self._motor_lock:
+            self._drive_one(index, forward, speed)
+
     def _close_motor(self) -> None:
         self.stop()  # leave both bridges disarmed on exit
         for dev in (*self.motors, *self.enables):
@@ -848,8 +883,8 @@ class RealHardware:
             if new_trim != self.dc_trim_pct:
                 self.dc_trim_pct = new_trim
                 print(
-                    f"[agent] motor balance = {new_trim:+.0f} % "
-                    f"(A x{self._trim_scale(0):.2f} / B x{self._trim_scale(1):.2f})",
+                    f"[agent] motor balance = {new_trim:+.1f} % "
+                    f"(A x{self._trim_scale(0):.3f} / B x{self._trim_scale(1):.3f})",
                     flush=True,
                 )
 
@@ -1624,6 +1659,13 @@ class Carousel:
         self.sensor_arm_s = 0.0
         # Operator-set homing time; None = drive default (HOME_TIMEOUT × scale).
         self.home_timeout_s: Optional[float] = None
+        self.shelf_timeout_s: Optional[float] = None
+        self.chain_sync_enabled = False
+        self.chain_sync_tolerance_ms = CHAIN_SYNC_DEFAULT_TOLERANCE_MS
+        self.chain_sync_max_wait_s = CHAIN_SYNC_MAX_WAIT_S
+        self.chain_sync_shelf_side = "a"
+        self._chain_sync_last_lead_ms: Optional[float] = None
+        self._chain_sync_last_corrected = False
         self._idle_since: Optional[float] = None
 
         # How a `goto` finds its shelf. "sensor": count shelf-flag edges (the
@@ -1644,6 +1686,10 @@ class Carousel:
         # sensor-mode moves (servo only, when not calibrated) so the distance
         # bounce filter has a yardstick before the first calibration.
         self._learned_pitch_pulses: Optional[float] = None
+        # Seconds between two consecutive counted shelf flags at cruise, learned
+        # from every multi-shelf move. Used to keep SAFE MOVE TIME shorter than
+        # one shelf pitch so the blind window can never swallow whole shelves.
+        self._learned_pitch_s: Optional[float] = None
         self.last_sync_drift: Optional[int] = None
         # Set by the server to persist a fresh calibration.
         self.on_calibration: Optional[Callable[[dict], None]] = None
@@ -1860,6 +1906,94 @@ class Carousel:
             return self.home_timeout_s
         return HOME_TIMEOUT * self._timeout_scale()
 
+    def set_shelf_timeout(self, seconds) -> bool:
+        """Shelf timeout: base seconds without a shelf flag before a move faults. None/0 = drive default."""
+        if seconds is None:
+            return False
+        try:
+            raw = float(seconds)
+        except (TypeError, ValueError):
+            return False
+        value: Optional[float] = None if raw <= 0 else round(max(SHELF_TIMEOUT_MIN_S, min(SHELF_TIMEOUT_MAX_S, raw)), 1)
+        if value == self.shelf_timeout_s:
+            return False
+        self.shelf_timeout_s = value
+        print(f"[agent] shelf timeout = {value if value is not None else 'drive default'} s", flush=True)
+        return True
+
+    def set_chain_sync(self, enabled=None, tolerance_ms=None, shelf_side=None, max_wait_s=None) -> bool:
+        """Chain sync at shelf 1: on/off, allowed lead in ms, safety-stop wait in s, which bridge carries the shelf sensor."""
+        changed = False
+        if isinstance(enabled, bool) and enabled != self.chain_sync_enabled:
+            self.chain_sync_enabled = enabled
+            changed = True
+        if isinstance(tolerance_ms, (int, float)) and not isinstance(tolerance_ms, bool):
+            tol = float(max(0.0, min(CHAIN_SYNC_MAX_TOLERANCE_MS, float(tolerance_ms))))
+            if tol != self.chain_sync_tolerance_ms:
+                self.chain_sync_tolerance_ms = tol
+                changed = True
+        if isinstance(max_wait_s, (int, float)) and not isinstance(max_wait_s, bool):
+            wait = float(max(CHAIN_SYNC_MIN_WAIT_S, min(CHAIN_SYNC_MAX_WAIT_LIMIT_S, float(max_wait_s))))
+            if wait != self.chain_sync_max_wait_s:
+                self.chain_sync_max_wait_s = wait
+                changed = True
+        if shelf_side in ("a", "b") and shelf_side != self.chain_sync_shelf_side:
+            self.chain_sync_shelf_side = shelf_side
+            changed = True
+        if changed:
+            print(
+                f"[agent] chain sync = {'on' if self.chain_sync_enabled else 'off'}, "
+                f"tolerance {self.chain_sync_tolerance_ms:.0f} ms, safety stop after "
+                f"{self.chain_sync_max_wait_s:.1f} s, shelf sensor on motor "
+                f"{self.chain_sync_shelf_side.upper()}",
+                flush=True,
+            )
+        return changed
+
+    def _chain_sync_hw(self):
+        """The hardware to pause per bridge, or None when sync is off or the drive cannot do it."""
+        if not self.chain_sync_enabled:
+            return None
+        hw = self.hw
+        can = getattr(hw, "can_chain_sync", None)
+        if can is None or not can() or not hasattr(hw, "hold_one") or not hasattr(hw, "index_active"):
+            return None
+        return hw
+
+    def _chain_sync_safety_stop(self, paused: int, shelf_idx: int, waited_s: float) -> None:
+        """
+        Cut both bridges after a chain-sync wait ran out. `paused` is the bridge
+        that was held; the other one kept driving and its sensor never fired.
+        The carousel is now out of level by an unknown amount and the shelf
+        count on the running chain is no longer trustworthy, so the position is
+        dropped and a re-home is required before the next automatic move.
+        """
+        self.hw.stop()
+        self.status = "idle"
+        self.homed = False
+        self._chain_sync_last_corrected = True
+        if self._abort.is_set():
+            return
+        running = "B" if paused == 0 else "A"
+        silent = "shelf" if paused != shelf_idx else "home"
+        print(f"[agent] chain sync: {silent} sensor silent for {waited_s:.1f} s, SAFETY STOP", flush=True)
+        self.emit({
+            "type": "fault",
+            "message": (
+                f"Chain sync safety stop: the {silent} sensor did not trigger within "
+                f"{self.chain_sync_max_wait_s:g} s while motor {running} drove alone to catch up. "
+                f"Check that the {silent} sensor is working and that motor {running}'s chain is "
+                f"not stuck, then level the chains by hand (Jog) and Home before moving again."
+            ),
+        })
+        self.emit(self.snapshot())
+
+    def _shelf_timeout(self) -> float:
+        """Effective shelf-timeout base: the operator's value, else PULSE_TIMEOUT × drive scale."""
+        if self.shelf_timeout_s is not None:
+            return self.shelf_timeout_s
+        return PULSE_TIMEOUT * self._timeout_scale()
+
     def set_hold_timeout(self, seconds) -> None:
         if seconds is None:
             return
@@ -1930,6 +2064,11 @@ class Carousel:
             snap["holdTimeoutS"] = self.hold_timeout_s
         if snap:
             snap["homeTimeoutS"] = round(self._home_timeout(), 1)
+            snap["shelfTimeoutS"] = round(self._shelf_timeout(), 1)
+            snap["chainSyncLastLeadMs"] = (
+                None if self._chain_sync_last_lead_ms is None else round(self._chain_sync_last_lead_ms)
+            )
+            snap["chainSyncLastCorrected"] = self._chain_sync_last_corrected
         return snap
 
     def set_motion(self, move_speed=None, homing_speed=None, ramp_pct=None,
@@ -3149,6 +3288,18 @@ class Carousel:
         ramp_seconds = 0.0 if steps <= 1 else self._ramp_seconds()
         ramp_started = time.monotonic()
 
+        # SAFE MOVE TIME must be shorter than one shelf pitch, or the flags that
+        # pass while the sensor is blind are simply never counted and the move
+        # overshoots by that many shelves (a 10 s window left over from a
+        # geared servo setup made a DC carousel go 3 shelves for a 1-shelf goto).
+        # Once a pitch time has been learned, cap the window at half of it.
+        arm_s = max(0.0, self.sensor_arm_s)
+        if self._learned_pitch_s and arm_s > 0.5 * self._learned_pitch_s:
+            capped = round(0.5 * self._learned_pitch_s, 1)
+            print(f"[agent] safe move time {arm_s:.1f}s exceeds half a shelf pitch "
+                  f"({self._learned_pitch_s:.1f}s); using {capped:.1f}s for this move", flush=True)
+            arm_s = capped
+
         # NO RAMP MEANS FULL REQUESTED DUTY IMMEDIATELY — not a crawl.
         #
         # This branch is essential, not a shortcut. Opening at `ramp_floor`
@@ -3192,6 +3343,33 @@ class Carousel:
         # already have moved back into the window.
         seen_inactive = not parked_on_flag
 
+        # CHAIN SYNC at shelf 1. `home_leg` is True while the shelf about to be
+        # counted is shelf 0 (the one carrying the home flag). That leg is driven
+        # at Approach speed and the two sensors are timed against each other:
+        # whichever fires first starts a lead clock; past the tolerance its
+        # bridge is held until the other sensor fires. `sync_paused` is the held
+        # bridge index while a correction is in progress.
+        sync_hw = self._chain_sync_hw()
+        shelf_idx = 0 if self.chain_sync_shelf_side == "a" else 1
+        home_idx = 1 - shelf_idx
+        home_leg = sync_hw is not None and (self.current_shelf + step) % self.shelves == 0
+        sync_shelf_t: Optional[float] = None
+        sync_home_t: Optional[float] = None
+        sync_paused: Optional[int] = None
+        sync_pause_started = 0.0
+        sync_recorded = False
+        # The watch outlives the count: once the shelf sensor has fired, shelf 1
+        # is counted and the leg moves on, but the home sensor may still be a
+        # few hundred ms away. `sync_active` keeps the watch (and the Approach
+        # speed) going until both sensors have fired or the wait is given up.
+        sync_active = home_leg
+        sync_blind_until = ramp_started + arm_s
+        home_was_active = bool(sync_hw.index_active()) if sync_hw is not None else False
+        leg_target = approach if home_leg else cruise
+        if home_leg and speed > approach:
+            self._energise(direction, approach)
+            speed = approach
+
         # ------------------------------------------------------------------
         # RUNAWAY STOP — the only guard, and the only use of a clock here.
         #
@@ -3206,7 +3384,7 @@ class Carousel:
         # takes longer to reach the next shelf.
         # ------------------------------------------------------------------
         silence_limit = (
-            PULSE_TIMEOUT * self._timeout_scale() * (MOVE_SPEED / max(0.01, cruise)) + self._ramp_seconds()
+            self._shelf_timeout() * (MOVE_SPEED / max(0.01, cruise)) + self._ramp_seconds()
         )
         # SAFE MOVE TIME blinds the sensor for its whole duration: every edge is
         # discarded below and `last_activity` is never refreshed. Homing already
@@ -3215,7 +3393,7 @@ class Carousel:
         # tripped "Jam? No shelf pulse" a few seconds into every goto while the
         # sensors were still, by design, switched off. The silence clock only
         # has meaning once the sensor is allowed to speak, so start it then.
-        silence_limit += max(0.0, self.sensor_arm_s)
+        silence_limit += arm_s
         last_trigger = time.monotonic()
         # The runaway guard is reset by ANY sensor activity, including edges the
         # distance filter rejects — a bouncing sensor is a live sensor.
@@ -3259,9 +3437,9 @@ class Carousel:
             # changeover below had just set — `approach` is deliberately lower
             # than `cruise`, so `speed < cruise` stays true and the ramp would
             # undo the one thing that keeps the coast short.
-            if ramp_seconds > 0 and speed < cruise and not on_final_approach:
+            if ramp_seconds > 0 and speed < leg_target and not on_final_approach and not home_leg:
                 frac = (time.monotonic() - ramp_started) / ramp_seconds
-                target_duty = cruise if frac >= 1.0 else ramp_floor + (cruise - ramp_floor) * frac
+                target_duty = leg_target if frac >= 1.0 else ramp_floor + (leg_target - ramp_floor) * frac
                 if target_duty > speed:
                     self._energise(direction, target_duty)
                     speed = target_duty
@@ -3279,7 +3457,7 @@ class Carousel:
             # the target flag triggers. The stop itself is still instant on that
             # trigger; only the run-up to it is softened, which is why this adds no
             # overshoot.
-            if on_final_approach and decel_started is not None and speed > approach:
+            if (on_final_approach or home_leg) and decel_started is not None and speed > approach:
                 if decel_seconds <= 0:
                     target_duty = approach
                 else:
@@ -3324,7 +3502,7 @@ class Carousel:
             # are discarded and the window is treated as occupied, so a flag in
             # front of the sensor when the time runs out must still leave and the
             # NEXT one enter before it counts.
-            if self.sensor_arm_s > 0 and time.monotonic() - ramp_started < self.sensor_arm_s:
+            if arm_s > 0 and time.monotonic() - ramp_started < arm_s:
                 pulsed = False
                 active = True
                 seen_inactive = False
@@ -3416,6 +3594,69 @@ class Carousel:
                 time.sleep(POLL)
                 continue
 
+            if sync_active and sync_hw is not None and time.monotonic() >= sync_blind_until:
+                now_s = time.monotonic()
+                home_now = bool(sync_hw.index_active())
+                if home_now and not home_was_active and sync_home_t is None:
+                    sync_home_t = now_s
+                home_was_active = home_now
+                if triggered and sync_shelf_t is None:
+                    sync_shelf_t = now_s
+
+                if sync_paused is None:
+                    lead_s, leader = None, None
+                    if sync_shelf_t is not None and sync_home_t is None:
+                        lead_s, leader = now_s - sync_shelf_t, shelf_idx
+                    elif sync_home_t is not None and sync_shelf_t is None:
+                        lead_s, leader = now_s - sync_home_t, home_idx
+                    if lead_s is not None and lead_s * 1000.0 >= self.chain_sync_tolerance_ms:
+                        sync_paused = leader
+                        sync_pause_started = now_s
+                        sync_hw.hold_one(leader)
+                        self._chain_sync_last_corrected = True
+                        print(
+                            f"[agent] chain sync: {'shelf' if leader == shelf_idx else 'home'} sensor leads by "
+                            f"{lead_s * 1000:.0f} ms, holding motor {'A' if leader == 0 else 'B'}",
+                            flush=True,
+                        )
+                else:
+                    other_fired = (sync_home_t is not None) if sync_paused == shelf_idx else (sync_shelf_t is not None)
+                    waited = now_s - sync_pause_started
+                    if other_fired:
+                        sync_hw.release_one(sync_paused, direction != "up", speed)
+                        sync_paused = None
+                        last_activity = now_s
+                    elif waited > self.chain_sync_max_wait_s:
+                        # Safety stop. One chain has been driving alone and the
+                        # lagging sensor never fired: either it is dead or that
+                        # chain is stuck. Running on would wind the carousel out
+                        # of level, so cut both bridges and report it.
+                        self._chain_sync_safety_stop(
+                            paused=sync_paused, shelf_idx=shelf_idx, waited_s=waited
+                        )
+                        return
+
+                if not sync_recorded and sync_shelf_t is not None and sync_home_t is not None:
+                    sync_recorded = True
+                    sync_active = False
+                    self._chain_sync_last_lead_ms = (sync_home_t - sync_shelf_t) * 1000.0
+                    print(
+                        f"[agent] chain sync: shelf 1 passed, lead {self._chain_sync_last_lead_ms:+.0f} ms "
+                        f"({'corrected' if self._chain_sync_last_corrected else 'within tolerance'})",
+                        flush=True,
+                    )
+
+                if not sync_active and not home_leg and not on_final_approach and speed < cruise:
+                    # Shelf 1 was counted earlier while the sync was still
+                    # pending; now that it is settled, ramp back up to cruise.
+                    leg_target = cruise
+                    decel_started = None
+                    ramp_floor = speed
+                    ramp_started = now_s
+                    if ramp_seconds <= 0:
+                        self._energise(direction, cruise)
+                        speed = cruise
+
             if triggered:
                 now = time.monotonic()
                 # Time to cross the pitch just travelled — the interval since the
@@ -3428,12 +3669,50 @@ class Carousel:
                     last_pitch_time = pitch_time
                     if odo_now is not None and last_odo is not None and not self.carousel_pulses:
                         self._learned_pitch_pulses = abs(odo_now - last_odo)
+                    # Only shelf-to-shelf intervals teach the pitch time; the
+                    # first count is measured from standstill through the ramp
+                    # and the blind window, so it says nothing about cruise.
+                    # A slowed shelf-1 leg (or the re-acceleration after it) is
+                    # not a cruise pitch; keep it out of the learned average.
+                    if 0.2 < pitch_time < 120 and speed >= cruise:
+                        prev = self._learned_pitch_s
+                        self._learned_pitch_s = pitch_time if prev is None else 0.7 * prev + 0.3 * pitch_time
                 last_odo = odo_now
                 counted += 1
                 last_trigger = now
                 last_activity = now
 
                 if counted >= steps:
+                    if home_leg and sync_hw is not None and sync_home_t is None:
+                        # Parking on shelf 1 with the shelf sensor first: the
+                        # shelf side is where it should be, so hold it and let
+                        # the home side catch up until its flag arrives.
+                        sync_hw.hold_one(shelf_idx)
+                        if sync_paused == home_idx:
+                            sync_hw.release_one(home_idx, direction != "up", speed)
+                        wait_started = time.monotonic()
+                        while not self._abort.is_set():
+                            home_now = bool(sync_hw.index_active())
+                            if home_now and not home_was_active:
+                                sync_home_t = time.monotonic()
+                                break
+                            home_was_active = home_now
+                            waited = time.monotonic() - wait_started
+                            if waited > self.chain_sync_max_wait_s:
+                                # The home chain ran on alone and its flag never
+                                # came. Do not report "arrived": the shelf side
+                                # is parked but the other side is somewhere else.
+                                self._chain_sync_safety_stop(
+                                    paused=shelf_idx, shelf_idx=shelf_idx, waited_s=waited
+                                )
+                                return
+                            time.sleep(POLL)
+                        if sync_home_t is not None and sync_shelf_t is not None:
+                            self._chain_sync_last_lead_ms = (sync_home_t - sync_shelf_t) * 1000.0
+                            self._chain_sync_last_corrected = (
+                                self._chain_sync_last_corrected
+                                or self._chain_sync_last_lead_ms >= self.chain_sync_tolerance_ms
+                            )
                     # THIS IS THE TARGET. Cut power immediately, before any
                     # bookkeeping, while the flag is still in the window.
                     self.hw.stop()
@@ -3469,6 +3748,45 @@ class Carousel:
 
                 self.current_shelf = (self.current_shelf + step) % self.shelves
                 self.emit({"type": "pos", "shelf": self.current_shelf})
+
+                if sync_hw is not None:
+                    if sync_paused is not None:
+                        # Never carry a held bridge into the next leg.
+                        sync_hw.release_one(sync_paused, direction != "up", speed)
+                        sync_paused = None
+                    next_is_home = (self.current_shelf + step) % self.shelves == 0
+                    if home_leg and not next_is_home:
+                        # Shelf 1 is counted. Ramp back up to cruise now if both
+                        # sensors have fired; otherwise the watch above does it
+                        # once the home sensor has caught up.
+                        home_leg = False
+                        if not sync_active:
+                            leg_target = cruise
+                            if not on_final_approach:
+                                decel_started = None
+                                ramp_floor = speed
+                                ramp_started = now
+                                if ramp_seconds <= 0 and speed < cruise:
+                                    self._energise(direction, cruise)
+                                    speed = cruise
+                    elif next_is_home and not home_leg:
+                        # Shelf 1 is next: ease down to Approach and start timing.
+                        home_leg = True
+                        sync_active = True
+                        leg_target = approach
+                        self._chain_sync_last_corrected = False
+                        if not on_final_approach and approach < speed:
+                            decel_from = speed
+                            decel_started = now
+                            decel_seconds = min(self._ramp_seconds(), DECEL_LEG_FRACTION * pitch_time)
+                            if decel_seconds <= 0:
+                                self._energise(direction, approach)
+                                speed = approach
+                    if home_leg and next_is_home:
+                        sync_shelf_t = None
+                        sync_home_t = None
+                        sync_recorded = False
+                        home_was_active = bool(sync_hw.index_active())
 
             # Checked on EVERY pass, deliberately outside the if/elif above.
             # As an `elif` it was unreachable in the one case it exists for: a
@@ -3572,6 +3890,11 @@ async def serve(args) -> None:
         "holdTimeoutS": motor_conf.get("holdTimeoutS", SERVO_HOLD_TIMEOUT_S),
         "sensorArmS": motor_conf.get("sensorArmS", 0),
         "homeTimeoutS": motor_conf.get("homeTimeoutS"),
+        "shelfTimeoutS": motor_conf.get("shelfTimeoutS"),
+        "chainSyncEnabled": motor_conf.get("chainSyncEnabled"),
+        "chainSyncToleranceMs": motor_conf.get("chainSyncToleranceMs"),
+        "chainSyncMaxWaitS": motor_conf.get("chainSyncMaxWaitS"),
+        "chainSyncShelfSide": motor_conf.get("chainSyncShelfSide"),
         "positionMode": motor_conf.get("positionMode"),
         "calibration": motor_conf.get("calibration"),
     }
@@ -3684,6 +4007,13 @@ async def serve(args) -> None:
         c.set_hold_timeout(saved.get("holdTimeoutS", SERVO_HOLD_TIMEOUT_S))
         c.set_sensor_arm(saved.get("sensorArmS", 0))
         c.set_home_timeout(saved.get("homeTimeoutS"))
+        c.set_shelf_timeout(saved.get("shelfTimeoutS"))
+        c.set_chain_sync(
+            enabled=saved.get("chainSyncEnabled"),
+            tolerance_ms=saved.get("chainSyncToleranceMs"),
+            max_wait_s=saved.get("chainSyncMaxWaitS"),
+            shelf_side=saved.get("chainSyncShelfSide"),
+        )
         c.set_position_mode(saved.get("positionMode"))
         c.restore_calibration(saved.get("calibration"))
         if side:
@@ -3711,7 +4041,13 @@ async def serve(args) -> None:
         return {
             "holdTimeoutS": c.hold_timeout_s,
             "sensorArmS": c.sensor_arm_s,
+            "shelfPitchS": c._learned_pitch_s,
             "homeTimeoutS": c.home_timeout_s,
+            "shelfTimeoutS": c.shelf_timeout_s,
+            "chainSyncEnabled": c.chain_sync_enabled,
+            "chainSyncToleranceMs": c.chain_sync_tolerance_ms,
+            "chainSyncMaxWaitS": c.chain_sync_max_wait_s,
+            "chainSyncShelfSide": c.chain_sync_shelf_side,
             "positionMode": c.position_mode,
             "calibration": c.calibration_info,
             "reverseDir": c.reverse_dir,
@@ -3891,6 +4227,16 @@ async def serve(args) -> None:
                     home_t = msg.get("homeTimeoutS")
                     home_changed = (isinstance(home_t, (int, float)) and not isinstance(home_t, bool)
                                     and carousel.set_home_timeout(home_t))
+                    shelf_t = msg.get("shelfTimeoutS")
+                    shelf_changed = (isinstance(shelf_t, (int, float)) and not isinstance(shelf_t, bool)
+                                     and carousel.set_shelf_timeout(shelf_t))
+                    sync_changed = carousel.set_chain_sync(
+                        enabled=msg.get("chainSyncEnabled"),
+                        tolerance_ms=msg.get("chainSyncToleranceMs"),
+                        max_wait_s=msg.get("chainSyncMaxWaitS"),
+                        shelf_side=msg.get("chainSyncShelfSide"),
+                    )
+                    home_changed = home_changed or shelf_changed or sync_changed
                     reverse_changed = bool(side) and carousel.set_reverse(msg.get("reverseDir"))
                     mode_changed = (carousel.set_position_mode(msg.get("positionMode")) or reverse_changed
                                     or arm_changed or home_changed)
@@ -3950,7 +4296,7 @@ async def serve(args) -> None:
             # viewer leaves, and a dev-server restart drops it abruptly (which
             # surfaces as ConnectionClosedError "no close frame received or
             # sent"). Either way the app reconnects on its own, so stay quiet and
-            # keep serving — the motor state lives in `carousel`, not the socket.
+            # keep serving ��� the motor state lives in `carousel`, not the socket.
             pass
         finally:
             clients.discard(ws)
