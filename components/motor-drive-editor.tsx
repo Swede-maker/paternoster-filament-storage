@@ -320,7 +320,8 @@ export function MotorDriveEditor({ node }: { node: StorageNode }) {
                       id={`chain-wait-${node.id}`}
                       min={MIN_CHAIN_SYNC_MAX_WAIT_S}
                       max={MAX_CHAIN_SYNC_MAX_WAIT_S}
-                      step={0.5}
+                      integer={false}
+                      step={0.1}
                       unit="s"
                       value={chainSyncWait}
                       disabled={busy}
