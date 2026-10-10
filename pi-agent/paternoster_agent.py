@@ -844,7 +844,14 @@ class RealHardware:
         if mirror_b is not None:
             self.mirror_b = bool(mirror_b)
         if dc_trim_pct is not None:
-            self.dc_trim_pct = max(-DC_TRIM_MAX_PCT, min(DC_TRIM_MAX_PCT, float(dc_trim_pct)))
+            new_trim = max(-DC_TRIM_MAX_PCT, min(DC_TRIM_MAX_PCT, float(dc_trim_pct)))
+            if new_trim != self.dc_trim_pct:
+                self.dc_trim_pct = new_trim
+                print(
+                    f"[agent] motor balance = {new_trim:+.0f} % "
+                    f"(A x{self._trim_scale(0):.2f} / B x{self._trim_scale(1):.2f})",
+                    flush=True,
+                )
 
     def servo_snapshot(self) -> Optional[dict]:
         """
@@ -3189,6 +3196,14 @@ class Carousel:
         silence_limit = (
             PULSE_TIMEOUT * self._timeout_scale() * (MOVE_SPEED / max(0.01, cruise)) + self._ramp_seconds()
         )
+        # SAFE MOVE TIME blinds the sensor for its whole duration: every edge is
+        # discarded below and `last_activity` is never refreshed. Homing already
+        # adds the arm time to its timeout; the move did not, so with a Safe move
+        # time longer than this limit (10 s vs ~4 s at full duty) the guard
+        # tripped "Jam? No shelf pulse" a few seconds into every goto while the
+        # sensors were still, by design, switched off. The silence clock only
+        # has meaning once the sensor is allowed to speak, so start it then.
+        silence_limit += max(0.0, self.sensor_arm_s)
         last_trigger = time.monotonic()
         # The runaway guard is reset by ANY sensor activity, including edges the
         # distance filter rejects — a bouncing sensor is a live sensor.
