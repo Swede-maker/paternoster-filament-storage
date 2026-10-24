@@ -245,6 +245,7 @@ ESP32_PING_S = 0.5             # keep-alive; the firmware stops after 1.5 s of s
 ESP32_STATUS_TIMEOUT_S = 1.5   # no status line for this long = link down
 ESP32_WIFI_STATUS_TIMEOUT_S = 3.0   # Wi-Fi jitter: give it twice as long (firmware wd_ms matches)
 ESP32_RECONNECT_S = 2.0
+ESP32_READ_GLITCH_LIMIT = 50   # consecutive empty-read errors (~0.5 s) before the link counts as lost
 ESP32_HELLO_TIMEOUT_S = 4.0    # opening a USB port resets the board; it reboots in ~1 s
 ESP32_WIFI_CONNECT_TIMEOUT_S = 3.0
 
@@ -1684,8 +1685,19 @@ class Esp32ServoHardware(ServoHardware):
             try:
                 chunk = ser.read(max(1, ser.in_waiting))
             except Exception as exc:
+                # pyserial raises "device reports readiness to read but returned
+                # no data" when a single read comes back empty — a stray wake-up
+                # on the Pi UART, not a lost board. Ride out short bursts; a real
+                # disconnect keeps failing or trips the status timeout instead.
+                if "returned no data" in str(exc):
+                    self._read_glitches = getattr(self, "_read_glitches", 0) + 1
+                    if self._read_glitches < ESP32_READ_GLITCH_LIMIT:
+                        time.sleep(0.01)
+                        continue
+                self._read_glitches = 0
                 self._drop_link(f"read failed: {exc}")
                 return
+            self._read_glitches = 0
             if chunk:
                 buf += chunk
                 while b"\n" in buf:
@@ -4115,7 +4127,7 @@ class Carousel:
                 # sensor during coast-down, so after an emergency stop
                 # `current_shelf` was quietly one shelf behind the metal. Every
                 # later `goto` then counted from the wrong start and parked one
-                # shelf off — and the app, told "arrived at N", filed each spool
+                # shelf off ��� and the app, told "arrived at N", filed each spool
                 # of the remaining queue into the slot of shelf N while the
                 # operator was physically loading shelf N+1. The queue itself was
                 # fine; the machine had lost its place.
