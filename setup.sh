@@ -493,17 +493,28 @@ if [[ $HAS_APP -eq 1 ]]; then
   systemctl enable --now avahi-daemon >/dev/null 2>&1 || true
 
   # Node 22 LTS from NodeSource; the Debian package is too old for Next 16.
+  # Raspberry Pi OS ships its own nodejs package without npm, so a Node that
+  # is new enough but has no npm still gets replaced by NodeSource (npm bundled).
   NEED_NODE=1
-  if command -v node >/dev/null 2>&1; then
+  if command -v node >/dev/null 2>&1 && command -v npm >/dev/null 2>&1; then
     NODE_MAJOR="$(node -p 'process.versions.node.split(".")[0]')"
     [[ "$NODE_MAJOR" -ge 20 ]] && NEED_NODE=0
   fi
   if [[ $NEED_NODE -eq 1 ]]; then
-    say "Installing Node.js 22"
-    curl -fsSL https://deb.nodesource.com/setup_22.x | bash - >/dev/null
-    apt-get install -y -qq nodejs >/dev/null
+    say "Installing Node.js 22 (with npm)"
+    if curl -fsSL https://deb.nodesource.com/setup_22.x | bash - >/dev/null 2>&1; then
+      apt-get install -y -qq nodejs >/dev/null || true
+    fi
+    hash -r
+    if ! command -v npm >/dev/null 2>&1; then
+      note "NodeSource did not provide npm, installing the system npm package"
+      apt-get install -y -qq nodejs npm >/dev/null || true
+      hash -r
+    fi
   fi
-  note "node $(node -v)"
+  command -v node >/dev/null 2>&1 || die "Node.js could not be installed. Check the internet connection and re-run setup.sh"
+  command -v npm >/dev/null 2>&1 || die "npm could not be installed. Run 'sudo apt-get install npm' and re-run setup.sh"
+  note "node $(node -v), npm $(npm -v)"
   if ! command -v pnpm >/dev/null 2>&1; then
     # Pinned to 10.x: newer pnpm majors drop Node 20, and an unpinned install
     # fails on Pis that already have Node 20.
