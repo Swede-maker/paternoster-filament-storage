@@ -120,7 +120,7 @@ static const uint32_t LEDC_DUTY_ON = 128;    // 50 %
 static const uint32_t ABS_MAX_PPS = 300000;
 static const uint32_t MIN_PPS = 50;
 static const uint32_t WATCHDOG_MS = 1500;    // no line from the Pi -> stop (default; CFG wd_ms=)
-static const size_t LINE_MAX = 200;
+static const size_t PARSER_LINE_MAX = 200;
 
 // Arduino-ESP32 3.x makes constrain() a template that needs all three
 // arguments to be the exact same type, and on the newer Xtensa toolchain
@@ -239,9 +239,9 @@ static uint32_t g_lastRxMs = 0;
 static bool g_linkUp = false;
 static bool g_wdTripped = false;
 static uint32_t g_lastStatusMs = 0;
-static char g_lineUsb[LINE_MAX]; static size_t g_lenUsb = 0;
-static char g_lineUart[LINE_MAX]; static size_t g_lenUart = 0;
-static char g_lineTcp[LINE_MAX]; static size_t g_lenTcp = 0;
+static char g_lineUsb[PARSER_LINE_MAX]; static size_t g_lenUsb = 0;
+static char g_lineUart[PARSER_LINE_MAX]; static size_t g_lenUart = 0;
+static char g_lineTcp[PARSER_LINE_MAX]; static size_t g_lenTcp = 0;
 
 HardwareSerial LinkUart(1);
 
@@ -770,7 +770,7 @@ static void pump(Stream& port, char* buf, size_t& len) {
       buf[len] = 0;
       handleLine(buf);
       len = 0;
-    } else if (len < LINE_MAX - 1) {
+    } else if (len < PARSER_LINE_MAX - 1) {
       buf[len++] = c;
     } else {
       len = 0; // overlong line: drop it
