@@ -36,23 +36,24 @@ Each carousel uses:
 
 | Part                       | Qty | Purpose                                            |
 | -------------------------- | --- | -------------------------------------------------- |
-| Brushed DC motor           | 2   | One per chain, one on each side of the carousel.   |
-| BTS7960 / IBT-2 43A        | 2   | One half-bridge driver **per motor**. **Dual PWM**: RPWM vs LPWM picks direction. |
+| Brushed DC motor           | 1   | **One motor per carousel**, driving both chains through a common shaft or sprocket. |
+| BTS7960 / IBT-2 43A        | 1   | One half-bridge driver for that motor. **Dual PWM**: RPWM vs LPWM picks direction. |
 | Inductive **shelf** sensor | 1   | Pulses once as **every** shelf passes the window.  |
 | Inductive **index** sensor | 1   | Active **only at shelf 1** — the home reference.   |
 
-The agent gives both bridges the **same PWM duty and direction** during a move,
-so the two chains stay in step. Because motor B usually sits across the
-carousel from motor A, its direction is **inverted in software** by default
-(`DC_MIRROR_B = True` / *Mirror motor B* in the app) — flip that switch rather
-than rewiring if the two sides fight each other.
+A DC carousel is driven by **one** motor on bridge **A**. Two DC motors on the
+same carousel (one per chain, balanced in software) are **not** supported — in
+practice two brushed motors never stay in step. Bridge **B** exists only for
+**twin mode**: one Pi driving a *Left* carousel (motor A, the standard sensors)
+and a *Right* carousel (motor B, its own shelf and home sensors). See
+*Twin carousels* below.
 
 ### Default wiring (BCM pin numbers)
 
 Edit the constants at the top of `paternoster_agent.py` (`PIN_MOTOR_A_*`,
 `PIN_MOTOR_B_*`) to match your boards.
 
-| Signal        | Bridge **A** (motor A) | Bridge **B** (motor B) | Notes                                      |
+| Signal        | Bridge **A** (motor A) | Bridge **B** (twin Right only) | Notes                              |
 | ------------- | ---------------------- | ---------------------- | ------------------------------------------ |
 | RPWM          | GPIO 12                | GPIO 20                | PWM — drives one direction                 |
 | LPWM          | GPIO 13                | GPIO 21                | PWM — drives the other direction           |
@@ -63,11 +64,10 @@ Edit the constants at the top of `paternoster_agent.py` (`PIN_MOTOR_A_*`,
 | Shelf sensor  | GPIO 23                |                        | One pulse per shelf (shared)               |
 | Index sensor  | GPIO 24                |                        | Active only at shelf 1 (shared)            |
 
-The screw terminals carry the power side: **B+ / B−** of *each* bridge to your
-motor supply (the big cap is already on-board), **M+ / M−** to that bridge's
-motor. If the whole carousel runs the wrong way, flip `HOMING_DIRECTION`; if
-only *one* side runs the wrong way, toggle **Mirror motor B** in the app (or
-swap M+/M− on that bridge).
+The screw terminals carry the power side: **B+ / B−** of the bridge to your
+motor supply (the big cap is already on-board), **M+ / M−** to the motor. If
+the carousel runs the wrong way, flip `HOMING_DIRECTION` (or swap M+/M−); a
+twin side has its own *Reverse* switch in the app.
 
 **Key points for these boards:**
 
@@ -78,32 +78,62 @@ swap M+/M− on that bridge).
   logic, and feeding VCC 5 V can make the on-board logic pull the input pins
   above the Pi's 3.3 V limit.
 - GPIO 12/13 are the Pi's **hardware PWM** channels, so bridge A gets them;
-  bridge B on GPIO 20/21 is driven by software PWM. For the smoothest result
-  install `pigpio` (`sudo apt install pigpio && sudo systemctl enable --now
-  pigpiod`) and export `GPIOZERO_PIN_FACTORY=pigpio` — pigpio generates
-  jitter-free PWM on *any* GPIO, so both bridges then run identically. Without
-  it gpiozero falls back to software PWM, which can make a motor buzz.
+  bridge B on GPIO 20/21 (twin Right) is driven by software PWM. For the
+  smoothest result install `pigpio` (`sudo apt install pigpio && sudo systemctl
+  enable --now pigpiod`) and export `GPIOZERO_PIN_FACTORY=pigpio` — pigpio
+  generates jitter-free PWM on *any* GPIO. Without it gpiozero falls back to
+  software PWM, which can make a motor buzz.
 - Pulling **EN low is a hardware stop** — the outputs float regardless of the PWM
-  state. That's why `stop()` zeroes both PWMs and then disarms both ENs.
+  state. That's why `stop()` zeroes the PWM and then disarms EN.
 
-> Power the motors from their **own supply**, not the Pi's 5V rail. Size it for
-> two motors. Tie all grounds together — the Pi's GND *must* be common with both
-> drivers' GND or the PWM signals have no reference and the motors behave
-> erratically.
+> Power the motor from its **own supply**, not the Pi's 5V rail. Tie all
+> grounds together — the Pi's GND *must* be common with the driver's GND or the
+> PWM signals have no reference and the motor behaves erratically.
 
-#### Jogging one DC motor
+#### Jogging a DC carousel
 
 A DC bridge has no step unit, so a jog is **timed**: *Manual control → Motor
-jog* runs motor A, motor B or both for a set number of **milliseconds** (default
-150 ms, 10–5000 ms) at the unit's *Motor speed* PWM. Use it exactly like the
-servo micro-jog: nudge one side until the shelf hangs level, then **Home**. The
-step size is saved per unit.
+jog* runs the motor for a set number of **milliseconds** (default 150 ms,
+10–5000 ms) at the unit's *Motor speed* PWM. Use it to creep the carousel to a
+shelf or free a snag, then **Home**. The step size is saved per unit.
 
 `motor_test.py` still exercises bridge A only (`PIN_MOTOR_RPWM/LPWM/EN` are
 aliases for the A pins); to bench-test bridge B, point those constants at the
 `PIN_MOTOR_B_*` values temporarily.
 
-### Servo drive: two iSV57T on PUL/DIR
+### Servo drive: two A6-RS behind an ESP32 (recommended for A6-RS)
+
+For the StepperOnline **A6-RS** drives (DB44 "CN1" connector) an ESP32 DevKit
+sits between the Pi and the drives and takes over everything that is
+timing-critical: both PUL trains from one hardware timer, the shelf and home
+sensors with interrupt timestamps, and an *armed* stop that cuts the pulses
+on the target flag without waiting for the Pi. The agent keeps every motion
+decision and talks to the board over **USB** (`/dev/ttyUSB0`), the **GPIO
+UART** (GPIO14/15, `/dev/serial0`) or **Wi-Fi** — pick one in the app.
+
+Select **Integrated servo motors (PUL/DIR)** and then **Servo controller →
+ESP32** in the app, or run `sudo ./install.sh --servo-driver esp32
+[--esp32-link usb|uart|wifi]`. Firmware, flashing, the complete DB44 pinout and
+the ESP32 pin map are in **[`esp32-servo/README.md`](esp32-servo/README.md)**.
+
+**A carousel without a Pi.** With `--esp32-link wifi` the board runs
+standalone: it joins the router (falling back to the master's hotspot, like a
+slave Pi) and serves the same protocol on TCP 8766, while a *second agent
+instance on the master Pi* drives it:
+
+```bash
+sudo ./install.sh --instance hall-2 --name "Hall 2" --shelves 12 \
+     --pulse-drive ac-servo --esp32-link wifi --esp32-host pax-esp32-1a2b.local
+```
+
+That instance (`paternoster-agent-hall-2`, port 8767, own `motor.json`)
+registers with the local master as a slave, so new router credentials are
+pushed to the board automatically and it appears — tagged **ESP32** — in the
+master's slaves list, ready for "Add as carousel". First-time Wi-Fi setup
+(`WIFI` / `WIFIAP` on the USB console) and over-the-air updates are described
+in the firmware README.
+
+### Servo drive: two iSV57T on PUL/DIR (Pi GPIO)
 
 Select **Integrated servo motors (PUL/DIR)** in the app. The agent then drives
 two StepperOnline iSV57T integrated servos (tested target: **iSV57T-090(S)**)
@@ -255,13 +285,14 @@ more carousel speed.
 If the shelf hangs lower on one side after assembly or a jam:
 
 1. Open **Manual control** for the unit; the jog card (**Servo micro-jog** or
-   **Motor jog**) shows the motor selector and the arrows — plus the two ALM
-   lamps on servos.
+   **Motor jog**) shows the arrows — plus, on servos, the motor selector and
+   the two ALM lamps.
 2. Set the **step size**. Servo: pulses per tap (40 pulses = 3.6° at 4000 ppr).
    DC: milliseconds per tap (default 150 ms, at the unit's *Motor speed* PWM).
    It is saved per unit.
-3. Select **Motor A** or **Motor B** and tap **▲ / ▼** until the shelf is level,
-   or select **Both** to nudge the whole carousel.
+3. Servo: select **Motor A** or **Motor B** and tap **▲ / ▼** until the shelf
+   is level, or select **Both** to nudge the whole carousel. DC: the arrows
+   always nudge the carousel's one motor.
 4. **Home** the carousel so the shelf count is re-referenced.
 
 A jog never changes the recorded shelf number; the shelf sensor keeps counting

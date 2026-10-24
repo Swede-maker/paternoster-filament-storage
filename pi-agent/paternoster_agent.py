@@ -2,15 +2,15 @@
 """
 PAX paternoster — Raspberry Pi GPIO agent.
 
-This program runs ON a Raspberry Pi and drives one paternoster carousel. The
-carousel always has TWO motors, one per chain, one on each side:
-  * EITHER two brushed DC motors, each on its own BTS7960 / IBT-2 half-bridge,
-    with PWM speed control ("dc" drive mode, the default: both bridges get the
-    same duty and direction for a move, and each motor can be jogged on its own
-    for a number of MILLISECONDS to level the chains),
-  * OR two StepperOnline iSV57T integrated servos on pulse/direction lines
-    ("servo" drive mode: synchronised dual-motor moves, speed by pulse
-    frequency, exact-count micro-jog per motor in PULSES), and
+This program runs ON a Raspberry Pi and drives one paternoster carousel (or a
+Left and a Right carousel in twin mode). A carousel is driven by:
+  * EITHER one brushed DC motor on a BTS7960 / IBT-2 half-bridge with PWM
+    speed control ("dc" drive mode, the default; a timed jog in MILLISECONDS
+    nudges the carousel by hand; the second bridge is only used by the Right
+    carousel of a twin setup),
+  * OR two StepperOnline iSV57T integrated servos on pulse/direction lines,
+    one per chain ("servo" drive mode: synchronised dual-motor moves, speed by
+    pulse frequency, exact-count micro-jog per motor in PULSES), and
   * two inductive proximity sensors (identical in both modes):
       - SHELF sensor: pulses once as every shelf passes the pick window,
       - INDEX sensor: active only at shelf 1 (the home / absolute reference).
@@ -49,8 +49,12 @@ import argparse
 import asyncio
 import json
 import math
+import os
+import select
+import socket
 import threading
 import time
+import weakref
 from typing import Callable, Optional
 
 # Wi-Fi / hotspot management (NetworkManager). Optional: the agent must keep
@@ -67,16 +71,14 @@ else:
 # --------------------------------------------------------------------------
 # Pin configuration (BCM numbering). Adjust to match your wiring.
 # --------------------------------------------------------------------------
-# DC drive mode: TWO BTS7960 / IBT-2 43A half-bridges, one per motor (motor A
-# on one side of the carousel, motor B on the other). Unlike an L298N there is
-# no single "enable = PWM" pin: RPWM and LPWM are BOTH PWM inputs and *which
-# one* you drive picks the direction. Drive only one at a time — driving both
-# together shoots through the bridge.
+# DC drive mode: ONE BTS7960 / IBT-2 43A half-bridge per carousel. Unlike an
+# L298N there is no single "enable = PWM" pin: RPWM and LPWM are BOTH PWM
+# inputs and *which one* you drive picks the direction. Drive only one at a
+# time — driving both together shoots through the bridge.
 #
-# Both bridges receive the same duty and direction during a move so the two
-# chains stay in step; motor B's direction is inverted in software when the
-# two motors face each other (DC_MIRROR_B / "Mirror motor B" in the app). Each
-# bridge can also be run ALONE for a timed jog to level the chains.
+# A single carousel uses bridge A. Bridge B is only used by a twin setup, where
+# one Pi drives a Left carousel (motor A) and a Right carousel (motor B), each
+# with its own sensors. Two DC motors on the SAME carousel are not supported.
 PIN_MOTOR_A_RPWM = 12  # bridge A -> RPWM (PWM, drives one direction)
 PIN_MOTOR_A_LPWM = 13  # bridge A -> LPWM (PWM, drives the other direction)
 PIN_MOTOR_A_EN = 22    # bridge A -> R_EN + L_EN tied together (HIGH = armed)
@@ -87,16 +89,13 @@ PIN_MOTOR_B_EN = 27    # bridge B -> R_EN + L_EN tied together
 PIN_MOTOR_RPWM = PIN_MOTOR_A_RPWM
 PIN_MOTOR_LPWM = PIN_MOTOR_A_LPWM
 PIN_MOTOR_EN = PIN_MOTOR_A_EN
-# Motor B usually sits across the carousel from motor A and therefore turns the
-# opposite way for the same chain direction. Flip from the app if yours is
-# wired alike (shares the "Mirror motor B" switch with the servo backend).
+# Kept for the `servo` status snapshot: the "Mirror motor B" switch is shared
+# with the servo backend, where it still matters. The DC backend drives one
+# motor and does not use it.
 DC_MIRROR_B = True
-# Largest PWM balance the app may ask for, in percent of duty taken off the
-# faster bridge. Mirrors MAX_DC_TRIM_PCT in lib/filament.ts.
-DC_TRIM_MAX_PCT = 20.0
-# Timed jog on a DC bridge. There is no step unit, so a jog is "run this motor
+# Timed jog on a DC bridge. There is no step unit, so a jog is "run the motor
 # for N milliseconds" at a fixed duty; the app's step size is in ms. The duty
-# defaults to the same cruise duty as a move so a single motor reliably breaks
+# defaults to the same cruise duty as a move so the motor reliably breaks
 # stiction; the app may pass its own `speed`.
 DC_JOG_DUTY = 0.45
 DC_JOG_MAX_MS = 5000
@@ -194,9 +193,66 @@ SERVO_DIR_SETUP_S = 0.001
 # for the two to pull the same way. Flip from the app if yours is wired alike.
 SERVO_MIRROR_B = True
 
+# Which drive sits on the PUL/DIR lines. The motion code is identical for all
+# three; the profile only decides the polarity of the enable and alarm lines,
+# the pulse ceiling and the default pulse source. Mirrors PULSE_DRIVE_PROFILES
+# in lib/filament.ts — keep the two in step.
+#   ena_active_low : GPIO LOW on the enable output = motor ENGAGED. False
+#                    (HIGH = engaged) covers both README hookups: S-ON through
+#                    an NPN transistor (HIGH on the base = S-ON conducting =
+#                    servo on) and the stepper's MF wired common-anode (+5 V
+#                    on MF+, GPIO sinks MF-: LOW = MF conducting = coils OFF,
+#                    HIGH = engaged). Flip it from the app if your hookup
+#                    inverts one of these (e.g. MF through the transistor).
+#   alm_active_low : the ALM optocoupler CONDUCTS (pin LOW) on a fault. iSV57T
+#                    and A6-RS conduct while healthy (False); CL86Y conducts
+#                    on the alarm (True).
+#   has_enable     : the drive has an enable / motor-free input. The iSV57T has
+#                    none, so its "release" is the optional supply relay.
+PULSE_DRIVE_DEFAULT = "integrated-servo"
+PULSE_DRIVES = ("integrated-servo", "ac-servo", "closed-loop-stepper")
+PULSE_DRIVE_PROFILES = {
+    "integrated-servo":   {"ena_active_low": False, "alm_active_low": False, "max_pps": 300_000, "has_enable": False, "default_driver": "gpio"},
+    "ac-servo":           {"ena_active_low": False, "alm_active_low": False, "max_pps": 300_000, "has_enable": True,  "default_driver": "esp32"},
+    "closed-loop-stepper":{"ena_active_low": False, "alm_active_low": True,  "max_pps": 200_000, "has_enable": True,  "default_driver": "esp32"},
+}
+
+
+def pulse_drive_profile(drive: Optional[str]) -> dict:
+    return PULSE_DRIVE_PROFILES.get(drive if drive in PULSE_DRIVES else PULSE_DRIVE_DEFAULT)
+
+# ESP32 servo controller (pi-agent/esp32-servo). With servoDriver = "esp32" the
+# Pi no longer pulses PUL/DIR itself: it sends RUN/STOP/JOG lines to the ESP32
+# over a serial link and receives sensor edges and drive status back. The
+# sensors move to the ESP32 too, so the stop on a flag never waits for Linux.
+#   link "usb"  : the DevKit's micro-USB (CP2102/CH340 -> /dev/ttyUSB0, or
+#                 native USB -> /dev/ttyACM0); auto-detected via /dev/serial/by-id.
+#   link "uart" : 3 wires on the Pi header (GPIO14 TXD -> ESP32 RX 21,
+#                 GPIO15 RXD <- ESP32 TX 22, GND); needs the serial console
+#                 disabled (install.sh --esp32-uart does this).
+#   link "wifi" : no Pi on that carousel at all. The board runs standalone,
+#                 joins the router (or the master's hotspot as a fallback) and
+#                 serves the same line protocol on TCP port 8766. This agent
+#                 instance is then just the brain for a remote board — run it
+#                 on the master Pi as a second service (install.sh --instance).
+ESP32_LINK_DEFAULT = "usb"
+ESP32_LINKS = ("usb", "uart", "wifi")
+ESP32_UART_PORT = "/dev/serial0"
+ESP32_USB_CANDIDATES = ("/dev/ttyUSB0", "/dev/ttyACM0", "/dev/ttyUSB1", "/dev/ttyACM1")
+ESP32_BAUD_DEFAULT = 460800
+ESP32_WIFI_PORT = 8766
+ESP32_PING_S = 0.5             # keep-alive; the firmware stops after 1.5 s of silence
+ESP32_STATUS_TIMEOUT_S = 1.5   # no status line for this long = link down
+ESP32_WIFI_STATUS_TIMEOUT_S = 3.0   # Wi-Fi jitter: give it twice as long (firmware wd_ms matches)
+ESP32_RECONNECT_S = 2.0
+ESP32_HELLO_TIMEOUT_S = 4.0    # opening a USB port resets the board; it reboots in ~1 s
+ESP32_WIFI_CONNECT_TIMEOUT_S = 3.0
+
 # Where the agent remembers the selected drive mode and servo parameters between
 # restarts. Written whenever the app pushes a `config` with motor fields.
-MOTOR_CONF_PATH = "/var/lib/pax-agent/motor.json"
+# A second agent instance on the same Pi (a Wi-Fi ESP32 carousel) gets its own
+# file via PAX_MOTOR_CONF / --motor-conf so the two never overwrite each other.
+MOTOR_CONF_PATH = os.environ.get("PAX_MOTOR_CONF") or "/var/lib/pax-agent/motor.json"
 
 # Motion tuning. These are DEFAULTS ONLY — the app overrides them at runtime via
 # the `config` command, so the speed and soft-start sliders reach the motor. Do
@@ -248,34 +304,6 @@ HOME_TIMEOUT_MAX_S = 600.0
 # and Safe move time are still added on top.
 SHELF_TIMEOUT_MIN_S = 2.0
 SHELF_TIMEOUT_MAX_S = 300.0
-# Motor drive → "Auto-correct chains at shelf 1" (DC, two bridges). Shelf 1
-# carries both the shelf flag and the home flag, so the two sensors should fire
-# together as it passes. If one leads the other by more than the tolerance, the
-# leading side's bridge is paused until the lagging sensor fires.
-CHAIN_SYNC_DEFAULT_TOLERANCE_MS = 150.0
-CHAIN_SYNC_MAX_TOLERANCE_MS = 5000.0
-# Longest a paused bridge waits for the other sensor before the move is cut
-# with a safety-stop fault, so a dead sensor or a stuck chain can never leave
-# the carousel driving on one chain for a lap. The chains are then out of level
-# and the operator must jog them straight and re-home. Operator-adjustable per
-# carousel ("Safety stop after"); this is the default and the allowed range.
-CHAIN_SYNC_MAX_WAIT_S = 3.0
-CHAIN_SYNC_MIN_WAIT_S = 0.5
-CHAIN_SYNC_MAX_WAIT_LIMIT_S = 60.0
-# Motor balance auto-calibration: full carousel turns each chain is timed over.
-# More turns average out sensor jitter; three is plenty for a 0.01 % result on
-# a lap of a minute.
-BALANCE_CAL_DEFAULT_TURNS = 3
-BALANCE_CAL_MAX_TURNS = 10
-# Once the first chain has finished its turns, the other may need this fraction
-# of the first chain's time (plus a floor) to catch up. ±20 % of trim can only
-# fix a 25 % speed difference, so anything slower than that is a mechanical
-# problem, not a balance problem, and the run is cut.
-BALANCE_CAL_CATCH_UP_FRACTION = 0.25
-# The home sensor only fires once per lap during calibration, and the chains
-# start on the flag, so its silence guard must cover a whole lap plus slack.
-BALANCE_CAL_LAP_GUARD_MARGIN = 1.5
-BALANCE_CAL_CATCH_UP_FLOOR_S = 3.0
 # How often a long sensor wait re-checks for an emergency stop. Small enough to
 # feel instant to an operator, large enough not to spin the CPU.
 ABORT_POLL_SECONDS = 0.02
@@ -340,6 +368,11 @@ PULSE_DUTY_UPDATE_S = 0.02
 # The calibration revolution may take a while on a slow chain: allowance for the
 # full turn, as a multiple of HOME_TIMEOUT (already drive-scaled).
 CALIBRATE_TIMEOUT_SCALE = 3.0
+# The index sensor must stay clear this long before the flag counts as passed
+# (flag-length measurement), so a flickering edge is not taken for its end.
+FLAG_CLEAR_CONFIRM_S = 0.005
+# Pause after the second flag pass before reversing onto the flag's middle.
+CALIBRATE_REVERSE_SETTLE_S = 0.3
 
 
 def shelf_settle_for(duty: float) -> float:
@@ -527,12 +560,7 @@ HOMING_DIRECTION = "down"
 
 
 def home_travel_direction() -> str:
-    """
-    The carousel direction ("up"/"down") the homing sweep runs in. The balance
-    calibration defaults to the same direction so the operator sees both turn
-    the same way, and so a single shared balance is measured where it matters
-    most: on the homing pass that levels the chains.
-    """
+    """The carousel direction ("up"/"down") the homing sweep runs in."""
     return "up" if HOMING_DIRECTION == "down" else "down"
 
 
@@ -580,15 +608,16 @@ def _present(devices) -> tuple:
 
 class RealHardware:
     """
-    Drives real GPIO through gpiozero: two DC motors, each on its own BTS7960
-    bridge (motor A / motor B, one per chain), plus the two inductive sensors.
+    Drives real GPIO through gpiozero: ONE DC motor on a BTS7960 bridge plus
+    the two inductive sensors. A carousel is driven by a single DC motor; the
+    second bridge (motor B) exists only so a twin setup can run a Left and a
+    Right carousel from the same Pi, each with its own backend instance.
 
     The motor half lives in `_init_motor` / `forward` / `backward` / `stop` /
     `_close_motor` / `jog` so `ServoHardware` can swap in PUL/DIR control while
     reusing every sensor-counting detail below unchanged. The motion code only
-    ever calls `forward`/`backward`/`stop` with a 0..1 "speed", which a DC
-    bridge turns into a PWM duty on BOTH bridges and a servo drive turns into a
-    pulse frequency on both PUL lines.
+    ever calls `forward`/`backward`/`stop` with a 0..1 "speed", which the DC
+    bridge turns into a PWM duty and a servo drive turns into a pulse frequency.
     """
 
     motor_mode = "dc"
@@ -600,16 +629,22 @@ class RealHardware:
         shelf_pin: int = PIN_SHELF_SENSOR,
         index_pin: int = PIN_INDEX_SENSOR,
     ) -> None:
-        from gpiozero import DigitalInputDevice  # imported lazily
-
         if mirror_b is not None:
             self.mirror_b = bool(mirror_b)
-        # Twin carousels: this backend owns ONE motor (0 = A, 1 = B) and only
-        # claims that motor's pins, so a second backend can own the other one.
+        # Which bridge this carousel's motor is on: 0 = A (default, single
+        # carousel or the twin Left side), 1 = B (twin Right side). Only that
+        # motor's pins are claimed, so a second backend can own the other one.
         self.motor_index = motor_index if motor_index in (0, 1) else None
-        # Twin side only: run this carousel's one motor the other way round.
+        # Run this carousel's motor the other way round.
         self.reverse = False
         self._init_motor()
+        self._init_sensor_state()
+        self._init_sensors(shelf_pin, index_pin)
+
+    def _init_sensors(self, shelf_pin: int, index_pin: int) -> None:
+        """Claim the two sensor GPIOs and route their edges into the counters."""
+        from gpiozero import DigitalInputDevice  # imported lazily
+
         # An NPN (sinking) sensor pulls the line to GND when it detects a shelf,
         # so we pull the pin up and let gpiozero treat LOW as active. A PNP
         # (sourcing) sensor is the mirror image: pull down, HIGH is active.
@@ -618,7 +653,29 @@ class RealHardware:
         pull_up = SENSOR_TYPE.upper() == "NPN"
         self.shelf = DigitalInputDevice(shelf_pin, pull_up=pull_up, bounce_time=SENSOR_BOUNCE)
         self.index = DigitalInputDevice(index_pin, pull_up=pull_up, bounce_time=SENSOR_BOUNCE)
+        # WHICH EDGE MEANS "METAL ARRIVED" depends on SENSOR_INVERT.
+        #
+        # gpiozero names these after the electrical level, not after the shelf. On
+        # an inverted sensor the signal is present in the GAPS, so metal arriving
+        # DEACTIVATES the input and `when_deactivated` is the arrival edge. Leaving
+        # these unswapped is what makes the carousel count in the gaps and stop
+        # between shelves — the count would be off by exactly half a pitch.
+        if SENSOR_INVERT:
+            self.shelf.when_deactivated = self._on_shelf
+            self.index.when_deactivated = self._on_index
+        else:
+            self.shelf.when_activated = self._on_shelf
+            self.index.when_activated = self._on_index
+        # The exit edge is the opposite one, mirrored the same way — otherwise it
+        # would be bound to the same edge as the arrival above and every arrival
+        # would immediately register as a departure.
+        if SENSOR_INVERT:
+            self.shelf.when_activated = self._on_shelf_exit
+        else:
+            self.shelf.when_deactivated = self._on_shelf_exit
 
+    def _init_sensor_state(self) -> None:
+        """Counters, lockout and direction memory shared by every sensor source."""
         # ------------------------------------------------------------------
         # Sensors are EDGE COUNTERS, never a power gate.
         #
@@ -649,19 +706,6 @@ class RealHardware:
         self._last_counted: Optional[float] = None
         self._shelf_settle = 0.0
         self._suppressed_bounces = 0
-        # WHICH EDGE MEANS "METAL ARRIVED" depends on SENSOR_INVERT.
-        #
-        # gpiozero names these after the electrical level, not after the shelf. On
-        # an inverted sensor the signal is present in the GAPS, so metal arriving
-        # DEACTIVATES the input and `when_deactivated` is the arrival edge. Leaving
-        # these unswapped is what makes the carousel count in the gaps and stop
-        # between shelves — the count would be off by exactly half a pitch.
-        if SENSOR_INVERT:
-            self.shelf.when_deactivated = self._on_shelf
-            self.index.when_deactivated = self._on_index
-        else:
-            self.shelf.when_activated = self._on_shelf
-            self.index.when_activated = self._on_index
 
         # Which way the motor is turning right now, and which way it was turning
         # at the moment the shelf flag LEFT the sensor window.
@@ -676,13 +720,6 @@ class RealHardware:
         # time. The falling edge is what actually happened.
         self.travel_direction: Optional[str] = None
         self.flag_exit_direction: Optional[str] = None
-        # The exit edge is the opposite one, mirrored the same way — otherwise it
-        # would be bound to the same edge as the arrival above and every arrival
-        # would immediately register as a departure.
-        if SENSOR_INVERT:
-            self.shelf.when_activated = self._on_shelf_exit
-        else:
-            self.shelf.when_deactivated = self._on_shelf_exit
 
     def set_shelf_settle(self, seconds: float) -> None:
         """Lockout applied AFTER a counted shelf, to swallow that shelf's bounce."""
@@ -748,42 +785,16 @@ class RealHardware:
             self._index_pulses += 1
         self._index_tick.set()
 
-    # ---- motor backend (DC / two BTS7960 bridges) ---------------------------
-    # `mirror_b` is read by `_init_motor` through `getattr` so a subclass that
-    # does not set it (ServoHardware has its own) still constructs cleanly.
+    # ---- motor backend (DC / one BTS7960 bridge) ----------------------------
+    # `mirror_b` is read through `getattr` so a subclass that does not set it
+    # (ServoHardware has its own) still constructs cleanly. The DC backend
+    # drives one motor, so it only stores the flag for the `servo` snapshot.
     mirror_b: bool = DC_MIRROR_B
-    # PWM balance from the app's "Motor balance" slider, -20..+20 %. Two
-    # brushed motors never match for the same duty, so the FASTER bridge is
-    # scaled down: negative trims A, positive trims B, 0 = equal duty.
-    dc_trim_pct: float = 0.0
-    # Optional second balance for "up" travel (the homing direction). Gearboxes
-    # and brushes rarely drag the same amount both ways, so when
-    # `dc_trim_per_dir` is on, "down" uses dc_trim_pct and "up" uses this one.
-    dc_trim_up_pct: float = 0.0
-    dc_trim_per_dir: bool = False
 
-    def _channels(self) -> tuple:
-        """Motor indexes this backend owns: both, or just its twin-side motor."""
+    def _channel(self) -> int:
+        """The bridge index this carousel's motor is on: A unless twin Right."""
         mi = getattr(self, "motor_index", None)
-        return (mi,) if mi in (0, 1) else (0, 1)
-
-    def trim_for_direction(self, direction: str) -> float:
-        """The balance in force for carousel travel `direction` ("up"/"down")."""
-        if direction == "up" and self.dc_trim_per_dir:
-            return float(self.dc_trim_up_pct)
-        return float(self.dc_trim_pct)
-
-    def _trim_scale(self, index: int, forward: bool = True) -> float:
-        if getattr(self, "motor_index", None) is not None:
-            return 1.0  # balance only means something with two motors
-        # Bridge "forward" is carousel "down" (see Carousel._energise and jog).
-        t = self.trim_for_direction("down" if forward else "up")
-        t = max(-DC_TRIM_MAX_PCT, min(DC_TRIM_MAX_PCT, t))
-        if index == 0 and t < 0:
-            return 1.0 + t / 100.0
-        if index == 1 and t > 0:
-            return 1.0 - t / 100.0
-        return 1.0
+        return mi if mi in (0, 1) else 0
 
     def _init_motor(self) -> None:
         from gpiozero import Motor, DigitalOutputDevice
@@ -791,111 +802,70 @@ class RealHardware:
         # BTS7960: passing NO `enable` to Motor makes gpiozero PWM the two
         # direction pins directly, which is exactly what RPWM/LPWM want — it
         # drives one pin with the duty cycle and holds the other at 0.
-        # Index 0 is motor A, index 1 is motor B — the same order the servo
-        # backend and the `jog` command use.
-        # An unowned channel (twin mode) stays None so its pins remain free.
+        # Index 0 is motor A, index 1 is motor B. Only the owned bridge is
+        # claimed; the other one's pins stay free for a twin backend.
         pins = (
             (PIN_MOTOR_A_RPWM, PIN_MOTOR_A_LPWM, PIN_MOTOR_A_EN),
             (PIN_MOTOR_B_RPWM, PIN_MOTOR_B_LPWM, PIN_MOTOR_B_EN),
         )
-        owned = self._channels()
-        self.motors = tuple(
-            Motor(forward=p[0], backward=p[1], pwm=True) if i in owned else None
-            for i, p in enumerate(pins)
-        )
-        # R_EN and L_EN of each bridge tied to one GPIO: HIGH arms the bridge,
+        rpwm, lpwm, en = pins[self._channel()]
+        self.motor = Motor(forward=rpwm, backward=lpwm, pwm=True)
+        # R_EN and L_EN of the bridge tied to one GPIO: HIGH arms the bridge,
         # LOW makes the outputs float. Pulling this LOW is a true hardware stop
         # that works even if a PWM pin is stuck, so the estop path uses it.
-        self.enables = tuple(
-            DigitalOutputDevice(p[2], initial_value=True) if i in owned else None
-            for i, p in enumerate(pins)
-        )
+        self.enable = DigitalOutputDevice(en, initial_value=True)
         self._motor_lock = threading.Lock()
         self._jog_abort = False
 
-    def _drive_one(self, index: int, forward: bool, speed: float) -> None:
-        """Run ONE bridge in the carousel's `forward` sense, honouring mirror B."""
-        if self.motors[index] is None:
-            return
-        if self.motor_index is not None:
-            # Twin side: one motor, flipped by its own "Reverse" switch only.
-            bridge_forward = forward != bool(getattr(self, "reverse", False))
-        else:
-            bridge_forward = forward if (index == 0 or not self.mirror_b) else (not forward)
-        duty = max(0.0, min(1.0, float(speed) * self._trim_scale(index, forward)))
-        self.enables[index].on()  # re-arm in case an estop left the bridge disabled
+    def _drive(self, forward: bool, speed: float) -> None:
+        """Run the bridge in the carousel's `forward` sense, honouring Reverse."""
+        bridge_forward = forward != bool(getattr(self, "reverse", False))
+        duty = max(0.0, min(1.0, float(speed)))
+        self.enable.on()  # re-arm in case an estop left the bridge disabled
         if bridge_forward:
-            self.motors[index].forward(duty)
+            self.motor.forward(duty)
         else:
-            self.motors[index].backward(duty)
+            self.motor.backward(duty)
 
     def forward(self, speed: float) -> None:
         with self._motor_lock:
-            for i in self._channels():
-                self._drive_one(i, True, speed)
+            self._drive(True, speed)
 
     def backward(self, speed: float) -> None:
         with self._motor_lock:
-            for i in self._channels():
-                self._drive_one(i, False, speed)
+            self._drive(False, speed)
 
     def stop(self) -> None:
-        # Zero the PWM first so each bridge brakes cleanly, then disarm it. Doing
+        # Zero the PWM first so the bridge brakes cleanly, then disarm it. Doing
         # it in this order avoids floating the outputs while a duty cycle is
         # still applied.
         with self._motor_lock:
-            for m in self.motors:
-                if m is not None:
-                    m.stop()
-            for en in self.enables:
-                if en is not None:
-                    en.off()
-
-    def can_chain_sync(self) -> bool:
-        """Two bridges owned by this process: the chain-sync pause has a motor to hold."""
-        return getattr(self, "motor_index", None) is None and all(m is not None for m in self.motors)
-
-    def hold_one(self, index: int) -> None:
-        """Pause ONE bridge (coast) while the other keeps driving; the enable stays armed."""
-        with self._motor_lock:
-            m = self.motors[index]
-            if m is not None:
-                m.stop()
-
-    def release_one(self, index: int, forward: bool, speed: float) -> None:
-        """Run a paused bridge again at the current duty, in the carousel's `forward` sense."""
-        with self._motor_lock:
-            self._drive_one(index, forward, speed)
+            self.motor.stop()
+            self.enable.off()
 
     def _close_motor(self) -> None:
-        self.stop()  # leave both bridges disarmed on exit
-        for dev in (*self.motors, *self.enables):
-            if dev is not None:
-                dev.close()
+        self.stop()  # leave the bridge disarmed on exit
+        self.motor.close()
+        self.enable.close()
 
     def jog(self, motor: str, direction: str, amount: int, speed: Optional[float] = None) -> None:
         """
-        Timed jog: run motor "a", "b" or "both" in `direction` for `amount`
+        Timed jog: run the carousel's motor in `direction` for `amount`
         MILLISECONDS at a fixed duty. This is the DC equivalent of the servo's
-        pulse-count jog — the alignment tool for levelling the two chains. It
-        blocks on the Carousel worker; `abort_jog()` (estop) cuts it short
-        within one DC_JOG_SLICE_S.
+        pulse-count jog. `motor` is accepted for protocol compatibility but a
+        DC carousel has only one motor, so it is ignored. It blocks on the
+        Carousel worker; `abort_jog()` (estop) cuts it short within one
+        DC_JOG_SLICE_S.
         """
         ms = max(0, min(DC_JOG_MAX_MS, int(amount)))
         if ms == 0:
             return
         duty = DC_JOG_DUTY if speed is None else max(SLIDER_MIN_DUTY, min(1.0, float(speed)))
-        if self.motor_index is not None:
-            # Twin side: its one motor IS the carousel, whatever was asked.
-            targets = (self.motor_index,)
-        else:
-            targets = (0, 1) if motor == "both" else ((0,) if motor == "a" else (1,))
         # Same convention as Carousel._energise: "down" is the bridge's forward.
         forward = direction == "down"
         self._jog_abort = False
         with self._motor_lock:
-            for i in targets:
-                self._drive_one(i, forward, duty)
+            self._drive(forward, duty)
         deadline = time.monotonic() + ms / 1000.0
         try:
             while time.monotonic() < deadline:
@@ -908,58 +878,24 @@ class RealHardware:
     def abort_jog(self) -> None:
         self._jog_abort = True
 
-    def set_servo_params(
-        self, mirror_b=None, dc_trim_pct=None, dc_trim_up_pct=None, dc_trim_per_dir=None, **_: object
-    ) -> None:
+    def set_servo_params(self, mirror_b=None, **_: object) -> None:
         """
-        Drive tuning from the app's `config`. The DC bridge cares about
-        `mirror_b` and the PWM balance; pulses/rate are servo-only and ignored.
+        Drive tuning from the app's `config`. Pulses/rate are servo-only and
+        ignored; `mirror_b` is only remembered for the status snapshot.
         """
         if mirror_b is not None:
             self.mirror_b = bool(mirror_b)
-        changed = False
-        if dc_trim_pct is not None:
-            new_trim = max(-DC_TRIM_MAX_PCT, min(DC_TRIM_MAX_PCT, float(dc_trim_pct)))
-            if new_trim != self.dc_trim_pct:
-                self.dc_trim_pct = new_trim
-                changed = True
-        if dc_trim_up_pct is not None:
-            new_up = max(-DC_TRIM_MAX_PCT, min(DC_TRIM_MAX_PCT, float(dc_trim_up_pct)))
-            if new_up != self.dc_trim_up_pct:
-                self.dc_trim_up_pct = new_up
-                changed = True
-        if dc_trim_per_dir is not None and bool(dc_trim_per_dir) != self.dc_trim_per_dir:
-            self.dc_trim_per_dir = bool(dc_trim_per_dir)
-            changed = True
-        if changed:
-            if self.dc_trim_per_dir:
-                print(
-                    f"[agent] motor balance down = {self.dc_trim_pct:+.3f} % "
-                    f"(A x{self._trim_scale(0, True):.3f} / B x{self._trim_scale(1, True):.3f}), "
-                    f"up = {self.dc_trim_up_pct:+.3f} % "
-                    f"(A x{self._trim_scale(0, False):.3f} / B x{self._trim_scale(1, False):.3f})",
-                    flush=True,
-                )
-            else:
-                print(
-                    f"[agent] motor balance = {self.dc_trim_pct:+.3f} % both directions "
-                    f"(A x{self._trim_scale(0):.3f} / B x{self._trim_scale(1):.3f})",
-                    flush=True,
-                )
 
     def servo_snapshot(self) -> Optional[dict]:
         """
         Drive status (`servo` event on the wire, kept for compatibility). In DC
-        mode it tells the app which backend is live and how motor B is mirrored;
-        there are no alarm lines on a BTS7960, so those fields are absent.
+        mode it tells the app which backend is live; there are no alarm lines
+        on a BTS7960, so those fields are absent.
         """
         return {
             "type": "servo",
             "mode": "dc",
             "mirrorB": self.mirror_b,
-            "dcTrimPct": self.dc_trim_pct,
-            "dcTrimUpPct": self.dc_trim_up_pct,
-            "dcTrimPerDirection": self.dc_trim_per_dir,
             "jogMaxMs": DC_JOG_MAX_MS,
         }
 
@@ -1119,9 +1055,19 @@ class ServoHardware(RealHardware):
         motor_index: Optional[int] = None,
         shelf_pin: int = PIN_SHELF_SENSOR,
         index_pin: int = PIN_INDEX_SENSOR,
+        pulse_drive: str = PULSE_DRIVE_DEFAULT,
+        ena_active_low: Optional[bool] = None,
+        alm_active_low: Optional[bool] = None,
     ) -> None:
+        # Drive profile first: it caps max_pps and sets the line polarities.
+        self.pulse_drive = pulse_drive if pulse_drive in PULSE_DRIVES else PULSE_DRIVE_DEFAULT
+        prof = pulse_drive_profile(self.pulse_drive)
+        self.ena_active_low = bool(prof["ena_active_low"] if ena_active_low is None else ena_active_low)
+        self.alm_active_low = bool(prof["alm_active_low"] if alm_active_low is None else alm_active_low)
+        self.has_enable_input = bool(prof["has_enable"])
+        self.drive_max_pps = int(prof["max_pps"])
         self.pulses_per_rev = max(1, int(pulses_per_rev))
-        self.max_pps = max(SERVO_MIN_PPS, min(300_000, int(max_pps)))
+        self.max_pps = max(SERVO_MIN_PPS, min(self.drive_max_pps, int(max_pps)))
         self.mirror_b = bool(mirror_b)
         # One-servo hardware carousel: only channel A is pulsed and monitored.
         self.single_motor = bool(single_motor)
@@ -1129,6 +1075,11 @@ class ServoHardware(RealHardware):
         # drive. Builds without ALM+/ALM- connected set this to run anyway.
         self.ignore_alarm = bool(ignore_alarm)
         super().__init__(motor_index=motor_index, shelf_pin=shelf_pin, index_pin=index_pin)
+
+    def _channels(self) -> tuple:
+        """Servo channels this backend owns: both, or just its twin-side one."""
+        mi = getattr(self, "motor_index", None)
+        return (mi,) if mi in (0, 1) else (0, 1)
 
     def _init_motor(self) -> None:
         from gpiozero import PWMOutputDevice, DigitalOutputDevice, DigitalInputDevice
@@ -1156,10 +1107,16 @@ class ServoHardware(RealHardware):
             lambda: DigitalInputDevice(PIN_SERVO_ALM_B, pull_up=True, bounce_time=0.05),
         )
         # Start ENGAGED (holding) so power-up matches the drive's own default.
-        # `active_high` folds the opto polarity in: `.on()` always means "release".
+        # `active_high` folds the polarity in: `.on()` always means "release".
+        # Integrated servos have no enable input, so GPIO 17/25 drive the
+        # optional supply relay (SERVO_ENA_ACTIVE_RELEASES). AC servos and
+        # closed-loop steppers have one (S-ON / MF): "engaged" is GPIO HIGH
+        # unless the profile / app says the line is active-low, so "release"
+        # (.on()) is the opposite level.
+        release_is_high = (not self.has_enable_input and SERVO_ENA_ACTIVE_RELEASES) or (self.has_enable_input and self.ena_active_low)
         self.ena = pair(
-            lambda: DigitalOutputDevice(PIN_SERVO_ENA_A, active_high=SERVO_ENA_ACTIVE_RELEASES, initial_value=False),
-            lambda: DigitalOutputDevice(PIN_SERVO_ENA_B, active_high=SERVO_ENA_ACTIVE_RELEASES, initial_value=False),
+            lambda: DigitalOutputDevice(PIN_SERVO_ENA_A, active_high=release_is_high, initial_value=False),
+            lambda: DigitalOutputDevice(PIN_SERVO_ENA_B, active_high=release_is_high, initial_value=False),
         )
         self._held = True
         self._motor_lock = threading.Lock()
@@ -1362,7 +1319,7 @@ class ServoHardware(RealHardware):
         if pulses_per_rev is not None:
             self.pulses_per_rev = max(1, int(pulses_per_rev))
         if max_pps is not None:
-            self.max_pps = max(SERVO_MIN_PPS, min(300_000, int(max_pps)))
+            self.max_pps = max(SERVO_MIN_PPS, min(self.drive_max_pps, int(max_pps)))
         if mirror_b is not None:
             self.mirror_b = bool(mirror_b)
         if ignore_alarm is not None:
@@ -1373,15 +1330,21 @@ class ServoHardware(RealHardware):
                 if self.single_motor and self.motor_index is None and self.pul[1] is not None:
                     self.pul[1].value = 0
 
+    def _alm_tripped(self, dev) -> bool:
+        """Read one ALM input in the drive's polarity (pull-up: is_active = pin LOW)."""
+        # Conducts-while-healthy drives (iSV57T, A6-RS): LOW = fine, open = fault.
+        # Conducts-on-fault drives (CL86Y): LOW = fault, open = fine.
+        return bool(dev.is_active) if self.alm_active_low else not dev.is_active
+
     def alarms(self) -> tuple[bool, bool]:
         """(motor A alarm, motor B alarm) — True when the drive has tripped."""
         if self.ignore_alarm:
             return (False, False)
         # An unused channel has no drive on its ALM, so its pull-up would read
         # as a permanent fault; unowned / one-servo channels never report.
-        a = self.alm[0] is not None and not self.alm[0].is_active
+        a = self.alm[0] is not None and self._alm_tripped(self.alm[0])
         b_used = self.alm[1] is not None and not (self.single_motor and self.motor_index is None)
-        b = b_used and not self.alm[1].is_active
+        b = b_used and self._alm_tripped(self.alm[1])
         return (a, b)
 
     def servo_snapshot(self) -> Optional[dict]:
@@ -1397,7 +1360,597 @@ class ServoHardware(RealHardware):
             "mirrorB": self.mirror_b,
             "singleMotor": self.single_motor,
             "held": self._held,
+            "pulseDrive": self.pulse_drive,
+            "enableActiveLow": self.ena_active_low,
+            "alarmActiveLow": self.alm_active_low,
         }
+
+
+class _TcpLink:
+    """
+    Just enough of pyserial's Serial surface (read / in_waiting / write /
+    close) over a TCP socket, so the ESP32 backend runs unchanged whether the
+    board hangs off a USB cable or sits on the other side of the hall on Wi-Fi.
+    """
+
+    def __init__(self, sock) -> None:
+        self._sock = sock
+        sock.settimeout(0.05)
+        try:
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except OSError:
+            pass
+
+    @property
+    def in_waiting(self) -> int:
+        r, _, _ = select.select([self._sock], [], [], 0)
+        return 4096 if r else 0
+
+    def read(self, n: int = 1) -> bytes:
+        try:
+            data = self._sock.recv(max(1, n))
+        except socket.timeout:
+            return b""
+        if not data:
+            raise ConnectionError("peer closed the link")
+        return data
+
+    def write(self, data: bytes) -> int:
+        self._sock.sendall(data)
+        return len(data)
+
+    def close(self) -> None:
+        try:
+            self._sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        self._sock.close()
+
+
+# Every live ESP32 backend, so the networking layer can hand new Wi-Fi
+# credentials to standalone boards without holding a reference to the motor.
+_ESP32_LINKS: "weakref.WeakSet" = weakref.WeakSet()
+
+
+def esp32_wifi_links() -> list:
+    return [h for h in list(_ESP32_LINKS) if getattr(h, "wifi", False)]
+
+
+class Esp32ServoHardware(ServoHardware):
+    """
+    Two A6-RS servo drives behind an ESP32 running pi-agent/esp32-servo.
+
+    Same contract as ServoHardware, but nothing here touches a GPIO: every
+    motor verb becomes a line on the serial link (RUN/STOP/ENA/JOG/HOLD/FREE)
+    and both sensors are read BY THE ESP32, which streams their edges back
+    with a microsecond timestamp. The edges are fed into the very same
+    counters, lockout and direction memory that the GPIO backends use
+    (`_on_shelf`, `_on_index`, `_on_shelf_exit`), so the Carousel's motion
+    logic sees an identical sensor model — just with sub-millisecond latency
+    and a pulse train that no Linux scheduling can disturb.
+
+    Two things only this backend offers:
+      * `arm_stop("shelf")` makes the ESP32 itself cut the pulse train on the
+        next arrival edge, before the edge has even reached the Pi. The
+        Carousel arms it for the target shelf of every move.
+      * the link is supervised both ways: the firmware stops the motors after
+        1.5 s without a line from the Pi, and the agent flags `linkOk=False`
+        (which the Carousel turns into a fault) when status lines stop.
+    """
+
+    driver = "esp32"
+
+    def __init__(
+        self,
+        link: str = ESP32_LINK_DEFAULT,
+        port: str = "",
+        baud: int = ESP32_BAUD_DEFAULT,
+        **kw,
+    ) -> None:
+        self.link = link if link in ESP32_LINKS else ESP32_LINK_DEFAULT
+        self.port_setting = (port or "").strip()
+        self.baud = int(baud) if baud else ESP32_BAUD_DEFAULT
+        self._ser = None
+        self._net: dict = {}                    # last NET reply from a Wi-Fi board
+        self._net_requested = 0.0
+        _ESP32_LINKS.add(self)
+        self._ser_lock = threading.Lock()
+        self._state_lock = threading.Lock()
+        self._levels = [False, False]          # gpiozero-sense active levels, shelf / home
+        self._alarms = (False, False)
+        self._esp_pos = 0.0
+        self._connected = False
+        self._firmware: Optional[str] = None
+        self._port_in_use: Optional[str] = None
+        self._link_error: Optional[str] = None
+        self._last_status = 0.0
+        self._last_ping = 0.0
+        self._hello_seen = threading.Event()
+        self._jog_done = threading.Event()
+        self._jog_sent = 0
+        self._stop_reader = threading.Event()
+        self._reader: Optional[threading.Thread] = None
+        self._armed: Optional[str] = None
+        self._trip_pos: Optional[float] = None
+        super().__init__(**kw)
+
+    # ---- construction hooks (no GPIO) --------------------------------------
+    def _init_motor(self) -> None:
+        self._held = True
+        self._motor_lock = threading.Lock()
+        self._pulsing = False
+        self._forward: Optional[bool] = None
+        self._jog_abort = False
+        self._odo_lock = threading.Lock()
+        self._odo_pulses = 0.0
+        self._odo_hz = 0
+        self._odo_sign = 0
+        self._odo_t0 = time.monotonic()
+
+    def _init_sensors(self, shelf_pin: int, index_pin: int) -> None:
+        # Sensors live on the ESP32; start the link once the counters exist.
+        import serial  # noqa: F401  (pyserial) -- fail here, at construction, if missing
+        self._reader = threading.Thread(target=self._reader_loop, name="esp32-link", daemon=True)
+        self._reader.start()
+        # Give the first connection a moment so `hello` can report the real state.
+        self._hello_seen.wait(ESP32_HELLO_TIMEOUT_S)
+
+    # ---- serial link --------------------------------------------------------
+    def _candidate_ports(self) -> list:
+        if self.port_setting:
+            return [self.port_setting]
+        if self.link == "uart":
+            return [ESP32_UART_PORT]
+        found: list = []
+        try:
+            import glob
+            for p in sorted(glob.glob("/dev/serial/by-id/*")):
+                found.append(p)
+        except Exception:
+            pass
+        for p in ESP32_USB_CANDIDATES:
+            if p not in found and os.path.exists(p):
+                found.append(p)
+        return found or list(ESP32_USB_CANDIDATES[:1])
+
+    @property
+    def wifi(self) -> bool:
+        return self.link == "wifi"
+
+    def _wifi_target(self) -> tuple:
+        """host[:port] from the "port" setting; the firmware's default port otherwise."""
+        host, _, port = self.port_setting.rpartition(":")
+        if not host:
+            host, port = self.port_setting, ""
+        try:
+            return host.strip(), int(port) if port else ESP32_WIFI_PORT
+        except ValueError:
+            return host.strip(), ESP32_WIFI_PORT
+
+    def _open_port(self) -> bool:
+        if self.wifi:
+            return self._open_wifi()
+        import serial
+        for path in self._candidate_ports():
+            try:
+                ser = serial.Serial(path, self.baud, timeout=0.05, write_timeout=0.5)
+            except Exception as exc:
+                self._link_error = f"{path}: {exc}"
+                continue
+            with self._ser_lock:
+                self._ser = ser
+                self._port_in_use = path
+            self._hello_seen.clear()
+            # A USB-serial open pulses DTR, which resets the DevKit; it answers
+            # HELLO once it has rebooted, so ask more than once.
+            deadline = time.monotonic() + ESP32_HELLO_TIMEOUT_S
+            while time.monotonic() < deadline and not self._hello_seen.is_set():
+                self._send("HELLO")
+                self._pump(0.4)
+            if self._hello_seen.is_set():
+                self._link_error = None
+                return True
+            self._link_error = f"{path}: no HELLO from the ESP32 (wrong port, baud {self.baud}, or firmware not flashed)"
+            self._drop_link(self._link_error, quiet=True)
+        return False
+
+    def _open_wifi(self) -> bool:
+        host, port = self._wifi_target()
+        if not host:
+            self._link_error = "no ESP32 host set — enter its hostname (pax-esp32-xxxx.local) or IP in the app"
+            return False
+        label = f"{host}:{port}"
+        try:
+            sock = socket.create_connection((host, port), timeout=ESP32_WIFI_CONNECT_TIMEOUT_S)
+        except Exception as exc:
+            self._link_error = f"{label}: {exc}"
+            return False
+        link = _TcpLink(sock)
+        with self._ser_lock:
+            self._ser = link
+            self._port_in_use = label
+        self._hello_seen.clear()
+        deadline = time.monotonic() + ESP32_HELLO_TIMEOUT_S
+        while time.monotonic() < deadline and not self._hello_seen.is_set():
+            self._send("HELLO")
+            self._pump(0.4)
+        if self._hello_seen.is_set():
+            self._link_error = None
+            return True
+        self._link_error = f"{label}: connected but no HELLO (is that a PAX ESP32 on port {port}?)"
+        self._drop_link(self._link_error, quiet=True)
+        return False
+
+    def push_wifi(self, ssid: Optional[str], psk: Optional[str],
+                  ap_ssid: Optional[str], ap_psk: Optional[str]) -> bool:
+        """Store router and/or master-hotspot credentials on a Wi-Fi board.
+        The board re-evaluates what to join right away, so a router change
+        drops this socket — the reader loop reconnects on the new network."""
+        if not self.wifi or not self._connected:
+            return False
+        if ap_ssid:
+            self._send(f"WIFIAP {ap_ssid} {ap_psk or ''}".rstrip())
+        if ssid:
+            self._send(f"WIFI {ssid} {psk or ''}".rstrip())
+        return True
+
+    def net_status(self) -> dict:
+        """Last NET reply (state/ssid/ip/rssi/host) plus link facts, for net.status."""
+        with self._state_lock:
+            n = dict(self._net)
+            n["linkOk"] = self._connected
+            n["target"] = self._port_in_use or self.port_setting
+        return n
+
+    def _after_hello(self) -> None:
+        self._send_cfg()
+        self._send(f"ENA {1 if self._held else 0}")
+        self._send("STOP")
+        if self.wifi:
+            self._send("NET")
+            self._net_requested = time.monotonic()
+        with self._state_lock:
+            self._connected = True
+            self._last_status = time.monotonic()
+        self._pulsing = False
+
+    def _send_cfg(self) -> None:
+        self._send(
+            "CFG "
+            f"mirror={1 if self.mirror_b else 0} "
+            f"single={1 if (self.single_motor and self.motor_index is None) else 0} "
+            f"rev={1 if getattr(self, 'reverse', False) else 0} "
+            f"npn={1 if SENSOR_TYPE.upper() == 'NPN' else 0} "
+            f"maxpps={self.max_pps} "
+            f"bounce_us={int(SENSOR_BOUNCE * 1_000_000)} "
+            f"dirsetup_us={max(5, int(SERVO_DIR_SETUP_S * 1_000_000))} "
+            f"jogpps={SERVO_JOG_PPS} "
+            # One firmware for every PUL/DIR drive: the profile picks the
+            # pulse ceiling and minimum pulse width on the board, and the two
+            # polarity flags tell it which way the enable and alarm lines go.
+            f"profile={self.pulse_drive} "
+            f"ena_low={1 if self.ena_active_low else 0} "
+            f"alm_low={1 if self.alm_active_low else 0} "
+            # Wi-Fi hiccups must not stop the chains every time a frame is late.
+            f"wd_ms={int(self._status_timeout_s() * 1000)}"
+        )
+
+    def _status_timeout_s(self) -> float:
+        return ESP32_WIFI_STATUS_TIMEOUT_S if self.wifi else ESP32_STATUS_TIMEOUT_S
+
+    def _send(self, line: str) -> None:
+        with self._ser_lock:
+            ser = self._ser
+            if ser is None:
+                return
+            try:
+                ser.write((line + "\n").encode("ascii", "replace"))
+            except Exception as exc:
+                self._drop_link(f"write failed: {exc}", quiet=False, locked=True)
+
+    def _drop_link(self, reason: str, quiet: bool = False, locked: bool = False) -> None:
+        if not locked:
+            self._ser_lock.acquire()
+        try:
+            ser, self._ser = self._ser, None
+        finally:
+            if not locked:
+                self._ser_lock.release()
+        if ser is not None:
+            try:
+                ser.close()
+            except Exception:
+                pass
+        with self._state_lock:
+            was = self._connected
+            self._connected = False
+            self._link_error = reason
+        self._rxbuf = b""
+        self._pulsing = False
+        self._odo_segment(0, 0)
+        self._jog_done.set()
+        if was and not quiet:
+            print(f"[agent] ESP32 link lost: {reason}", flush=True)
+
+    def _pump(self, seconds: float) -> None:
+        """Read and dispatch link traffic for up to `seconds`."""
+        end = time.monotonic() + seconds
+        buf = getattr(self, "_rxbuf", b"")
+        while time.monotonic() < end:
+            with self._ser_lock:
+                ser = self._ser
+            if ser is None:
+                return
+            try:
+                chunk = ser.read(max(1, ser.in_waiting))
+            except Exception as exc:
+                self._drop_link(f"read failed: {exc}")
+                return
+            if chunk:
+                buf += chunk
+                while b"\n" in buf:
+                    raw, buf = buf.split(b"\n", 1)
+                    self._handle_line(raw.decode("ascii", "replace").strip())
+            self._rxbuf = buf
+
+    def _reader_loop(self) -> None:
+        while not self._stop_reader.is_set():
+            if self._ser is None:
+                if not self._open_port():
+                    self._stop_reader.wait(ESP32_RECONNECT_S)
+                    continue
+                self._after_hello()
+                via = "wifi" if self.wifi else f"{self.link}, {self.baud} baud"
+                print(f"[agent] ESP32 servo controller on {self._port_in_use} ({via}, fw {self._firmware})", flush=True)
+            self._pump(0.1)
+            now = time.monotonic()
+            if now - self._last_ping >= ESP32_PING_S:
+                self._last_ping = now
+                self._send("PING")
+            if self._connected and now - self._last_status > self._status_timeout_s():
+                self._drop_link("no status from the ESP32")
+            if self.wifi and self._connected and now - self._net_requested > 30:
+                self._net_requested = now
+                self._send("NET")
+
+    # ---- inbound lines ------------------------------------------------------
+    def _apply_level(self, sensor: int, level: bool) -> None:
+        """Route a level change into the shared counters, honouring SENSOR_INVERT."""
+        prev = self._levels[sensor]
+        if level == prev:
+            return
+        self._levels[sensor] = level
+        arrival_is_active = not SENSOR_INVERT
+        if sensor == 0:
+            if level == arrival_is_active:
+                self._on_shelf()
+            else:
+                self._on_shelf_exit()
+        elif level == arrival_is_active:
+            self._on_index()
+
+    def _handle_line(self, line: str) -> None:
+        if not line:
+            return
+        head, _, rest = line.partition(" ")
+        if head == "E":
+            parts = rest.split()
+            if len(parts) >= 2:
+                sensor = 0 if parts[0] == "S" else 1
+                self._apply_level(sensor, parts[1] == "1")
+                if len(parts) >= 4:
+                    try:
+                        self._esp_pos = float(parts[3])
+                    except ValueError:
+                        pass
+        elif head == "ST":
+            fields = {}
+            for tok in rest.split():
+                k, _, v = tok.partition("=")
+                fields[k] = v
+            with self._state_lock:
+                self._last_status = time.monotonic()
+                self._alarms = (fields.get("aa") == "1", fields.get("ab") == "1")
+                try:
+                    self._esp_pos = float(fields.get("pos", self._esp_pos))
+                except ValueError:
+                    pass
+                if fields.get("arm") == "0":
+                    self._armed = None
+            # Levels are also in the status: a lost edge line re-syncs here.
+            if "s" in fields:
+                self._apply_level(0, fields["s"] == "1")
+            if "h" in fields:
+                self._apply_level(1, fields["h"] == "1")
+        elif head == "HELLO":
+            for tok in rest.split():
+                if tok.startswith("fw="):
+                    self._firmware = tok[3:]
+                elif tok.startswith("host="):
+                    with self._state_lock:
+                        self._net["host"] = tok[5:]
+            self._hello_seen.set()
+        elif head == "NET":
+            fields = {}
+            for tok in rest.split():
+                k, _, v = tok.partition("=")
+                fields[k] = v
+            with self._state_lock:
+                self._net.update(fields)
+                self._net["at"] = time.time()
+        elif head == "TRIP":
+            parts = rest.split()
+            self._pulsing = False
+            self._odo_segment(0, 0)
+            self._armed = None
+            try:
+                self._trip_pos = float(parts[2]) if len(parts) >= 3 else None
+            except ValueError:
+                self._trip_pos = None
+        elif head == "JOGDONE":
+            try:
+                self._jog_sent = int(rest.strip() or 0)
+            except ValueError:
+                self._jog_sent = 0
+            self._jog_done.set()
+        elif head == "BOOT":
+            # The board restarted under us (brown-out, reset button): its config
+            # and enable state are gone, so push them again.
+            if self._connected:
+                self._pulsing = False
+                self._odo_segment(0, 0)
+                self._send_cfg()
+                self._send(f"ENA {1 if self._held else 0}")
+        elif head == "EV":
+            print(f"[agent] ESP32: {rest}", flush=True)
+            if "WATCHDOG" in rest:
+                self._pulsing = False
+                self._odo_segment(0, 0)
+        elif head == "ERR":
+            print(f"[agent] ESP32 rejected a command: {rest}", flush=True)
+
+    # ---- sensor levels (read from the link, not a pin) ----------------------
+    def _shelf_level(self) -> bool:
+        raw = self._levels[0]
+        return (not raw) if SENSOR_INVERT else raw
+
+    def _index_level(self) -> bool:
+        raw = self._levels[1]
+        return (not raw) if SENSOR_INVERT else raw
+
+    # ---- motor verbs --------------------------------------------------------
+    @property
+    def link_ok(self) -> bool:
+        return self._connected
+
+    def engage(self) -> None:
+        with self._motor_lock:
+            if self._held:
+                return
+            self._send("ENA 1")
+            time.sleep(SERVO_ENABLE_SETTLE_S)
+            self._held = True
+
+    def release(self) -> None:
+        with self._motor_lock:
+            self._odo_segment(0, 0)
+            self._pulsing = False
+            self._send("ENA 0")
+            self._held = False
+
+    def _run_pulses(self, forward: bool, speed: float) -> None:
+        self.engage()
+        with self._motor_lock:
+            hz = self._hz_for(speed)
+            if not self._pulsing or self._forward != forward:
+                self._odo_segment(0, 0)
+            self._send(f"RUN {1 if forward else -1} {hz}")
+            self._odo_segment(hz, 1 if forward else -1)
+            self._pulsing = True
+            self._forward = forward
+
+    def stop(self) -> None:
+        with self._motor_lock:
+            self._odo_segment(0, 0)
+            self._jog_abort = True
+            self._armed = None
+            self._send("STOP")
+            self._pulsing = False
+
+    def abort_jog(self) -> None:
+        self._jog_abort = True
+        self._send("STOP")
+
+    def jog(self, motor: str, direction: str, amount: int, speed: Optional[float] = None) -> None:
+        pulses = max(0, min(SERVO_JOG_MAX_PULSES, int(amount)))
+        if pulses == 0:
+            return
+        if self.motor_index is not None:
+            motor = "both"
+        elif self.single_motor:
+            if motor == "b":
+                return
+            motor = "both"
+        self.engage()
+        forward = direction == "down"
+        with self._motor_lock:
+            self._odo_segment(0, 0)
+            self._pulsing = False
+            self._jog_abort = False
+            self._jog_done.clear()
+            self._jog_sent = 0
+            self._send(f"JOG {motor} {1 if forward else -1} {pulses} {SERVO_JOG_PPS}")
+        # Blocks on the Carousel worker like the GPIO jog; estop sends STOP,
+        # the firmware answers JOGDONE with what it managed to send.
+        self._jog_done.wait(pulses / float(SERVO_JOG_PPS) + 3.0)
+        if motor == "both" and self._jog_sent:
+            with self._odo_lock:
+                self._odo_close_segment()
+                self._odo_pulses += (1 if forward else -1) * self._jog_sent
+
+    def arm_stop(self, sensor: str = "shelf", min_gap_s: float = 0.0) -> None:
+        """
+        Make the ESP32 cut the pulse train on the next ARRIVAL edge of `sensor`
+        ("shelf" or "index"), without waiting for the Pi. The edge still
+        arrives in the counters as usual, so the Carousel's own bookkeeping is
+        unchanged — only the stop happens earlier. `min_gap_s` is how long the
+        window must have been empty before an arrival counts (bounce guard).
+        """
+        level = 0 if SENSOR_INVERT else 1
+        self._armed = sensor
+        gap_us = int(max(0.0, float(min_gap_s)) * 1_000_000)
+        self._send(f"ARM {'S' if sensor == 'shelf' else 'H'} {level} {gap_us}")
+
+    def disarm(self) -> None:
+        if self._armed is not None:
+            self._armed = None
+            self._send("ARM 0")
+
+    def set_servo_params(self, *args, **kwargs) -> None:
+        super().set_servo_params(*args, **kwargs)
+        if self._connected:
+            self._send_cfg()
+
+    def alarms(self) -> tuple[bool, bool]:
+        if self.ignore_alarm:
+            return (False, False)
+        a, b = self._alarms
+        b_used = not (self.single_motor and self.motor_index is None)
+        return (bool(a), bool(b and b_used))
+
+    def servo_snapshot(self) -> Optional[dict]:
+        snap = super().servo_snapshot() or {}
+        with self._state_lock:
+            snap.update({
+                "driver": "esp32",
+                "linkOk": self._connected,
+                "link": self.link,
+                "port": self._port_in_use or (self.port_setting or None),
+                "baud": self.baud,
+                "esp32Firmware": self._firmware,
+                "linkError": None if self._connected else self._link_error,
+            })
+            if self.wifi:
+                snap["esp32Host"] = self._net.get("host")
+                snap["esp32Wifi"] = self._net.get("state")
+                rssi = self._net.get("rssi")
+                snap["esp32Rssi"] = int(rssi) if rssi and rssi.lstrip("-").isdigit() else None
+                snap["esp32Ip"] = self._net.get("ip")
+        return snap
+
+    def _close_motor(self) -> None:
+        self._stop_reader.set()
+        self._send("STOP")
+        self._send("ENA 1")  # leave the drives in their power-up (enabled) state
+        if self._reader is not None and self._reader is not threading.current_thread():
+            self._reader.join(timeout=1.0)
+        self._drop_link("agent shutting down", quiet=True)
+
+    def cleanup(self) -> None:
+        try:
+            self._close_motor()
+        except Exception:
+            pass
 
 
 class SimHardware:
@@ -1548,15 +2101,13 @@ class SimHardware:
     def abort_jog(self) -> None:
         self._jog_abort = True
 
-    def set_servo_params(self, pulses_per_rev=None, max_pps=None, mirror_b=None, dc_trim_pct=None, **_: object) -> None:
+    def set_servo_params(self, pulses_per_rev=None, max_pps=None, mirror_b=None, **_: object) -> None:
         if pulses_per_rev is not None:
             self.pulses_per_rev = max(1, int(pulses_per_rev))
         if max_pps is not None:
             self.max_pps = max(SERVO_MIN_PPS, min(300_000, int(max_pps)))
         if mirror_b is not None:
             self.mirror_b = bool(mirror_b)
-        if dc_trim_pct is not None:
-            self.dc_trim_pct = max(-DC_TRIM_MAX_PCT, min(DC_TRIM_MAX_PCT, float(dc_trim_pct)))
 
     def __getattr__(self, name: str):
         # The odometer exists only on the servo drive. In DC mode the attribute
@@ -1654,17 +2205,6 @@ class SimHardware:
         with self._lock:
             return self._index_window_active()
 
-    # The simulator has one shared position, so "holding" a bridge changes
-    # nothing; these exist so the chain-sync and balance routines can run.
-    def can_chain_sync(self) -> bool:
-        return self.motor_mode == "dc"
-
-    def hold_one(self, index: int) -> None:
-        return None
-
-    def release_one(self, index: int, forward: bool, speed: float) -> None:
-        return None
-
     def shelf_clear(self, timeout: float) -> bool:
         deadline = time.monotonic() + timeout
         while self.shelf_active():
@@ -1732,12 +2272,6 @@ class Carousel:
         # Operator-set homing time; None = drive default (HOME_TIMEOUT × scale).
         self.home_timeout_s: Optional[float] = None
         self.shelf_timeout_s: Optional[float] = None
-        self.chain_sync_enabled = False
-        self.chain_sync_tolerance_ms = CHAIN_SYNC_DEFAULT_TOLERANCE_MS
-        self.chain_sync_max_wait_s = CHAIN_SYNC_MAX_WAIT_S
-        self.chain_sync_shelf_side = "a"
-        self._chain_sync_last_lead_ms: Optional[float] = None
-        self._chain_sync_last_corrected = False
         self._idle_since: Optional[float] = None
 
         # How a `goto` finds its shelf. "sensor": count shelf-flag edges (the
@@ -1763,11 +2297,11 @@ class Carousel:
         # one shelf pitch so the blind window can never swallow whole shelves.
         self._learned_pitch_s: Optional[float] = None
         self.last_sync_drift: Optional[int] = None
+        # Pulse positioning: re-zero the odometer every time the home flag
+        # passes during a move. Off = only Home / Calibrate set zero.
+        self.home_resync = True
         # Set by the server to persist a fresh calibration.
         self.on_calibration: Optional[Callable[[dict], None]] = None
-        # Set by the server to persist a trim found by the balance calibration.
-        self.on_balance: Optional[Callable[[float, str], None]] = None
-        self.last_balance: Optional[dict] = None
 
         self._cmd: Optional[tuple] = None
         self._abort = threading.Event()
@@ -1796,13 +2330,6 @@ class Carousel:
     def request_calibrate(self) -> None:
         self._set_command(("calibrate",))
 
-    def request_balance_calibrate(self, turns=None, direction=None) -> None:
-        n = BALANCE_CAL_DEFAULT_TURNS
-        if isinstance(turns, (int, float)) and not isinstance(turns, bool):
-            n = max(1, min(BALANCE_CAL_MAX_TURNS, int(turns)))
-        d = direction if direction in ("up", "down") else None
-        self._set_command(("balance_calibrate", n, d))
-
     def set_position_mode(self, mode) -> bool:
         if mode not in ("sensor", "pulses", "index"):
             return False
@@ -1817,6 +2344,13 @@ class Carousel:
             return False
         self.position_mode = mode
         print(f"[agent] positioning = {mode}", flush=True)
+        return True
+
+    def set_home_resync(self, on) -> bool:
+        if not isinstance(on, bool) or on == self.home_resync:
+            return False
+        self.home_resync = on
+        print(f"[agent] re-zero on home pass = {on}", flush=True)
         return True
 
     @property
@@ -1843,7 +2377,7 @@ class Carousel:
             return False
         win = info.get("indexWindowPulses")
         self.carousel_pulses = ppr
-        self.index_window_pulses = int(win) if isinstance(win, (int, float)) and win > 0 else None
+        self.index_window_pulses = int(win) if isinstance(win, (int, float)) and win > 0 else self.index_window_pulses
         self.calibration_info = {
             "type": "calibration",
             "ok": True,
@@ -2003,316 +2537,6 @@ class Carousel:
         print(f"[agent] shelf timeout = {value if value is not None else 'drive default'} s", flush=True)
         return True
 
-    def set_chain_sync(self, enabled=None, tolerance_ms=None, shelf_side=None, max_wait_s=None) -> bool:
-        """Chain sync at shelf 1: on/off, allowed lead in ms, safety-stop wait in s, which bridge carries the shelf sensor."""
-        changed = False
-        if isinstance(enabled, bool) and enabled != self.chain_sync_enabled:
-            self.chain_sync_enabled = enabled
-            changed = True
-        if isinstance(tolerance_ms, (int, float)) and not isinstance(tolerance_ms, bool):
-            tol = float(max(0.0, min(CHAIN_SYNC_MAX_TOLERANCE_MS, float(tolerance_ms))))
-            if tol != self.chain_sync_tolerance_ms:
-                self.chain_sync_tolerance_ms = tol
-                changed = True
-        if isinstance(max_wait_s, (int, float)) and not isinstance(max_wait_s, bool):
-            wait = float(max(CHAIN_SYNC_MIN_WAIT_S, min(CHAIN_SYNC_MAX_WAIT_LIMIT_S, float(max_wait_s))))
-            if wait != self.chain_sync_max_wait_s:
-                self.chain_sync_max_wait_s = wait
-                changed = True
-        if shelf_side in ("a", "b") and shelf_side != self.chain_sync_shelf_side:
-            self.chain_sync_shelf_side = shelf_side
-            changed = True
-        if changed:
-            print(
-                f"[agent] chain sync = {'on' if self.chain_sync_enabled else 'off'}, "
-                f"tolerance {self.chain_sync_tolerance_ms:.0f} ms, safety stop after "
-                f"{self.chain_sync_max_wait_s:.1f} s, shelf sensor on motor "
-                f"{self.chain_sync_shelf_side.upper()}",
-                flush=True,
-            )
-        return changed
-
-    def _chain_sync_hw(self):
-        """The hardware to pause per bridge, or None when sync is off or the drive cannot do it."""
-        if not self.chain_sync_enabled:
-            return None
-        hw = self.hw
-        can = getattr(hw, "can_chain_sync", None)
-        if can is None or not can() or not hasattr(hw, "hold_one") or not hasattr(hw, "index_active"):
-            return None
-        return hw
-
-    def _chain_sync_safety_stop(self, paused: int, shelf_idx: int, waited_s: float) -> None:
-        """
-        Cut both bridges after a chain-sync wait ran out. `paused` is the bridge
-        that was held; the other one kept driving and its sensor never fired.
-        The carousel is now out of level by an unknown amount and the shelf
-        count on the running chain is no longer trustworthy, so the position is
-        dropped and a re-home is required before the next automatic move.
-        """
-        self.hw.stop()
-        self.status = "idle"
-        self.homed = False
-        self._chain_sync_last_corrected = True
-        if self._abort.is_set():
-            return
-        running = "B" if paused == 0 else "A"
-        silent = "shelf" if paused != shelf_idx else "home"
-        print(f"[agent] chain sync: {silent} sensor silent for {waited_s:.1f} s, SAFETY STOP", flush=True)
-        self.emit({
-            "type": "fault",
-            "message": (
-                f"Chain sync safety stop: the {silent} sensor did not trigger within "
-                f"{self.chain_sync_max_wait_s:g} s while motor {running} drove alone to catch up. "
-                f"Check that the {silent} sensor is working and that motor {running}'s chain is "
-                f"not stuck, then level the chains by hand (Jog) and Home before moving again."
-            ),
-        })
-        self.emit(self.snapshot())
-
-    # ---- motor balance auto-calibration (DC, two bridges) ----
-    def _balance_frame(self, phase: str, message: str, **extra) -> dict:
-        frame = {"type": "balance", "phase": phase, "message": message}
-        frame.update(extra)
-        return frame
-
-    def _balance_fail(self, message: str, **extra) -> None:
-        self.hw.stop()
-        self.status = "idle"
-        print(f"[agent] balance calibration failed: {message}", flush=True)
-        self.last_balance = self._balance_frame("failed", message, **extra)
-        self.emit(self.last_balance)
-        self.emit(self.snapshot())
-
-    def _do_balance_calibrate(self, turns: int, direction: Optional[str] = None) -> None:
-        """
-        Measure the two chains against each other and set the Motor balance.
-
-        `direction` is the carousel travel to run in ("up"/"down"); omitted =
-        the homing direction, so the calibration turns the same way homing
-        does. With per-direction balance on, only that direction's trim is
-        measured and replaced; otherwise the single shared trim is.
-
-        Start condition: motor A's chain parked with the shelf flag in the shelf
-        sensor and motor B's chain with the home flag in the home sensor (or the
-        other way round if the shelf sensor is on motor B). Both bridges then run
-        `turns` full carousel turns at Motor speed. Each sensor is timed to the
-        rising edge that completes ITS chain's last turn: `turns × shelves` shelf
-        flags for the shelf sensor, `turns` home flags for the home sensor. The
-        chain that finishes first is held while the other catches up, so both
-        end where they started. The ratio of the two times, with the trim they
-        ran under, gives the trim that makes them equal.
-        """
-        hw = self.hw
-        can = getattr(hw, "can_chain_sync", None)
-        if can is None or not can() or not all(hasattr(hw, n) for n in ("hold_one", "index_active", "shelf_active")):
-            self._balance_fail(
-                "Motor balance calibration needs the Standard DC drive with both bridges on this agent."
-            )
-            return
-
-        shelf_idx = 0 if self.chain_sync_shelf_side == "a" else 1
-        home_idx = 1 - shelf_idx
-        shelf_motor, home_motor = "AB"[shelf_idx], "AB"[home_idx]
-        shelf_on = bool(hw.shelf_active())
-        home_on = bool(hw.index_active())
-        if not (shelf_on and home_on):
-            missing = []
-            if not shelf_on:
-                missing.append(f"the shelf sensor (jog motor {shelf_motor} until shelf 1's flag lights it)")
-            if not home_on:
-                missing.append(f"the home sensor (jog motor {home_motor} until the home flag lights it)")
-            self._balance_fail(
-                "Not ready: both chains must start on their trigger point. Still dark: " + " and ".join(missing) + "."
-            )
-            return
-
-        turns = max(1, min(BALANCE_CAL_MAX_TURNS, int(turns)))
-        direction = direction if direction in ("up", "down") else home_travel_direction()
-        per_dir = bool(getattr(hw, "dc_trim_per_dir", False))
-        need = {shelf_idx: turns * self.shelves, home_idx: turns}
-        counts = {0: 0, 1: 0}
-        # Each sensor starts ON its flag, so the first thing it must see is the
-        # flag leaving; only rising edges after that count.
-        armed = {shelf_idx: False, home_idx: False}
-        was_on = {shelf_idx: True, home_idx: True}
-        finished_at = {0: None, 1: None}
-        held: Optional[int] = None
-        trim_for = getattr(hw, "trim_for_direction", None)
-        prev_trim = float(trim_for(direction) if trim_for else getattr(hw, "dc_trim_pct", 0.0) or 0.0)
-        duty = self.move_speed
-
-        def sensor(idx: int) -> bool:
-            return bool(hw.shelf_active()) if idx == shelf_idx else bool(hw.index_active())
-
-        def progress(message: str) -> None:
-            self.emit(self._balance_frame(
-                "running", message, turns=turns, direction=direction,
-                lapsA=counts[0] // (self.shelves if shelf_idx == 0 else 1),
-                lapsB=counts[1] // (self.shelves if shelf_idx == 1 else 1),
-                previousTrimPct=prev_trim,
-            ))
-
-        self.status = "calibrating"
-        self.emit(self.snapshot())
-        print(
-            f"[agent] balance calibration: {turns} turn(s) {direction} at duty {duty:.2f}, "
-            f"current trim {prev_trim:+.3f} % ({'per-direction' if per_dir else 'shared'}), "
-            f"shelf sensor on motor {shelf_motor}",
-            flush=True,
-        )
-        progress(f"Both motors running {turns} turn{'s' if turns != 1 else ''} {direction} at Motor speed…")
-
-        # Soft start handled inline so no sensor edge is missed during the ramp.
-        ramp = self._ramp_seconds()
-        floor = min(MIN_DUTY, duty)
-        t0 = time.monotonic()
-        self._energise(direction, floor if ramp > 0 else duty)
-        last_duty = floor if ramp > 0 else duty
-        # Silence guards: a shelf flag must come at least once per shelf time,
-        # a home flag once per lap. Scaled for the duty like the move's guard.
-        # Both chains start ON their flag, so the home sensor's first edge is a
-        # whole lap away. The homing time only has to cover the half lap homing
-        # needs on average, so it is far too short here; a lap is bounded by
-        # one shelf time per shelf, and the lap guard takes the longer of the two
-        # with a half-lap margin on top.
-        scale = MOVE_SPEED / max(0.01, duty)
-        shelf_silence = self._shelf_timeout() * scale
-        lap_bound = max(self._home_timeout() * scale, shelf_silence * self.shelves)
-        silence = {
-            shelf_idx: shelf_silence + ramp,
-            home_idx: lap_bound * BALANCE_CAL_LAP_GUARD_MARGIN + ramp,
-        }
-        last_edge = {0: t0, 1: t0}
-        catch_up_deadline: Optional[float] = None
-        POLL = 0.001
-
-        while True:
-            if self._abort.is_set():
-                hw.stop()
-                self.status = "idle"
-                self.last_balance = self._balance_frame(
-                    "failed", "Balance calibration stopped.", turns=turns, direction=direction
-                )
-                self.emit(self.last_balance)
-                self.emit(self.snapshot())
-                return
-            now = time.monotonic()
-            if ramp > 0 and held is None and last_duty < duty:
-                frac = min(1.0, (now - t0) / ramp)
-                step_duty = floor + (duty - floor) * frac
-                if step_duty - last_duty >= 0.005 or frac >= 1.0:
-                    self._energise(direction, step_duty)
-                    last_duty = step_duty
-
-            for idx in (0, 1):
-                if finished_at[idx] is not None:
-                    continue
-                on = sensor(idx)
-                if not armed[idx]:
-                    if not on:
-                        armed[idx] = True
-                        last_edge[idx] = now
-                elif on and not was_on[idx]:
-                    counts[idx] += 1
-                    last_edge[idx] = now
-                    per_lap = self.shelves if idx == shelf_idx else 1
-                    if counts[idx] % per_lap == 0:
-                        lap = counts[idx] // per_lap
-                        if counts[idx] < need[idx]:
-                            progress(f"Motor {'AB'[idx]}: lap {lap} of {turns}")
-                    if counts[idx] >= need[idx]:
-                        finished_at[idx] = now - t0
-                        other = 1 - idx
-                        if finished_at[other] is None:
-                            hw.hold_one(idx)
-                            held = idx
-                            catch_up_deadline = now + max(
-                                BALANCE_CAL_CATCH_UP_FLOOR_S, BALANCE_CAL_CATCH_UP_FRACTION * finished_at[idx]
-                            )
-                            progress(
-                                f"Motor {'AB'[idx]} finished in {finished_at[idx]:.3f} s and is held; "
-                                f"waiting for motor {'AB'[other]}…"
-                            )
-                was_on[idx] = on
-
-            if finished_at[0] is not None and finished_at[1] is not None:
-                break
-
-            for idx in (0, 1):
-                if finished_at[idx] is None and now - last_edge[idx] > silence[idx]:
-                    name = "shelf" if idx == shelf_idx else "home"
-                    self._balance_fail(
-                        f"Safety stop: the {name} sensor did not trigger for {now - last_edge[idx]:.0f} s "
-                        f"while motor {'AB'[idx]} was running. Check the sensor and that the chain is not stuck.",
-                        turns=turns, direction=direction,
-                    )
-                    self.homed = False
-                    return
-            if catch_up_deadline is not None and now > catch_up_deadline:
-                self._balance_fail(
-                    f"Safety stop: motor {'AB'[1 - held]} needed more than "
-                    f"{BALANCE_CAL_CATCH_UP_FRACTION * 100:.0f} % longer than motor {'AB'[held]} to finish. "
-                    "That is more than the balance can correct; check both chains and sensors.",
-                    turns=turns, direction=direction,
-                )
-                self.homed = False
-                return
-            time.sleep(POLL)
-
-        hw.stop()
-        # Both chains are back on their flags give or take the coast of the
-        # second one; the shelf count during the held phase is not trustworthy,
-        # so the position is dropped and the operator homes before the next move.
-        self.homed = False
-        t_a, t_b = finished_at[0], finished_at[1]
-        scale_a = 1.0 + prev_trim / 100.0 if prev_trim < 0 else 1.0
-        scale_b = 1.0 - prev_trim / 100.0 if prev_trim > 0 else 1.0
-        # Speed per unit duty is inversely proportional to time taken at that duty.
-        per_duty_a = 1.0 / (t_a * scale_a)
-        per_duty_b = 1.0 / (t_b * scale_b)
-        if per_duty_a > per_duty_b:
-            ideal = -(1.0 - per_duty_b / per_duty_a) * 100.0
-        else:
-            ideal = (1.0 - per_duty_a / per_duty_b) * 100.0
-        new_trim = max(-DC_TRIM_MAX_PCT, min(DC_TRIM_MAX_PCT, ideal))
-        clamped = abs(ideal) > DC_TRIM_MAX_PCT
-        new_trim = round(new_trim, 3)
-        # Per-direction balance: an "up" run only touches the up trim. Shared
-        # balance (or a "down" run) replaces dc_trim_pct, which serves both ways.
-        store_up = per_dir and direction == "up"
-        if store_up:
-            self.set_servo(dc_trim_up_pct=new_trim)
-        else:
-            self.set_servo(dc_trim_pct=new_trim)
-        if self.on_balance is not None:
-            try:
-                self.on_balance(new_trim, "up" if store_up else "down")
-            except Exception as exc:  # pragma: no cover
-                print(f"[agent] could not persist balance: {exc}", flush=True)
-        self.status = "idle"
-        slower = "A" if t_a > t_b else "B"
-        diff_ms = abs(t_a - t_b) * 1000.0
-        which = f"{direction} balance" if per_dir else "balance"
-        if new_trim == 0:
-            verdict = f"both chains ran equal: {which} left at 0."
-        else:
-            verdict = f"{which} set to {'A' if new_trim < 0 else 'B'} −{abs(new_trim):.3f} %."
-        message = (
-            f"Motor A {t_a:.3f} s, motor B {t_b:.3f} s over {turns} turn{'s' if turns != 1 else ''} {direction} "
-            f"(motor {slower} slower by {diff_ms:.0f} ms): {verdict}"
-            + (" The ideal value was beyond ±20 % and has been clamped; check the mechanics." if clamped else "")
-            + " Home before the next move."
-        )
-        print(f"[agent] balance calibration: {message}", flush=True)
-        self.last_balance = self._balance_frame(
-            "done", message, turns=turns, direction=direction,
-            aMs=round(t_a * 1000.0, 1), bMs=round(t_b * 1000.0, 1),
-            previousTrimPct=prev_trim, trimPct=new_trim, clamped=clamped,
-        )
-        self.emit(self.last_balance)
-        self.emit(self.snapshot())
-
     def _shelf_timeout(self) -> float:
         """Effective shelf-timeout base: the operator's value, else PULSE_TIMEOUT × drive scale."""
         if self.shelf_timeout_s is not None:
@@ -2356,10 +2580,7 @@ class Carousel:
         max_pps=None,
         mirror_b=None,
         ignore_alarm=None,
-        dc_trim_pct=None,
         single_motor=None,
-        dc_trim_up_pct=None,
-        dc_trim_per_dir=None,
     ) -> None:
         """Forward drive tuning from the app's `config` to the live backend."""
         setter = getattr(self.hw, "set_servo_params", None)
@@ -2370,21 +2591,14 @@ class Carousel:
             max_pps=max_pps,
             mirror_b=mirror_b,
             ignore_alarm=ignore_alarm,
-            dc_trim_pct=dc_trim_pct,
             single_motor=single_motor,
-            dc_trim_up_pct=dc_trim_up_pct,
-            dc_trim_per_dir=dc_trim_per_dir,
         )
-        if any(v is not None for v in (
-            pulses_per_rev, max_pps, mirror_b, ignore_alarm, dc_trim_pct, single_motor, dc_trim_up_pct, dc_trim_per_dir
-        )):
+        if any(v is not None for v in (pulses_per_rev, max_pps, mirror_b, ignore_alarm, single_motor)):
             print(
                 f"[agent] drive set: ppr={getattr(self.hw, 'pulses_per_rev', '?')} "
                 f"max_pps={getattr(self.hw, 'max_pps', '?')} mirror_b={getattr(self.hw, 'mirror_b', '?')} "
                 f"ignore_alarm={getattr(self.hw, 'ignore_alarm', '?')} "
-                f"dc_trim_pct={getattr(self.hw, 'dc_trim_pct', '?')} "
-                f"dc_trim_up_pct={getattr(self.hw, 'dc_trim_up_pct', '?')} "
-                f"per_dir={getattr(self.hw, 'dc_trim_per_dir', '?')}",
+                f"single_motor={getattr(self.hw, 'single_motor', '?')}",
                 flush=True,
             )
 
@@ -2398,10 +2612,6 @@ class Carousel:
         if snap:
             snap["homeTimeoutS"] = round(self._home_timeout(), 1)
             snap["shelfTimeoutS"] = round(self._shelf_timeout(), 1)
-            snap["chainSyncLastLeadMs"] = (
-                None if self._chain_sync_last_lead_ms is None else round(self._chain_sync_last_lead_ms)
-            )
-            snap["chainSyncLastCorrected"] = self._chain_sync_last_corrected
         return snap
 
     def set_motion(self, move_speed=None, homing_speed=None, ramp_pct=None,
@@ -2861,12 +3071,24 @@ class Carousel:
             # app the same way, and halt the pulse train so a tripped drive is
             # not asked to keep following a command it has already dropped.
             snap = self.servo_snapshot()
-            key = (snap.get("alarmA"), snap.get("alarmB")) if snap else None
+            key = (snap.get("alarmA"), snap.get("alarmB"), snap.get("linkOk")) if snap else None
             if key != servo_last:
                 servo_last = key
                 if snap:
                     try:
                         self.emit(snap)
+                        if snap.get("linkOk") is False:
+                            # The ESP32 controller stopped answering. Its own
+                            # watchdog has already cut the pulses; tell the app.
+                            self.request_stop()
+                            self.status = "idle"
+                            self.emit(self.snapshot())
+                            self.emit({
+                                "type": "fault",
+                                "message": "ESP32 servo controller link lost "
+                                           f"({snap.get('linkError') or 'no answer on ' + str(snap.get('port') or 'serial port')}). "
+                                           "Check the USB/UART cable and the controller's power; the agent keeps retrying.",
+                            })
                         if snap.get("alarmA") or snap.get("alarmB"):
                             which = " and ".join(
                                 n for n, on in (("motor A", snap.get("alarmA")), ("motor B", snap.get("alarmB"))) if on
@@ -2906,8 +3128,6 @@ class Carousel:
                     self._do_goto(cmd[1])
                 elif cmd[0] == "calibrate":
                     self._do_calibrate()
-                elif cmd[0] == "balance_calibrate":
-                    self._do_balance_calibrate(cmd[1], cmd[2] if len(cmd) > 2 else None)
                 elif cmd[0] == "jog":
                     self._do_jog(cmd[1], cmd[2], cmd[3], cmd[4] if len(cmd) > 4 else None)
             except Exception as exc:  # pragma: no cover - hardware faults
@@ -3045,6 +3265,25 @@ class Carousel:
         # position is measured from, and the index edge was taken in
         # `home_direction` — the same edge calibration measured.
         edge_pos = self._odometer()
+        home_sign = 1 if home_direction == "down" else -1
+        if found and edge_pos is not None and not self._abort.is_set():
+            # Pulse drive: keep the motor running past the edge and finish on
+            # the middle of the home flag without a stop at the edge.
+            centre = self._home_to_flag_centre(home_direction, home_sign, edge_pos,
+                                               home_target, home_floor, home_ramp, home_t0)
+            if centre is None:
+                self.hw.stop()
+                self.status = "idle"
+                if not self._abort.is_set():
+                    self.emit({"type": "fault", "message": "Homing: could not reach the middle of the home flag"})
+                return
+            self._home_origin = centre
+            self._home_edge_direction = home_direction
+            self.current_shelf = 0
+            self.homed = True
+            self.status = "idle"
+            self.emit({"type": "homed", "shelf": 0})
+            return
         self.hw.stop()
         if self._abort.is_set():
             self.status = "idle"
@@ -3073,12 +3312,10 @@ class Carousel:
         # defined by the INDEX sensor; whether the shelf flag also lines up is a
         # mounting question, not something to fix by driving the motor.
 
+        # DC drives have no pulse counter: home is wherever the edge stopped us.
         self.current_shelf = 0
         self.homed = True
         self.status = "idle"
-        if edge_pos is not None:
-            self._home_origin = edge_pos
-            self._home_edge_direction = home_direction
         self.emit({"type": "homed", "shelf": 0})
 
     def _track_coast(self, step: int, seen_inactive: bool) -> None:
@@ -3133,33 +3370,150 @@ class Carousel:
         self.emit({"type": "calibration", "ok": False,
                    "message": "Calibration stopped." if aborted else message})
 
+    def _index_half(self) -> float:
+        """Half the measured home-flag length in pulses (0 when unknown)."""
+        return float(self.index_window_pulses) / 2.0 if self.index_window_pulses else 0.0
+
+    def _home_to_flag_centre(self, direction: str, sign: int, edge_pos: float,
+                             target: float, floor: float, ramp: float, t0: float) -> Optional[float]:
+        """
+        Motor still running, just past the home flag's rising edge. Returns the
+        datum (middle of the flag) once the carousel is parked on it, or None.
+
+        Flag length known: carry on at the homing speed for half a flag and
+        stop. The slow crawl is only for MEASURING, so it is skipped here.
+
+        Flag length unknown: measure it now, exactly as calibration does: crawl
+        over it at 1/3 of the homing speed until it leaves the sensor, stop,
+        reverse slowly onto the middle, and save the length for next time.
+        """
+        half = self._index_half()
+        if half > 0:
+            centre = edge_pos + sign * half
+            duty = target if ramp <= 0 else floor + (target - floor) * min(1.0, (time.monotonic() - t0) / ramp)
+            left = abs(centre - self._odometer())
+            timeout = 3.0 * left / self._pulse_rate(duty) + 3.0
+            if not self._drive_to_pulse(direction, duty, centre, timeout):
+                return None
+            # Coasting past the computed middle is fine: the datum is the
+            # computed centre, so the next move corrects the difference.
+            return centre
+
+        slow = max(SLIDER_MIN_DUTY, target / 3.0)
+        self._energise(direction, slow)
+        flag = self._measure_flag(edge_pos, sign, self._home_timeout())
+        self.hw.stop()
+        if flag is None:
+            return None
+        self.hw.reset_pulses()
+        if flag <= 0:
+            return edge_pos
+        centre = edge_pos + sign * flag / 2.0
+        time.sleep(CALIBRATE_REVERSE_SETTLE_S)
+        back_direction = "up" if direction == "down" else "down"
+        back = abs(self._odometer() - centre)
+        if not self._drive_to_pulse(back_direction, slow, centre,
+                                    3.0 * back / self._pulse_rate(slow) + 3.0):
+            return None
+        self._remember_flag_length(int(round(flag)))
+        return centre
+
+    def _remember_flag_length(self, pulses: int) -> None:
+        """Keep a flag length measured by homing, across restarts."""
+        if pulses <= 0:
+            return
+        self.index_window_pulses = pulses
+        message = f"Home flag measured while homing: {pulses} pulses long; position 0 is its middle."
+        print(f"[agent] {message}", flush=True)
+        if self.calibration_info:
+            self.calibration_info = dict(self.calibration_info, indexWindowPulses=pulses)
+            self.calibration_info.pop("restored", None)
+            self.emit(self.calibration_frame())
+        if self.on_calibration is not None:
+            try:
+                self.on_calibration(self.calibration_info or {})
+            except Exception as exc:
+                print(f"[agent] could not persist home flag length: {exc}", flush=True)
+
+    def set_home_flag(self, pulses) -> None:
+        """Restore a flag length saved by an earlier homing (never overrides a calibration)."""
+        if self.index_window_pulses:
+            return
+        if isinstance(pulses, (int, float)) and pulses > 0:
+            self.index_window_pulses = int(pulses)
+
+    def _measure_flag(self, edge_pos: float, sign: int, timeout: float) -> Optional[float]:
+        """
+        Motor already crawling over the home flag: return how far (pulses) the
+        carousel travelled from `edge_pos` until the flag LEFT the index window.
+        The first inactive sample is the candidate end; it only counts once the
+        sensor has stayed clear for FLAG_CLEAR_CONFIRM_S, so a flickering edge
+        is not taken for the end of the flag. None on abort or timeout.
+        """
+        deadline = time.monotonic() + timeout
+        candidate: Optional[float] = None
+        clear_since = 0.0
+        while True:
+            if self._abort.is_set() or time.monotonic() > deadline:
+                return None
+            pos = self._odometer()
+            now = time.monotonic()
+            if self.hw.index_active():
+                candidate = None
+            elif candidate is None:
+                candidate = pos
+                clear_since = now
+            elif now - clear_since >= FLAG_CLEAR_CONFIRM_S:
+                return max(0.0, (candidate - edge_pos) * sign)
+            time.sleep(0.001)
+
+    def _drive_to_pulse(self, direction: str, duty: float, goal: float, timeout: float) -> bool:
+        """Drive at a fixed duty until the odometer reaches `goal`, then stop."""
+        sign = 1 if direction == "down" else -1
+        self._energise(direction, duty)
+        deadline = time.monotonic() + timeout
+        tolerance = self._pulse_rate(duty) * 1.5 * 0.001
+        while True:
+            if self._abort.is_set() or time.monotonic() > deadline:
+                self.hw.stop()
+                return False
+            if (goal - self._odometer()) * sign <= tolerance:
+                self.hw.stop()
+                return True
+            time.sleep(0.001)
+
     def _do_calibrate(self) -> None:
         """
-        Measure the carousel in pulses, in ONE continuous run at homing speed:
+        Measure the carousel in pulses (servo, AC servo or closed-loop stepper):
 
-          1. find the index rising edge — that is home, zero the odometer there
-             (the carousel does not stop; stopping and restarting would add the
-             start-up slack to the measurement);
-          2. keep going: note where the index flag LEAVES the window (its width
-             in pulses, needed to re-sync when passing home the other way) and
-             every shelf-flag edge seen on the way round;
-          3. the next index rising edge closes the revolution: pulses per
-             revolution. Stop there — we are at home, so the run ends homed.
-
-        Both index edges are taken at the same speed in the same direction, so
-        sensor latency cancels out of the difference.
+          1. at homing speed, find the index rising edge: one end of the home
+             flag (the motor keeps running, so no start-up slack is measured);
+          2. drop to 1/3 of the homing speed and crawl until the flag leaves the
+             window: the flag length in pulses;
+          3. back to homing speed for the rest of the turn, noting every shelf
+             flag; the next index rising edge closes the revolution (both edges
+             are taken at homing speed in the same direction, so sensor latency
+             cancels out of pulses-per-revolution);
+          4. crawl over the flag a second time at 1/3 speed and average the two
+             flag lengths;
+          5. stop, reverse at 1/3 speed back to the MIDDLE of the flag and set
+             that as position 0. Shelves are spaced evenly from there
+             (pulses per revolution / shelves), so no shelf sensor is needed.
         """
         if self._odometer() is None:
             self.emit({"type": "calibration", "ok": False,
-                       "message": "Calibration needs the servo drive: the DC bridges have no pulse counter."})
+                       "message": "Calibration needs a pulse drive (servo or closed-loop stepper): "
+                                  "the DC bridges have no pulse counter."})
             return
         self.status = "calibrating"
         self.emit(self.snapshot())
         self.hw.reset_pulses()
 
         direction = "up" if HOMING_DIRECTION == "down" else "down"
+        back_direction = "up" if direction == "down" else "down"
         sign = 1 if direction == "down" else -1
         target = self.homing_speed
+        slow = max(SLIDER_MIN_DUTY, target / 3.0)
         ramp = self._ramp_seconds()
         floor = min(MIN_DUTY, target)
         self._energise(direction, floor if ramp > 0 else target)
@@ -3180,19 +3534,35 @@ class Carousel:
             return
 
         origin = self._odometer()
-        self._home_origin = origin
-        self._home_edge_direction = direction
-        self.current_shelf = 0
-        self.homed = True
-        self.emit({"type": "homed", "shelf": 0})
+
+        # Flag length, first pass, at a third of the homing speed.
+        self._energise(direction, slow)
+        flag_1 = self._measure_flag(origin, sign, home_timeout)
+        if flag_1 is None:
+            self._calibration_failed(
+                "Calibration stopped." if self._abort.is_set()
+                else "Calibration timed out: the home flag never left the index sensor.")
+            return
+        # Drop any bounce edges produced while crawling off the flag.
         self.hw.reset_pulses()
 
+        # Back up to homing speed for the rest of the turn.
+        t1 = time.monotonic()
+
+        def speed_up_step() -> None:
+            if ramp <= 0:
+                self._energise(direction, target)
+                return
+            frac = min(1.0, (time.monotonic() - t1) / ramp)
+            self._energise(direction, slow + (target - slow) * frac)
+
+        speed_up_step()
         shelf_edges: list[float] = []
-        index_window: Optional[float] = None
-        index_was_active = True
+        index_window: Optional[float] = flag_1
         seen_inactive = not self.hw.shelf_active()
         deadline = time.monotonic() + home_timeout * CALIBRATE_TIMEOUT_SCALE
         rev_raw: Optional[float] = None
+        last_duty_update = 0.0
 
         while True:
             if self._abort.is_set():
@@ -3202,14 +3572,11 @@ class Carousel:
                 self._calibration_failed(
                     "Calibration timed out: the index sensor was not seen again after a full revolution.")
                 return
-            ramp_step()
+            if time.monotonic() - last_duty_update >= PULSE_DUTY_UPDATE_S:
+                speed_up_step()
+                last_duty_update = time.monotonic()
             pos = self._odometer()
             travelled = (pos - origin) * sign
-
-            idx_active = self.hw.index_active()
-            if index_was_active and not idx_active and index_window is None:
-                index_window = travelled
-            index_was_active = idx_active
 
             pulsed = self.hw.take_shelf_pulse(0.0)
             active = self.hw.shelf_active()
@@ -3220,20 +3587,42 @@ class Carousel:
                 seen_inactive = True
 
             if self.hw.take_index_pulse(0.0):
-                # Only a rising edge that follows the window being cleared, and
-                # is far beyond the window's own width, closes the revolution;
-                # anything else is the home flag bouncing at the sensor.
-                if index_window is not None and travelled > max(100.0, 20.0 * index_window):
+                # Only a rising edge far beyond the flag's own length closes the
+                # revolution; anything else is the home flag bouncing at the sensor.
+                if travelled > max(100.0, 20.0 * (index_window or 0.0)):
                     rev_raw = travelled
                     break
             time.sleep(0.001)
 
-        self.hw.stop()
+        edge_2 = origin + sign * rev_raw
         rev = int(round(abs(rev_raw)))
         if rev <= 0:
-            self._calibration_failed("Calibration measured zero travel; is the servo drive pulsing?")
+            self._calibration_failed("Calibration measured zero travel; is the drive pulsing?")
             return
-        window = int(round(abs(index_window))) if index_window else None
+
+        # Flag length, second pass, at the same slow speed; average both.
+        self._energise(direction, slow)
+        flag_2 = self._measure_flag(edge_2, sign, home_timeout)
+        self.hw.stop()
+        if flag_2 is None:
+            self._calibration_failed(
+                "Calibration stopped." if self._abort.is_set()
+                else "Calibration timed out: the home flag never left the index sensor.")
+            return
+        flag_lengths = [w for w in (flag_1, flag_2) if w > 0]
+        flag = sum(flag_lengths) / len(flag_lengths) if flag_lengths else 0.0
+        window = int(round(flag)) if flag > 0 else None
+        centre = edge_2 + sign * flag / 2.0
+
+        # Let the drive settle, then reverse slowly back onto the flag's middle.
+        time.sleep(CALIBRATE_REVERSE_SETTLE_S)
+        back_pulses = abs((self._odometer() - centre))
+        back_timeout = 3.0 * back_pulses / self._pulse_rate(slow) + 3.0
+        if not self._drive_to_pulse(back_direction, slow, centre, back_timeout):
+            self._calibration_failed(
+                "Calibration stopped." if self._abort.is_set()
+                else "Calibration: could not drive back to the middle of the home flag.")
+            return
         pitch = rev / max(1, self.shelves)
 
         # Merge shelf edges that sit within a quarter pitch of each other (the
@@ -3249,6 +3638,8 @@ class Carousel:
 
         message = (f"Calibrated: {rev} pulses per revolution, {round(pitch)} per shelf "
                    f"({self.shelves} shelves).")
+        if window:
+            message += f" Home flag {window} pulses long; position 0 is its middle."
         if flags_seen is None:
             message += " Home sensor only: shelves are spaced evenly from home."
         else:
@@ -3259,9 +3650,10 @@ class Carousel:
 
         self.carousel_pulses = rev
         self.index_window_pulses = window
-        # Home again: the datum is the edge just taken, not the stop a
-        # millisecond later.
-        self._home_origin = origin + sign * rev_raw
+        # The datum is the computed middle of the flag, not wherever the
+        # reverse crawl happened to stop a pulse or two later.
+        self._home_origin = centre
+        self._home_edge_direction = direction
         self.current_shelf = 0
         self.homed = True
         self.status = "idle"
@@ -3377,15 +3769,11 @@ class Carousel:
             if self.hw.take_index_pulse(0.0):
                 if last_index_pos is None or abs(pos - last_index_pos) > START_REENTRY_PITCH_FRACTION * pitch:
                     last_index_pos = pos
-                    if absolute:
-                        # Calibration measured the rising edge travelling in the
-                        # homing direction; coming the other way the edge is the
-                        # far side of the window, one window-width along.
-                        if direction == self._home_edge_direction or not self.index_window_pulses:
-                            expected = 0.0
-                        else:
-                            home_sign = 1 if self._home_edge_direction == "down" else -1
-                            expected = home_sign * float(self.index_window_pulses)
+                    if absolute and self.home_resync:
+                        # Zero is the middle of the home flag, so the rising
+                        # edge is half a flag BEFORE it in the travel direction,
+                        # whichever way the carousel is going.
+                        expected = -sign * self._index_half()
                         measured = (pos - self._home_origin) % rev
                         drift = (measured - expected) % rev
                         if drift > rev / 2:
@@ -3678,33 +4066,6 @@ class Carousel:
         # already have moved back into the window.
         seen_inactive = not parked_on_flag
 
-        # CHAIN SYNC at shelf 1. `home_leg` is True while the shelf about to be
-        # counted is shelf 0 (the one carrying the home flag). That leg is driven
-        # at Approach speed and the two sensors are timed against each other:
-        # whichever fires first starts a lead clock; past the tolerance its
-        # bridge is held until the other sensor fires. `sync_paused` is the held
-        # bridge index while a correction is in progress.
-        sync_hw = self._chain_sync_hw()
-        shelf_idx = 0 if self.chain_sync_shelf_side == "a" else 1
-        home_idx = 1 - shelf_idx
-        home_leg = sync_hw is not None and (self.current_shelf + step) % self.shelves == 0
-        sync_shelf_t: Optional[float] = None
-        sync_home_t: Optional[float] = None
-        sync_paused: Optional[int] = None
-        sync_pause_started = 0.0
-        sync_recorded = False
-        # The watch outlives the count: once the shelf sensor has fired, shelf 1
-        # is counted and the leg moves on, but the home sensor may still be a
-        # few hundred ms away. `sync_active` keeps the watch (and the Approach
-        # speed) going until both sensors have fired or the wait is given up.
-        sync_active = home_leg
-        sync_blind_until = ramp_started + arm_s
-        home_was_active = bool(sync_hw.index_active()) if sync_hw is not None else False
-        leg_target = approach if home_leg else cruise
-        if home_leg and speed > approach:
-            self._energise(direction, approach)
-            speed = approach
-
         # ------------------------------------------------------------------
         # RUNAWAY STOP — the only guard, and the only use of a clock here.
         #
@@ -3738,6 +4099,13 @@ class Carousel:
         last_odo = self._odometer()
         last_pitch_time: Optional[float] = None
         rejected_edges = 0
+        # Controllers that can stop on a sensor edge BY THEMSELVES (the ESP32
+        # backend): armed once for the target leg, below, so the pulse train is
+        # cut the microsecond the flag arrives rather than one serial round trip
+        # and one Python poll later. Everything else in this loop is unchanged;
+        # the edge still reaches the counters and `hw.stop()` is still called.
+        hw_arm = getattr(self.hw, "arm_stop", None)
+        hw_armed = False
 
         while True:
             if self._abort.is_set():
@@ -3772,9 +4140,9 @@ class Carousel:
             # changeover below had just set — `approach` is deliberately lower
             # than `cruise`, so `speed < cruise` stays true and the ramp would
             # undo the one thing that keeps the coast short.
-            if ramp_seconds > 0 and speed < leg_target and not on_final_approach and not home_leg:
+            if ramp_seconds > 0 and speed < cruise and not on_final_approach:
                 frac = (time.monotonic() - ramp_started) / ramp_seconds
-                target_duty = leg_target if frac >= 1.0 else ramp_floor + (leg_target - ramp_floor) * frac
+                target_duty = cruise if frac >= 1.0 else ramp_floor + (cruise - ramp_floor) * frac
                 if target_duty > speed:
                     self._energise(direction, target_duty)
                     speed = target_duty
@@ -3792,7 +4160,7 @@ class Carousel:
             # the target flag triggers. The stop itself is still instant on that
             # trigger; only the run-up to it is softened, which is why this adds no
             # overshoot.
-            if (on_final_approach or home_leg) and decel_started is not None and speed > approach:
+            if on_final_approach and decel_started is not None and speed > approach:
                 if decel_seconds <= 0:
                     target_duty = approach
                 else:
@@ -3830,6 +4198,18 @@ class Carousel:
             #
             # If a backend ever did pulse on both edges, the fix belongs in that
             # driver — the falling edge must not reach this queue.
+            if (hw_arm is not None and not hw_armed and counted == steps - 1 and seen_inactive
+                    and not (arm_s > 0 and time.monotonic() - ramp_started < arm_s)):
+                # Target leg, window already seen empty, safe-move time over: let
+                # the controller stop on the next arrival. The minimum empty gap
+                # it must see first is a quarter pitch, so a counted flag rocking
+                # back into the window (a bounce) cannot trip it early.
+                gap_ref = last_pitch_time or self._learned_pitch_s or 0.0
+                try:
+                    hw_arm("shelf", min_gap_s=max(0.05, 0.25 * float(gap_ref)))
+                    hw_armed = True
+                except Exception:
+                    hw_arm = None
             pulsed = self.hw.take_shelf_pulse(0.0)
             active = self.hw.shelf_active()
             # SAFE MOVE TIME (operator setting, 0 = off). For this long after the
@@ -3929,69 +4309,6 @@ class Carousel:
                 time.sleep(POLL)
                 continue
 
-            if sync_active and sync_hw is not None and time.monotonic() >= sync_blind_until:
-                now_s = time.monotonic()
-                home_now = bool(sync_hw.index_active())
-                if home_now and not home_was_active and sync_home_t is None:
-                    sync_home_t = now_s
-                home_was_active = home_now
-                if triggered and sync_shelf_t is None:
-                    sync_shelf_t = now_s
-
-                if sync_paused is None:
-                    lead_s, leader = None, None
-                    if sync_shelf_t is not None and sync_home_t is None:
-                        lead_s, leader = now_s - sync_shelf_t, shelf_idx
-                    elif sync_home_t is not None and sync_shelf_t is None:
-                        lead_s, leader = now_s - sync_home_t, home_idx
-                    if lead_s is not None and lead_s * 1000.0 >= self.chain_sync_tolerance_ms:
-                        sync_paused = leader
-                        sync_pause_started = now_s
-                        sync_hw.hold_one(leader)
-                        self._chain_sync_last_corrected = True
-                        print(
-                            f"[agent] chain sync: {'shelf' if leader == shelf_idx else 'home'} sensor leads by "
-                            f"{lead_s * 1000:.0f} ms, holding motor {'A' if leader == 0 else 'B'}",
-                            flush=True,
-                        )
-                else:
-                    other_fired = (sync_home_t is not None) if sync_paused == shelf_idx else (sync_shelf_t is not None)
-                    waited = now_s - sync_pause_started
-                    if other_fired:
-                        sync_hw.release_one(sync_paused, direction != "up", speed)
-                        sync_paused = None
-                        last_activity = now_s
-                    elif waited > self.chain_sync_max_wait_s:
-                        # Safety stop. One chain has been driving alone and the
-                        # lagging sensor never fired: either it is dead or that
-                        # chain is stuck. Running on would wind the carousel out
-                        # of level, so cut both bridges and report it.
-                        self._chain_sync_safety_stop(
-                            paused=sync_paused, shelf_idx=shelf_idx, waited_s=waited
-                        )
-                        return
-
-                if not sync_recorded and sync_shelf_t is not None and sync_home_t is not None:
-                    sync_recorded = True
-                    sync_active = False
-                    self._chain_sync_last_lead_ms = (sync_home_t - sync_shelf_t) * 1000.0
-                    print(
-                        f"[agent] chain sync: shelf 1 passed, lead {self._chain_sync_last_lead_ms:+.0f} ms "
-                        f"({'corrected' if self._chain_sync_last_corrected else 'within tolerance'})",
-                        flush=True,
-                    )
-
-                if not sync_active and not home_leg and not on_final_approach and speed < cruise:
-                    # Shelf 1 was counted earlier while the sync was still
-                    # pending; now that it is settled, ramp back up to cruise.
-                    leg_target = cruise
-                    decel_started = None
-                    ramp_floor = speed
-                    ramp_started = now_s
-                    if ramp_seconds <= 0:
-                        self._energise(direction, cruise)
-                        speed = cruise
-
             if triggered:
                 now = time.monotonic()
                 # Time to cross the pitch just travelled — the interval since the
@@ -4018,36 +4335,6 @@ class Carousel:
                 last_activity = now
 
                 if counted >= steps:
-                    if home_leg and sync_hw is not None and sync_home_t is None:
-                        # Parking on shelf 1 with the shelf sensor first: the
-                        # shelf side is where it should be, so hold it and let
-                        # the home side catch up until its flag arrives.
-                        sync_hw.hold_one(shelf_idx)
-                        if sync_paused == home_idx:
-                            sync_hw.release_one(home_idx, direction != "up", speed)
-                        wait_started = time.monotonic()
-                        while not self._abort.is_set():
-                            home_now = bool(sync_hw.index_active())
-                            if home_now and not home_was_active:
-                                sync_home_t = time.monotonic()
-                                break
-                            home_was_active = home_now
-                            waited = time.monotonic() - wait_started
-                            if waited > self.chain_sync_max_wait_s:
-                                # The home chain ran on alone and its flag never
-                                # came. Do not report "arrived": the shelf side
-                                # is parked but the other side is somewhere else.
-                                self._chain_sync_safety_stop(
-                                    paused=shelf_idx, shelf_idx=shelf_idx, waited_s=waited
-                                )
-                                return
-                            time.sleep(POLL)
-                        if sync_home_t is not None and sync_shelf_t is not None:
-                            self._chain_sync_last_lead_ms = (sync_home_t - sync_shelf_t) * 1000.0
-                            self._chain_sync_last_corrected = (
-                                self._chain_sync_last_corrected
-                                or self._chain_sync_last_lead_ms >= self.chain_sync_tolerance_ms
-                            )
                     # THIS IS THE TARGET. Cut power immediately, before any
                     # bookkeeping, while the flag is still in the window.
                     self.hw.stop()
@@ -4083,45 +4370,6 @@ class Carousel:
 
                 self.current_shelf = (self.current_shelf + step) % self.shelves
                 self.emit({"type": "pos", "shelf": self.current_shelf})
-
-                if sync_hw is not None:
-                    if sync_paused is not None:
-                        # Never carry a held bridge into the next leg.
-                        sync_hw.release_one(sync_paused, direction != "up", speed)
-                        sync_paused = None
-                    next_is_home = (self.current_shelf + step) % self.shelves == 0
-                    if home_leg and not next_is_home:
-                        # Shelf 1 is counted. Ramp back up to cruise now if both
-                        # sensors have fired; otherwise the watch above does it
-                        # once the home sensor has caught up.
-                        home_leg = False
-                        if not sync_active:
-                            leg_target = cruise
-                            if not on_final_approach:
-                                decel_started = None
-                                ramp_floor = speed
-                                ramp_started = now
-                                if ramp_seconds <= 0 and speed < cruise:
-                                    self._energise(direction, cruise)
-                                    speed = cruise
-                    elif next_is_home and not home_leg:
-                        # Shelf 1 is next: ease down to Approach and start timing.
-                        home_leg = True
-                        sync_active = True
-                        leg_target = approach
-                        self._chain_sync_last_corrected = False
-                        if not on_final_approach and approach < speed:
-                            decel_from = speed
-                            decel_started = now
-                            decel_seconds = min(self._ramp_seconds(), DECEL_LEG_FRACTION * pitch_time)
-                            if decel_seconds <= 0:
-                                self._energise(direction, approach)
-                                speed = approach
-                    if home_leg and next_is_home:
-                        sync_shelf_t = None
-                        sync_home_t = None
-                        sync_recorded = False
-                        home_was_active = bool(sync_hw.index_active())
 
             # Checked on EVERY pass, deliberately outside the if/elif above.
             # As an `elif` it was unreachable in the one case it exists for: a
@@ -4215,12 +4463,26 @@ async def serve(args) -> None:
         "max_pps": motor_conf.get("maxPps", SERVO_MAX_PPS),
         "mirror_b": motor_conf.get("mirrorB", SERVO_MIRROR_B),
         "ignore_alarm": bool(motor_conf.get("ignoreAlarm", False)),
-        "dc_trim_pct": float(motor_conf.get("dcTrimPct", 0.0) or 0.0),
-        "dc_trim_up_pct": float(motor_conf.get("dcTrimUpPct", 0.0) or 0.0),
-        "dc_trim_per_dir": bool(motor_conf.get("dcTrimPerDirection", False)),
         "single_motor": bool(motor_conf.get("singleMotor", False)),
+        # Servo controller: "gpio" = the Pi pulses PUL/DIR itself (iSV57T wiring),
+        # "esp32" = an ESP32 running pi-agent/esp32-servo does it (A6-RS wiring).
+        "driver": getattr(args, "servo_driver", None) or motor_conf.get("servoDriver") or "gpio",
+        "esp32_link": motor_conf.get("esp32Link") or ESP32_LINK_DEFAULT,
+        "esp32_port": getattr(args, "esp32_port", None) or motor_conf.get("esp32Port") or "",
+        "esp32_baud": int(motor_conf.get("esp32Baud") or ESP32_BAUD_DEFAULT),
+        # Which drive is on the PUL/DIR lines (integrated servo / AC servo /
+        # closed-loop stepper) and optional polarity overrides (None = profile).
+        "pulse_drive": (
+            getattr(args, "pulse_drive", None) or motor_conf.get("pulseDrive")
+            or ("ac-servo" if (motor_conf.get("servoDriver") == "esp32") else PULSE_DRIVE_DEFAULT)
+        ),
+        "ena_active_low": motor_conf.get("enableActiveLow") if isinstance(motor_conf.get("enableActiveLow"), bool) else None,
+        "alm_active_low": motor_conf.get("alarmActiveLow") if isinstance(motor_conf.get("alarmActiveLow"), bool) else None,
     }
-    DC_ONLY_PARAMS = ("dc_trim_pct", "dc_trim_up_pct", "dc_trim_per_dir")
+    if servo_params["pulse_drive"] not in PULSE_DRIVES:
+        servo_params["pulse_drive"] = PULSE_DRIVE_DEFAULT
+    # Consumed by build_hardware, never passed to a backend constructor.
+    LINK_PARAMS = ("driver", "esp32_link", "esp32_port", "esp32_baud")
     # Per-carousel state (hold timeout, positioning, calibration). A normal Pi
     # has one carousel stored at the top level; twin mode (hardware only) keeps
     # one entry per side so each carousel keeps its own calibration.
@@ -4229,10 +4491,6 @@ async def serve(args) -> None:
         "sensorArmS": motor_conf.get("sensorArmS", 0),
         "homeTimeoutS": motor_conf.get("homeTimeoutS"),
         "shelfTimeoutS": motor_conf.get("shelfTimeoutS"),
-        "chainSyncEnabled": motor_conf.get("chainSyncEnabled"),
-        "chainSyncToleranceMs": motor_conf.get("chainSyncToleranceMs"),
-        "chainSyncMaxWaitS": motor_conf.get("chainSyncMaxWaitS"),
-        "chainSyncShelfSide": motor_conf.get("chainSyncShelfSide"),
         "positionMode": motor_conf.get("positionMode"),
         "calibration": motor_conf.get("calibration"),
     }
@@ -4254,14 +4512,38 @@ async def serve(args) -> None:
             print(f"[agent] running in SIMULATION mode ({shelves} shelves, {mode} drive){label}", flush=True)
             return SimHardware(shelves, motor_mode=mode), "started with --simulate"
         try:
-            if mode == "servo":
-                params = {k: v for k, v in servo_params.items() if k not in DC_ONLY_PARAMS}
+            if mode == "servo" and servo_params["driver"] == "esp32":
+                if side:
+                    raise RuntimeError(
+                        "the ESP32 servo controller drives one carousel (both chains) per board; "
+                        "twin mode needs the Pi GPIO driver"
+                    )
+                params = {k: v for k, v in servo_params.items() if k not in LINK_PARAMS}
+                built = Esp32ServoHardware(
+                    link=servo_params["esp32_link"],
+                    port=servo_params["esp32_port"],
+                    baud=servo_params["esp32_baud"],
+                    **params,
+                )
+                snap = built.servo_snapshot() or {}
+                print(
+                    f"[agent] ESP32 servo controller: "
+                    + (f"connected on {snap.get('port')} (fw {snap.get('esp32Firmware')})"
+                       if snap.get("linkOk") else f"NOT connected yet ({snap.get('linkError')}); retrying in the background")
+                    + f" — link {servo_params['esp32_link']}, {servo_params['esp32_baud']} baud, "
+                    f"{'one' if servo_params['single_motor'] else 'two'} {servo_params['pulse_drive']} drive"
+                    f"{'' if servo_params['single_motor'] else 's'}{' (motor A only)' if servo_params['single_motor'] else ''}",
+                    flush=True,
+                )
+            elif mode == "servo":
+                params = {k: v for k, v in servo_params.items() if k not in LINK_PARAMS}
                 if side:
                     params["single_motor"] = False
                 built = ServoHardware(**params, **twin_kw)
+                kind = servo_params["pulse_drive"]
                 what = (
-                    "one iSV57T servo" if side
-                    else ("ONE iSV57T servo (motor A only)" if servo_params["single_motor"] else "two iSV57T servos")
+                    f"one {kind} drive" if side
+                    else (f"ONE {kind} drive (motor A only)" if servo_params["single_motor"] else f"two {kind} drives")
                 )
                 print(
                     f"[agent] GPIO ready: driving {what} on PUL/DIR "
@@ -4271,16 +4553,17 @@ async def serve(args) -> None:
                 )
             else:
                 built = RealHardware(mirror_b=servo_params["mirror_b"], **twin_kw)
-                built.dc_trim_pct = servo_params["dc_trim_pct"]
-                built.dc_trim_up_pct = servo_params["dc_trim_up_pct"]
-                built.dc_trim_per_dir = servo_params["dc_trim_per_dir"]
+                bridge = "B" if twin_kw.get("motor_index") == 1 else "A"
+                pins = (
+                    (PIN_MOTOR_B_RPWM, PIN_MOTOR_B_LPWM, PIN_MOTOR_B_EN)
+                    if bridge == "B"
+                    else (PIN_MOTOR_A_RPWM, PIN_MOTOR_A_LPWM, PIN_MOTOR_A_EN)
+                )
                 # flush=True matters under systemd: stdout is a pipe, not a TTY, so
                 # Python block-buffers it and this line can sit unflushed indefinitely.
                 print(
-                    f"[agent] GPIO ready: driving {'one DC motor' if side else 'two DC motors'} on BTS7960 bridges "
-                    f"(A: RPWM {PIN_MOTOR_A_RPWM} LPWM {PIN_MOTOR_A_LPWM} EN {PIN_MOTOR_A_EN}; "
-                    f"B: RPWM {PIN_MOTOR_B_RPWM} LPWM {PIN_MOTOR_B_LPWM} EN {PIN_MOTOR_B_EN}; "
-                    f"mirror B={servo_params['mirror_b']}){label}",
+                    f"[agent] GPIO ready: driving one DC motor on BTS7960 bridge {bridge} "
+                    f"(RPWM {pins[0]} LPWM {pins[1]} EN {pins[2]}){label}",
                     flush=True,
                 )
             return built, None
@@ -4348,23 +4631,13 @@ async def serve(args) -> None:
         c.set_sensor_arm(saved.get("sensorArmS", 0))
         c.set_home_timeout(saved.get("homeTimeoutS"))
         c.set_shelf_timeout(saved.get("shelfTimeoutS"))
-        c.set_chain_sync(
-            enabled=saved.get("chainSyncEnabled"),
-            tolerance_ms=saved.get("chainSyncToleranceMs"),
-            max_wait_s=saved.get("chainSyncMaxWaitS"),
-            shelf_side=saved.get("chainSyncShelfSide"),
-        )
         c.set_position_mode(saved.get("positionMode"))
+        c.set_home_resync(saved.get("homeResync", True))
         c.restore_calibration(saved.get("calibration"))
+        c.set_home_flag(saved.get("homeFlagPulses"))
         if side:
             c.set_reverse(bool(saved.get("reverseDir", False)))
         c.on_calibration = lambda _info: persist_motor_conf()
-
-        def adopt_balance(pct: float, direction: str = "down") -> None:
-            servo_params["dc_trim_up_pct" if direction == "up" else "dc_trim_pct"] = float(pct)
-            persist_motor_conf()
-
-        c.on_balance = adopt_balance
         return c
 
     def build_units() -> None:
@@ -4390,12 +4663,10 @@ async def serve(args) -> None:
             "shelfPitchS": c._learned_pitch_s,
             "homeTimeoutS": c.home_timeout_s,
             "shelfTimeoutS": c.shelf_timeout_s,
-            "chainSyncEnabled": c.chain_sync_enabled,
-            "chainSyncToleranceMs": c.chain_sync_tolerance_ms,
-            "chainSyncMaxWaitS": c.chain_sync_max_wait_s,
-            "chainSyncShelfSide": c.chain_sync_shelf_side,
             "positionMode": c.position_mode,
+            "homeResync": c.home_resync,
             "calibration": c.calibration_info,
+            "homeFlagPulses": c.index_window_pulses,
             "reverseDir": c.reverse_dir,
         }
 
@@ -4412,10 +4683,14 @@ async def serve(args) -> None:
             "maxPps": servo_params["max_pps"],
             "mirrorB": servo_params["mirror_b"],
             "ignoreAlarm": bool(servo_params["ignore_alarm"]),
-            "dcTrimPct": servo_params["dc_trim_pct"],
-            "dcTrimUpPct": servo_params["dc_trim_up_pct"],
-            "dcTrimPerDirection": bool(servo_params["dc_trim_per_dir"]),
             "singleMotor": bool(servo_params["single_motor"]),
+            "servoDriver": servo_params["driver"],
+            "esp32Link": servo_params["esp32_link"],
+            "esp32Port": servo_params["esp32_port"],
+            "esp32Baud": int(servo_params["esp32_baud"]),
+            "pulseDrive": servo_params["pulse_drive"],
+            "enableActiveLow": servo_params["ena_active_low"],
+            "alarmActiveLow": servo_params["alm_active_low"],
             "twin": rt["twin"],
             **single_saved,
             "sides": sides_saved,
@@ -4429,11 +4704,13 @@ async def serve(args) -> None:
             "type": "hello",
             "name": args.name,
             "shelves": first.shelves,
-            "firmware": "pax-agent-1.8",
+            "firmware": "pax-agent-1.9",
             "role": args.role,
             "simulated": rt["sim_reason"] is not None,
             "simReason": rt["sim_reason"],
             "motorMode": rt["mode"],
+            "servoDriver": servo_params["driver"],
+            "pulseDrive": servo_params["pulse_drive"],
             "twin": rt["twin"],
             "sides": list(TWIN_SIDES) if rt["twin"] else [],
         }
@@ -4553,15 +4830,6 @@ async def serve(args) -> None:
                         "max_pps": msg.get("servoMaxPps"),
                         "mirror_b": msg.get("servoMirrorB"),
                         "ignore_alarm": msg.get("servoIgnoreAlarm"),
-                        "dc_trim_pct": (
-                            msg.get("dcTrimPct") if isinstance(msg.get("dcTrimPct"), (int, float)) else None
-                        ),
-                        "dc_trim_up_pct": (
-                            msg.get("dcTrimUpPct") if isinstance(msg.get("dcTrimUpPct"), (int, float)) else None
-                        ),
-                        "dc_trim_per_dir": (
-                            msg.get("dcTrimPerDirection") if isinstance(msg.get("dcTrimPerDirection"), bool) else None
-                        ),
                         "single_motor": (
                             msg.get("servoSingleMotor") if isinstance(msg.get("servoSingleMotor"), bool) else None
                         ),
@@ -4569,11 +4837,39 @@ async def serve(args) -> None:
                     if rt["twin"]:
                         # Each twin side already owns exactly one motor.
                         servo_fields["single_motor"] = None
-                        for k in DC_ONLY_PARAMS:
-                            servo_fields[k] = None
                     for k, v in servo_fields.items():
                         if v is not None:
                             servo_params[k] = v
+                    # Servo controller + link. A change here needs a new backend
+                    # (the pins or the serial port are different), so it is
+                    # applied by rebuilding, like a drive change.
+                    link_fields = {
+                        "driver": msg.get("servoDriver") if msg.get("servoDriver") in ("gpio", "esp32") else None,
+                        "esp32_link": msg.get("esp32Link") if msg.get("esp32Link") in ESP32_LINKS else None,
+                        "esp32_port": msg.get("esp32Port") if isinstance(msg.get("esp32Port"), str) else None,
+                        "esp32_baud": (
+                            int(msg.get("esp32Baud"))
+                            if isinstance(msg.get("esp32Baud"), (int, float)) and not isinstance(msg.get("esp32Baud"), bool)
+                            and 9600 <= msg.get("esp32Baud") <= 2_000_000 else None
+                        ),
+                    }
+                    link_changed = False
+                    for k, v in link_fields.items():
+                        if v is not None and v != servo_params[k]:
+                            servo_params[k] = v
+                            link_changed = True
+                    # Drive profile + polarity overrides. They change which way
+                    # the enable/alarm pins are read, so they are applied by
+                    # rebuilding the backend too (the ESP32 gets a fresh CFG).
+                    drive_fields = {
+                        "pulse_drive": msg.get("pulseDrive") if msg.get("pulseDrive") in PULSE_DRIVES else None,
+                        "ena_active_low": msg.get("pulseEnableActiveLow") if isinstance(msg.get("pulseEnableActiveLow"), bool) else None,
+                        "alm_active_low": msg.get("pulseAlarmActiveLow") if isinstance(msg.get("pulseAlarmActiveLow"), bool) else None,
+                    }
+                    for k, v in drive_fields.items():
+                        if v is not None and v != servo_params[k]:
+                            servo_params[k] = v
+                            link_changed = True
                     hold = msg.get("servoHoldTimeoutS")
                     if isinstance(hold, (int, float)):
                         carousel.set_hold_timeout(hold)
@@ -4585,25 +4881,22 @@ async def serve(args) -> None:
                     shelf_t = msg.get("shelfTimeoutS")
                     shelf_changed = (isinstance(shelf_t, (int, float)) and not isinstance(shelf_t, bool)
                                      and carousel.set_shelf_timeout(shelf_t))
-                    sync_changed = carousel.set_chain_sync(
-                        enabled=msg.get("chainSyncEnabled"),
-                        tolerance_ms=msg.get("chainSyncToleranceMs"),
-                        max_wait_s=msg.get("chainSyncMaxWaitS"),
-                        shelf_side=msg.get("chainSyncShelfSide"),
-                    )
-                    home_changed = home_changed or shelf_changed or sync_changed
+                    home_changed = home_changed or shelf_changed
                     reverse_changed = bool(side) and carousel.set_reverse(msg.get("reverseDir"))
+                    resync_changed = carousel.set_home_resync(msg.get("homeResync"))
                     mode_changed = (carousel.set_position_mode(msg.get("positionMode")) or reverse_changed
-                                    or arm_changed or home_changed)
+                                    or arm_changed or home_changed or resync_changed)
                     cal_restored = carousel.restore_calibration({
                         "pulsesPerRev": msg.get("servoCarouselPulses"),
                         "indexWindowPulses": msg.get("servoIndexWindowPulses"),
                     })
-                    if (want in ("dc", "servo") or hold is not None or mode_changed or cal_restored
+                    if (want in ("dc", "servo") or hold is not None or mode_changed or cal_restored or link_changed
                             or any(v is not None for v in servo_fields.values())):
                         persist_motor_conf(want)
                     if want in ("dc", "servo") and want != rt["mode"]:
                         switch_motor_mode(want)
+                    elif link_changed and rt["mode"] == "servo":
+                        switch_motor_mode("servo")
                     for c in units.values():
                         c.set_servo(**servo_fields)
                     if (hold is not None or servo_fields["ignore_alarm"] is not None
@@ -4616,8 +4909,6 @@ async def serve(args) -> None:
                         broadcast(tag(side, carousel.calibration_frame()))
                 elif t == "calibrate":
                     carousel.request_calibrate()
-                elif t == "balance_calibrate":
-                    carousel.request_balance_calibrate(msg.get("turns"), msg.get("direction"))
                 elif t == "release":
                     carousel.request_release()
                 elif t == "hold":
@@ -4713,7 +5004,23 @@ class NetService:
             self._disabled_reason = "started with --no-net"
 
     # ------------------------------------------------------------ lifecycle
+    @property
+    def esp32_role(self) -> bool:
+        """This instance is the brain for a standalone Wi-Fi ESP32 carousel.
+        The Pi it runs on already has an agent managing its own Wi-Fi, so here
+        we only relay credentials to the board and register with the master."""
+        return getattr(self.args, "role", None) == "esp32"
+
     def start(self) -> None:
+        if self.esp32_role:
+            self._disabled_reason = None
+            try:
+                self.cfg = paxnet.Config() if paxnet is not None else None
+            except Exception:
+                self.cfg = None
+            self._slave_client_task = asyncio.ensure_future(self._esp32_client())
+            print(f"[agent] networking: role=esp32 (Wi-Fi board; master {self._master_url()})", flush=True)
+            return
         if self._disabled_reason:
             print(f"[agent] networking disabled ({self._disabled_reason})", flush=True)
             return
@@ -4783,6 +5090,9 @@ class NetService:
                     "mode": s.get("mode"),
                     "ssid": s.get("ssid"),
                     "ip": s.get("ip"),
+                    "kind": s.get("kind", "pi"),
+                    "agentHost": s.get("agentHost"),
+                    "agentPort": s.get("agentPort"),
                 }
                 for s in self.slaves.values()
             ],
@@ -4792,6 +5102,9 @@ class NetService:
     async def handle(self, ws, msg: dict) -> None:
         t = msg.get("type", "")
         op = t[4:]  # strip "net."
+        if self.esp32_role:
+            await self._handle_esp32(ws, op, msg)
+            return
         if self._disabled_reason:
             await self._send(ws, {"type": "net.result", "op": op, "ok": False, "error": self._disabled_reason})
             return
@@ -4920,6 +5233,9 @@ class NetService:
                 self.slaves[host] = {
                     "ws": ws, "hostname": host, "mac": msg.get("mac"), "seen": time.time(),
                     "mode": msg.get("mode"), "ssid": msg.get("ssid"), "ip": msg.get("ip"),
+                    "kind": "esp32" if msg.get("kind") == "esp32" else "pi",
+                    "agentHost": msg.get("agentHost") if isinstance(msg.get("agentHost"), str) else None,
+                    "agentPort": msg.get("agentPort") if isinstance(msg.get("agentPort"), int) else None,
                 }
                 await self._send(ws, {"type": "net.registered", "master": paxnet.hostname(),
                                       "apSsid": cfg.ap_ssid, "apPsk": cfg.ap_psk})
@@ -4997,6 +5313,135 @@ class NetService:
         if entry:
             entry["seen"] = time.time()
 
+    # ------------------------------------------------------------ Wi-Fi ESP32 carousel
+    def _master_url(self) -> str:
+        target = (getattr(self.args, "master", None) or "").strip()
+        if not target and self.cfg is not None:
+            target = self.cfg.master_host
+        if not target:
+            target = "127.0.0.1"
+        host, _, port = target.rpartition(":")
+        if not host or not port.isdigit():
+            host, port = target, "8765"
+        return f"ws://{host}:{port}/"
+
+    def _esp32_status(self) -> dict:
+        boards = esp32_wifi_links()
+        st = {"type": "net.status", "role": "esp32", "mode": "offline", "at": int(time.time() * 1000)}
+        if not boards:
+            st["error"] = "this agent has no ESP32 Wi-Fi link configured (servo controller must be ESP32, link Wi-Fi)"
+            return st
+        n = boards[0].net_status()
+        state = n.get("state")
+        st.update({
+            "mode": {"router": "router", "ap": "ap"}.get(state, "offline") if n.get("linkOk") else "offline",
+            "ssid": n.get("ssid") if n.get("ssid") not in (None, "-") else None,
+            "ip": n.get("ip") if n.get("ip") not in (None, "-") else None,
+            # dBm -> the 0–100 scale nmcli reports for Pi nodes (-100 = 0 %, -50 = 100 %).
+            "signal": (max(0, min(100, 2 * (int(n["rssi"]) + 100)))
+                       if str(n.get("rssi", "")).lstrip("-").isdigit() and n.get("rssi") != "0" else None),
+            "hostname": n.get("host"),
+            "linkOk": bool(n.get("linkOk")),
+            "target": n.get("target"),
+            "router": n.get("router") if n.get("router") != "-" else None,
+            "apSsid": n.get("hotspot") if n.get("hotspot") != "-" else None,
+        })
+        if not n.get("linkOk"):
+            st["error"] = "ESP32 not reachable over Wi-Fi"
+        return st
+
+    def _esp32_push(self, ssid, psk, ap_ssid, ap_psk) -> int:
+        return sum(1 for b in esp32_wifi_links() if b.push_wifi(ssid, psk, ap_ssid, ap_psk))
+
+    async def _handle_esp32(self, ws, op: str, msg: dict) -> None:
+        try:
+            if op == "status":
+                st = self._esp32_status()
+                self._last_status = st
+                self.broadcast(st)
+            elif op == "join":
+                ssid = str(msg.get("ssid", ""))
+                psk = str(msg.get("psk", "") or "")
+                if paxnet is not None:
+                    paxnet.validate_creds(ssid, psk)
+                ap_ssid, ap_psk = msg.get("apSsid"), msg.get("apPsk")
+                if not ap_ssid and self.cfg is not None:
+                    ap_ssid, ap_psk = self.cfg.ap_ssid, self.cfg.ap_psk
+                pushed = self._esp32_push(ssid, psk, ap_ssid, ap_psk)
+                if msg.get("fromMaster"):
+                    await self._send(ws, {"type": "net.ack", "op": "join", "ok": pushed > 0,
+                                          "hostname": self._esp32_hostname()})
+                    return
+                if not pushed:
+                    raise RuntimeError("ESP32 not connected — credentials not stored")
+                self.broadcast({"type": "net.result", "op": "join", "ok": True, "ssid": ssid})
+            elif op == "set-ap-psk":
+                psk = str(msg.get("psk", "") or "")
+                ap_ssid = msg.get("apSsid") or (self.cfg.ap_ssid if self.cfg is not None else None)
+                pushed = self._esp32_push(None, None, ap_ssid, psk)
+                if msg.get("fromMaster"):
+                    await self._send(ws, {"type": "net.ack", "op": "set-ap-psk", "ok": pushed > 0,
+                                          "hostname": self._esp32_hostname()})
+                    return
+                self.broadcast({"type": "net.result", "op": "set-ap-psk", "ok": pushed > 0})
+            else:
+                await self._send(ws, {"type": "net.result", "op": op, "ok": False,
+                                      "error": "this carousel is a Wi-Fi ESP32; scan, hotspot and mode live on the master"})
+        except Exception as exc:
+            err = str(exc) if paxnet is not None and isinstance(exc, paxnet.NetError) else repr(exc)
+            print(f"[agent] net.{op} (esp32) failed: {err}", flush=True)
+            self.broadcast({"type": "net.result", "op": op, "ok": False, "error": err})
+
+    def _esp32_hostname(self) -> str:
+        for b in esp32_wifi_links():
+            host = b.net_status().get("host")
+            if host:
+                return host
+        return getattr(self.args, "name", None) or "pax-esp32"
+
+    async def _esp32_client(self) -> None:
+        """Register with the master like a Pi slave so new router credentials
+        reach the board through the master's normal provisioning push."""
+        import websockets
+        url = self._master_url()
+        backoff = 3
+        while True:
+            try:
+                async with websockets.connect(url, open_timeout=10, ping_interval=20) as ws:
+                    backoff = 3
+                    st = self._esp32_status()
+                    # The app must talk to THIS agent, not to the board, so tell
+                    # the master where we listen (its own hostname, our port).
+                    try:
+                        agent_host = f"{paxnet.hostname()}.local" if paxnet is not None else socket.gethostname()
+                    except Exception:
+                        agent_host = socket.gethostname()
+                    await ws.send(json.dumps({
+                        "type": "net.register", "hostname": self._esp32_hostname(), "mac": None,
+                        "mode": st.get("mode"), "ssid": st.get("ssid"), "ip": st.get("ip"), "kind": "esp32",
+                        "agentHost": agent_host, "agentPort": int(self.args.port),
+                    }))
+                    print(f"[agent] registered ESP32 carousel with master at {url}", flush=True)
+                    async for raw in ws:
+                        try:
+                            msg = json.loads(raw)
+                        except Exception:
+                            continue
+                        t = msg.get("type", "")
+                        if t == "net.registered":
+                            # Make sure the board always knows the master's hotspot.
+                            ap_ssid, ap_psk = msg.get("apSsid"), msg.get("apPsk")
+                            if ap_ssid and ap_psk:
+                                self._esp32_push(None, None, ap_ssid, ap_psk)
+                        elif isinstance(t, str) and t.startswith("net."):
+                            await self.handle(ws, msg)
+            except asyncio.CancelledError:
+                return
+            except Exception as exc:
+                print(f"[agent] master link down ({exc.__class__.__name__}); retry in {backoff}s", flush=True)
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 60)
+
     # ------------------------------------------------------------ slave → master
     async def _slave_client(self) -> None:
         """Keep an outbound socket to the master open and re-register on every
@@ -5051,23 +5496,57 @@ def _wifi_mac(iface: str) -> Optional[str]:
 
 
 def main() -> None:
+    global MOTOR_CONF_PATH
     p = argparse.ArgumentParser(description="PAX paternoster Raspberry Pi agent")
     p.add_argument("--name", default="Paternoster", help="Human-readable unit name")
     p.add_argument("--port", type=int, default=8765, help="WebSocket port (match the app)")
     p.add_argument("--shelves", type=int, default=9, help="Number of shelves on this carousel")
     p.add_argument(
         "--role",
-        choices=("master", "slave"),
+        choices=("master", "slave", "esp32"),
         default=None,
-        help="master: runs the fallback hotspot and provisions slaves; slave: follows the master (default: from /etc/paxnet.conf)",
+        help="master: runs the fallback hotspot and provisions slaves; slave: follows the master; "
+             "esp32: this instance drives a standalone Wi-Fi ESP32 carousel and only relays credentials to it "
+             "(default: from /etc/paxnet.conf)",
+    )
+    p.add_argument(
+        "--master",
+        default=None,
+        help="--role esp32: the master agent to register with, host[:port] (default: 127.0.0.1:8765)",
+    )
+    p.add_argument(
+        "--motor-conf",
+        default=None,
+        help=f"Where this instance persists its drive settings (default: $PAX_MOTOR_CONF or {MOTOR_CONF_PATH})",
     )
     p.add_argument("--no-net", action="store_true", help="Disable Wi-Fi/hotspot management entirely")
     p.add_argument(
         "--motor",
         choices=("dc", "servo"),
         default=None,
-        help="Force the motor drive: dc = two DC motors on two BTS7960 bridges, servo = two iSV57T on PUL/DIR "
+        help="Force the motor drive: dc = one DC motor on a BTS7960 bridge, servo = two PUL/DIR drives "
+             "(integrated servo, AC servo or closed-loop stepper; see --pulse-drive) "
              "(default: whatever the app last configured, else dc)",
+    )
+    p.add_argument(
+        "--pulse-drive",
+        choices=PULSE_DRIVES,
+        default=None,
+        help="Which drive is on the PUL/DIR lines: integrated-servo = iSV57T, ac-servo = A6-RS, "
+             "closed-loop-stepper = CL86Y. Sets the enable/alarm polarity and the pulse ceiling "
+             "(default: whatever the app last configured, else integrated-servo; ac-servo with --servo-driver esp32)",
+    )
+    p.add_argument(
+        "--servo-driver",
+        choices=("gpio", "esp32"),
+        default=None,
+        help="Servo controller: gpio = the Pi pulses PUL/DIR itself, esp32 = an ESP32 running "
+             "pi-agent/esp32-servo does it over a serial link (default: whatever the app last configured, else gpio)",
+    )
+    p.add_argument(
+        "--esp32-port",
+        default=None,
+        help="Serial device of the ESP32 controller, e.g. /dev/ttyUSB0 or /dev/serial0 (default: auto by link type)",
     )
     p.add_argument("--simulate", action="store_true", help="Run without real GPIO (fake motion)")
     p.add_argument(
@@ -5076,6 +5555,8 @@ def main() -> None:
         help="Exit instead of silently simulating when GPIO is unavailable (recommended for the real unit)",
     )
     args = p.parse_args()
+    if args.motor_conf:
+        MOTOR_CONF_PATH = args.motor_conf
     try:
         asyncio.run(serve(args))
     except KeyboardInterrupt:

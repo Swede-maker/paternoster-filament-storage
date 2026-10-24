@@ -18,7 +18,35 @@
 #       now: it fetches them from the master on first registration.
 #   --no-net            skip all Wi-Fi/hostname setup (wired lab bench)
 #   --motor dc|servo    which drive is wired to this Pi; written to
-#                       /var/lib/pax-agent/motor.json (other tuning kept)
+#                       /var/lib/pax-agent/motor.json (other tuning kept).
+#                       "servo" = any pulse + direction drive (see --pulse-drive)
+#   --pulse-drive integrated-servo|ac-servo|closed-loop-stepper
+#                       what is on the PUL/DIR lines: iSV57T-class integrated
+#                       servo (default on gpio), A6-RS-class AC servo (default on
+#                       esp32) or a CL86Y-class closed-loop stepper. Implies
+#                       --motor servo; ac-servo / closed-loop-stepper imply
+#                       --servo-driver esp32 unless you say otherwise
+#   --servo-driver gpio|esp32
+#                       pulses from the Pi header (gpio) or from an ESP32
+#                       running esp32-servo/ (one firmware for every drive;
+#                       the agent sends it the profile at runtime)
+#   --esp32-link usb|uart|wifi
+#                       usb  = ESP32 on a USB cable (/dev/ttyUSB0, default)
+#                       uart = ESP32 on GPIO14/15 (/dev/serial0); frees the
+#                       UART from the login console and enables it (reboot)
+#                       wifi = a STANDALONE ESP32 carousel with no Pi of its
+#                       own; needs --esp32-host
+#   --esp32-host <host[:port]>
+#                       the Wi-Fi board, e.g. pax-esp32-1a2b.local (port 8766)
+#   --instance <name>   install this as an ADDITIONAL agent service on a Pi
+#                       that already runs one (the master): service
+#                       paternoster-agent-<name>, own motor.json, own --port
+#                       (8767 unless given), role "esp32" (registers with the
+#                       local master so new Wi-Fi credentials reach the board).
+#                       Typical standalone-ESP32 install, run ON THE MASTER:
+#   sudo ./install.sh --instance hall-2 --name "Hall 2" --shelves 12 \
+#                     --pulse-drive ac-servo --esp32-link wifi \
+#                     --esp32-host pax-esp32-1a2b.local
 #
 # Detects the invoking user and this directory instead of assuming `pi` and
 # /home/pi, which is what previously caused `status=217/USER` on systems where no
@@ -38,13 +66,24 @@ AP_SSID=""
 AP_PSK=""
 NET=1
 MOTOR=""
+PULSE_DRIVE=""
+SERVO_DRIVER=""
+ESP32_LINK=""
+ESP32_HOST=""
+INSTANCE=""
+PORT_SET=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --motor) MOTOR="$2"; shift 2 ;;
+    --pulse-drive) PULSE_DRIVE="$2"; shift 2 ;;
+    --servo-driver) SERVO_DRIVER="$2"; shift 2 ;;
+    --esp32-link) ESP32_LINK="$2"; shift 2 ;;
+    --esp32-host) ESP32_HOST="$2"; shift 2 ;;
+    --instance) INSTANCE="$2"; shift 2 ;;
     --name) NAME="$2"; shift 2 ;;
     --shelves) SHELVES="$2"; shift 2 ;;
-    --port) PORT="$2"; shift 2 ;;
+    --port) PORT="$2"; PORT_SET=1; shift 2 ;;
     --allow-simulation) STRICT=0; shift ;;
     --role) ROLE="$2"; shift 2 ;;
     --hostname) HOSTNAME_NEW="$2"; shift 2 ;;
@@ -52,7 +91,7 @@ while [[ $# -gt 0 ]]; do
     --ap-ssid) AP_SSID="$2"; shift 2 ;;
     --ap-psk) AP_PSK="$2"; shift 2 ;;
     --no-net) NET=0; shift ;;
-    -h|--help) sed -n '2,24p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,49p' "$0"; exit 0 ;;
     *) echo "unknown option: $1" >&2; exit 2 ;;
   esac
 done
@@ -64,6 +103,61 @@ fi
 if [[ -n "$MOTOR" && "$MOTOR" != "dc" && "$MOTOR" != "servo" ]]; then
   echo "error: --motor must be dc or servo" >&2
   exit 2
+fi
+if [[ -n "$SERVO_DRIVER" && "$SERVO_DRIVER" != "gpio" && "$SERVO_DRIVER" != "esp32" ]]; then
+  echo "error: --servo-driver must be gpio or esp32" >&2
+  exit 2
+fi
+if [[ -n "$ESP32_LINK" && "$ESP32_LINK" != "usb" && "$ESP32_LINK" != "uart" && "$ESP32_LINK" != "wifi" ]]; then
+  echo "error: --esp32-link must be usb, uart or wifi" >&2
+  exit 2
+fi
+if [[ -n "$ESP32_HOST" && -z "$ESP32_LINK" ]]; then
+  ESP32_LINK="wifi"
+fi
+if [[ "$ESP32_LINK" == "wifi" && -z "$ESP32_HOST" ]]; then
+  echo "error: --esp32-link wifi needs --esp32-host <pax-esp32-xxxx.local[:8766]>" >&2
+  exit 2
+fi
+if [[ -n "$ESP32_HOST" && ! "$ESP32_HOST" =~ ^[A-Za-z0-9][A-Za-z0-9.-]{0,120}(:[0-9]{1,5})?$ ]]; then
+  echo "error: --esp32-host must be a hostname or IP, optionally :port" >&2
+  exit 2
+fi
+if [[ -n "$INSTANCE" ]]; then
+  if [[ ! "$INSTANCE" =~ ^[a-z0-9][a-z0-9-]{0,31}$ ]]; then
+    echo "error: --instance must be 1-32 chars of a-z 0-9 -" >&2
+    exit 2
+  fi
+  if [[ "$ESP32_LINK" != "wifi" ]]; then
+    echo "error: --instance is for an additional Wi-Fi ESP32 carousel (--esp32-link wifi --esp32-host ...)" >&2
+    exit 2
+  fi
+  # The primary agent owns 8765; a second one needs its own WebSocket port.
+  if [[ $PORT_SET -eq 0 ]]; then
+    PORT=8767
+  elif [[ "$PORT" == "8765" ]]; then
+    echo "error: --instance cannot use port 8765 (the primary agent's); pick another --port" >&2
+    exit 2
+  fi
+fi
+if [[ -n "$PULSE_DRIVE" && "$PULSE_DRIVE" != "integrated-servo" && "$PULSE_DRIVE" != "ac-servo" && "$PULSE_DRIVE" != "closed-loop-stepper" ]]; then
+  echo "error: --pulse-drive must be integrated-servo, ac-servo or closed-loop-stepper" >&2
+  exit 2
+fi
+if [[ -n "$PULSE_DRIVE" ]]; then
+  if [[ "$MOTOR" == "dc" ]]; then
+    echo "error: --pulse-drive needs --motor servo (a PUL/DIR drive)" >&2
+    exit 2
+  fi
+  MOTOR="servo"
+  # A separate drive (AC servo / closed-loop stepper) is normally pulsed by
+  # the ESP32 controller; the integrated servo by the Pi header.
+  if [[ -z "$SERVO_DRIVER" && "$PULSE_DRIVE" != "integrated-servo" ]]; then
+    SERVO_DRIVER="esp32"
+  fi
+fi
+if [[ -n "$ESP32_LINK" && -z "$SERVO_DRIVER" ]]; then
+  SERVO_DRIVER="esp32"
 fi
 
 if [[ $EUID -ne 0 ]]; then
@@ -91,7 +185,43 @@ echo "[install] user=$RUN_USER dir=$DIR name='$NAME' shelves=$SHELVES port=$PORT
 # --- dependencies -----------------------------------------------------------
 echo "[install] installing python dependencies"
 apt-get update -qq
-apt-get install -y -qq python3-websockets python3-gpiozero >/dev/null
+apt-get install -y -qq python3-websockets python3-gpiozero python3-serial >/dev/null
+
+# --- ESP32 servo controller link ---------------------------------------------
+# The agent opens /dev/ttyUSB0 (USB) or /dev/serial0 (header UART) itself, so
+# the service user needs the dialout group either way. The UART additionally
+# has to be taken away from the login console and switched on; on the Pi 3/4/
+# Zero W the full UART is also moved back to GPIO14/15 (Bluetooth gets the
+# mini-UART). All of that is config.txt/cmdline.txt work and needs a reboot.
+if getent group dialout >/dev/null 2>&1; then
+  usermod -aG dialout "$RUN_USER"
+  echo "[install] added $RUN_USER to the dialout group (serial ports)"
+fi
+NEED_REBOOT_UART=0
+if [[ "$ESP32_LINK" == "uart" ]]; then
+  if command -v raspi-config >/dev/null 2>&1; then
+    # do_serial_cons 1 = console OFF, do_serial_hw 0 = UART ON (nonint numbering)
+    raspi-config nonint do_serial_cons 1 || true
+    raspi-config nonint do_serial_hw 0 || true
+  fi
+  for conf in /boot/firmware/config.txt /boot/config.txt; do
+    [[ -f "$conf" ]] || continue
+    grep -q '^enable_uart=1' "$conf" || echo 'enable_uart=1' >> "$conf"
+    MODEL_UART="$(tr -d '\0' < /proc/device-tree/model 2>/dev/null || echo unknown)"
+    if [[ "$MODEL_UART" != *"Raspberry Pi 5"* ]]; then
+      grep -q '^dtoverlay=disable-bt' "$conf" || echo 'dtoverlay=disable-bt' >> "$conf"
+      systemctl disable hciuart >/dev/null 2>&1 || true
+    fi
+    break
+  done
+  for cmd in /boot/firmware/cmdline.txt /boot/cmdline.txt; do
+    [[ -f "$cmd" ]] || continue
+    sed -i -E 's/console=serial0,[0-9]+ ?//; s/console=ttyAMA0,[0-9]+ ?//; s/console=ttyS0,[0-9]+ ?//' "$cmd"
+    break
+  done
+  NEED_REBOOT_UART=1
+  echo "[install] UART on GPIO14/15 enabled for the ESP32 link (serial console removed) — reboot required"
+fi
 
 # --- pin factory ------------------------------------------------------------
 # lgpio is installed on every model so a minimal OS image without any GPIO
@@ -140,25 +270,43 @@ rm -f /usr/local/sbin/pax-agent-prestart /etc/udev/rules.d/99-pax-pwm.rules
 # first boot. Only `mode` changes; pulses/rev, pulse rate, mirror and the
 # hold timeout the app may already have tuned are kept.
 MOTOR_CONF=/var/lib/pax-agent/motor.json
-if [[ -n "$MOTOR" ]]; then
+if [[ -n "$INSTANCE" ]]; then
+  # A second agent on this Pi must never share the first one's drive settings.
+  MOTOR_CONF=/var/lib/pax-agent/$INSTANCE/motor.json
+fi
+if [[ -n "$MOTOR" || -n "$PULSE_DRIVE" || -n "$SERVO_DRIVER" || -n "$ESP32_LINK" || -n "$ESP32_HOST" ]]; then
   mkdir -p "$(dirname "$MOTOR_CONF")"
-  python3 - "$MOTOR_CONF" "$MOTOR" <<'PY'
+  python3 - "$MOTOR_CONF" "$MOTOR" "$SERVO_DRIVER" "$ESP32_LINK" "$PULSE_DRIVE" "$ESP32_HOST" <<'PY'
 import json, os, sys
-path, mode = sys.argv[1], sys.argv[2]
+path, mode, driver, link, pulse_drive, esp32_host = sys.argv[1:7]
 conf = {}
 try:
     with open(path, encoding="utf-8") as fh:
         conf = json.load(fh) or {}
 except (OSError, ValueError):
     pass
-conf["mode"] = mode
+if mode:
+    conf["mode"] = mode
+if driver:
+    conf["servoDriver"] = driver
+    if driver == "esp32" and not mode:
+        conf["mode"] = "servo"  # an ESP32 controller is only ever a PUL/DIR drive
+if link:
+    conf["esp32Link"] = link
+if esp32_host:
+    conf["esp32Port"] = esp32_host  # host[:port] rides in the "port" slot for the wifi link
+if pulse_drive:
+    conf["pulseDrive"] = pulse_drive
+    # The profile's own polarities apply until the app overrides them.
+    conf.pop("enableActiveLow", None)
+    conf.pop("alarmActiveLow", None)
 tmp = path + ".tmp"
 with open(tmp, "w", encoding="utf-8") as fh:
     json.dump(conf, fh)
 os.replace(tmp, path)
 PY
   chown -R "$RUN_USER:$RUN_USER" "$(dirname "$MOTOR_CONF")"
-  echo "[install] motor drive → $MOTOR ($MOTOR_CONF)"
+  echo "[install] motor drive → ${MOTOR:-unchanged}, PUL/DIR drive → ${PULSE_DRIVE:-unchanged}, controller → ${SERVO_DRIVER:-unchanged}, ESP32 link → ${ESP32_LINK:-unchanged}${ESP32_HOST:+ @ $ESP32_HOST} ($MOTOR_CONF)"
 fi
 
 EXTRA_ARGS=""
@@ -166,7 +314,15 @@ if [[ $STRICT -eq 1 ]]; then
   # Fail loudly rather than pretending the motor moved.
   EXTRA_ARGS="--strict-gpio"
 fi
-EXTRA_ARGS="$EXTRA_ARGS --role $ROLE"
+if [[ -n "$INSTANCE" ]]; then
+  # Role "esp32": no nmcli work of its own (the primary agent owns this Pi's
+  # Wi-Fi); registers with the local master so credential pushes reach the board.
+  ROLE="esp32"
+  NET=0
+  EXTRA_ARGS="$EXTRA_ARGS --role esp32 --master 127.0.0.1:8765 --motor-conf $MOTOR_CONF"
+else
+  EXTRA_ARGS="$EXTRA_ARGS --role $ROLE"
+fi
 
 # --- networking (paxnet) -----------------------------------------------------
 # Hostname + mDNS so nodes address each other as `pax-*.local` and survive a
@@ -318,16 +474,19 @@ EOF
       echo "[install] adopted current Wi-Fi '$CURRENT' as 'pax-router'"
     fi
   fi
+elif [[ -n "$INSTANCE" ]]; then
+  echo "[install] --instance: Wi-Fi/hostname setup belongs to the primary agent on this Pi — skipped"
 else
   echo "[install] --no-net: skipping hostname, mDNS, hotspot and sudoers setup"
   EXTRA_ARGS="$EXTRA_ARGS --no-net"
 fi
 
 # --- unit file --------------------------------------------------------------
-UNIT=/etc/systemd/system/paternoster-agent.service
-python3 - "$DIR/paternoster-agent.service" "$UNIT" <<PY
+SERVICE=paternoster-agent${INSTANCE:+-$INSTANCE}
+UNIT=/etc/systemd/system/$SERVICE.service
+python3 - "$DIR/paternoster-agent.service" "$UNIT" "$INSTANCE" <<PY
 import sys
-src, dst = sys.argv[1], sys.argv[2]
+src, dst, instance = sys.argv[1], sys.argv[2], sys.argv[3]
 text = open(src).read()
 for key, val in {
     "__USER__": """$RUN_USER""",
@@ -339,6 +498,12 @@ for key, val in {
     "__ENVIRONMENT__": """$ENVIRONMENT""",
 }.items():
     text = text.replace(key, val)
+if instance:
+    text = text.replace("Description=PAX paternoster GPIO agent",
+                        f"Description=PAX paternoster agent ({instance}, Wi-Fi ESP32 carousel)")
+    # Come up after the primary agent so registration succeeds first try.
+    text = text.replace("After=NetworkManager.service network.target",
+                        "After=NetworkManager.service network.target paternoster-agent.service")
 open(dst, "w").write(text)
 PY
 
@@ -351,14 +516,14 @@ if grep -vE '^\s*#' "$UNIT" | grep -q "__"; then
 fi
 
 systemctl daemon-reload
-systemctl enable paternoster-agent >/dev/null 2>&1 || true
-systemctl restart paternoster-agent
+systemctl enable "$SERVICE" >/dev/null 2>&1 || true
+systemctl restart "$SERVICE"
 
 sleep 3
-if systemctl is-active --quiet paternoster-agent; then
-  echo "[install] service is running"
+if systemctl is-active --quiet "$SERVICE"; then
+  echo "[install] service $SERVICE is running"
   echo "[install] verify GPIO mode with:"
-  echo "           journalctl -u paternoster-agent -n 20 --no-pager | grep -i -e gpio -e simulation"
+  echo "           journalctl -u $SERVICE -n 20 --no-pager | grep -i -e gpio -e simulation"
   if [[ $NEED_REBOOT -eq 1 ]]; then
     echo
     echo "================================================================"
@@ -366,6 +531,40 @@ if systemctl is-active --quiet paternoster-agent; then
     echo " boot config. Until the Pi reboots GPIO 12/13 stay kernel-owned"
     echo " and the agent will report 'GPIO busy'.         sudo reboot"
     echo "================================================================"
+  fi
+  if [[ $NEED_REBOOT_UART -eq 1 ]]; then
+    echo
+    echo "================================================================"
+    echo " REBOOT NEEDED: the header UART (GPIO14 TXD / GPIO15 RXD) was"
+    echo " freed from the login console for the ESP32 link. Wire"
+    echo "   Pi GPIO14 (pin 8)  -> ESP32 GPIO21 (RX)"
+    echo "   Pi GPIO15 (pin 10) <- ESP32 GPIO22 (TX)"
+    echo "   Pi GND (pin 6)     -- ESP32 GND"
+    echo " then:                                           sudo reboot"
+    echo "================================================================"
+  fi
+  if [[ "$ESP32_LINK" == "wifi" ]]; then
+    echo
+    echo "================================================================"
+    echo " Standalone Wi-Fi ESP32 carousel"
+    echo "   board      : $ESP32_HOST"
+    echo "   agent      : $SERVICE on ws://$(hostname).local:$PORT  <-- add this as the"
+    echo "                carousel's address in the app (Settings → Carousels)"
+    echo
+    echo " First time only, on the board's USB console (pio device monitor):"
+    echo "   WIFI <router ssid> <password>"
+    echo "   WIFIAP <master hotspot ssid> <hotspot password>   (fallback)"
+    echo "   NET                                              (check)"
+    echo " After that the master pushes new credentials itself, and firmware"
+    echo " updates go over the air: http://$ESP32_HOST/  (user admin)."
+    echo "   link log   : journalctl -u $SERVICE -f | grep -i esp32"
+    echo "================================================================"
+  elif [[ "$SERVO_DRIVER" == "esp32" ]]; then
+    echo
+    echo "[install] motor controller = ESP32 (${PULSE_DRIVE:-profile set from the app}). Flash esp32-servo/ once"
+    echo "          (one firmware for AC servo / integrated servo / closed-loop stepper; the agent"
+    echo "          sends the profile), see esp32-servo/README.md, then check the link:"
+    echo "          journalctl -u $SERVICE -f | grep -i esp32"
   fi
   if [[ $NET -eq 1 ]]; then
     echo
@@ -393,7 +592,7 @@ if systemctl is-active --quiet paternoster-agent; then
     echo "================================================================"
   fi
 else
-  echo "[install] SERVICE FAILED TO START — recent log:" >&2
-  journalctl -u paternoster-agent -n 20 --no-pager >&2
+  echo "[install] SERVICE $SERVICE FAILED TO START — recent log:" >&2
+  journalctl -u "$SERVICE" -n 20 --no-pager >&2
   exit 1
 fi
