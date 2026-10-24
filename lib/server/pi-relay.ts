@@ -604,10 +604,18 @@ export function sendCommand(ip: string, port: number, cmd: NodeCommand): boolean
     if (cmd.servoMirrorB !== undefined) relay.motion.servoMirrorB = cmd.servoMirrorB
   if (cmd.servoSingleMotor !== undefined) relay.motion.servoSingleMotor = cmd.servoSingleMotor
     if (cmd.servoIgnoreAlarm !== undefined) relay.motion.servoIgnoreAlarm = cmd.servoIgnoreAlarm
+    if (cmd.servoDriver !== undefined) relay.motion.servoDriver = cmd.servoDriver
+    if (cmd.pulseDrive !== undefined) relay.motion.pulseDrive = cmd.pulseDrive
+    if (cmd.pulseEnableActiveLow !== undefined) relay.motion.pulseEnableActiveLow = cmd.pulseEnableActiveLow
+    if (cmd.pulseAlarmActiveLow !== undefined) relay.motion.pulseAlarmActiveLow = cmd.pulseAlarmActiveLow
+    if (cmd.esp32Link !== undefined) relay.motion.esp32Link = cmd.esp32Link
+    if (cmd.esp32Port !== undefined) relay.motion.esp32Port = cmd.esp32Port
+    if (cmd.esp32Baud !== undefined) relay.motion.esp32Baud = cmd.esp32Baud
     if (cmd.servoHoldTimeoutS !== undefined) relay.motion.servoHoldTimeoutS = cmd.servoHoldTimeoutS
     if (cmd.positionMode !== undefined) relay.motion.positionMode = cmd.positionMode
     if (cmd.servoCarouselPulses !== undefined) relay.motion.servoCarouselPulses = cmd.servoCarouselPulses
     if (cmd.servoIndexWindowPulses !== undefined) relay.motion.servoIndexWindowPulses = cmd.servoIndexWindowPulses
+    if (cmd.homeResync !== undefined) relay.motion.homeResync = cmd.homeResync
     if (cmd.shelves > 0) relay.shelves = cmd.shelves
   }
 

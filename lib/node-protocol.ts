@@ -63,28 +63,6 @@ export interface CalibrateCommand {
 }
 
 /**
- * DC only (pax-agent-1.7+): measure the two chains against each other and set
- * the Motor balance from the result. Start with the shelf-side chain parked on
- * shelf 1's flag (shelf sensor lit) and the other chain on the home flag (home
- * sensor lit). Both bridges run `turns` full carousel turns at Motor speed;
- * each sensor is timed to the trigger that completes its chain's last turn, the
- * first chain to finish is held until the other arrives, and the trim that
- * equalises the two times is applied and persisted. Progress and the result
- * arrive as `balance` frames.
- */
-export interface BalanceCalibrateCommand {
-  type: "balance_calibrate"
-  /** Full turns to time over, 1–10 (default 3). */
-  turns?: number
-  /**
-   * Which way to run (pax-agent-1.8+). Omitted = the homing direction, so a
-   * calibration turns the same way the operator sees homing turn. With
-   * `dcTrimPerDirection` on, the result is stored for this direction only.
-   */
-  direction?: "up" | "down"
-}
-
-/**
  * How a `goto` finds its shelf.
  * - "sensor": count shelf-flag edges on the proximity sensor (the only option on DC).
  * - "pulses": servo only — drive a calibrated number of pulses per shelf from the
@@ -127,8 +105,8 @@ export interface ConfigCommand {
   /** Servo only: pulse frequency at 100 % speed, in pulses/s (≤ 300 000 per the iSV57T manual). */
   servoMaxPps?: number
   /**
-   * Invert motor B's direction so two facing motors pull the same way. Applies
-   * to both drives (DIR line on the servos, RPWM/LPWM swap on the DC bridge).
+   * Servo only: invert motor B's DIR so two facing servos pull the same way.
+   * A DC carousel has one motor, so the DC backend ignores it.
    */
   servoMirrorB?: boolean
   /** Servo only: drive the carousel with motor A alone (hardware carousels). */
@@ -141,18 +119,29 @@ export interface ConfigCommand {
    * per-side settings arrive.
    */
   twin?: boolean
-  /**
-   * DC only (pax-agent-1.6+): PWM balance, −20…+20 %. The agent scales the
-   * faster bridge's duty down — motor A by (1 + v/100) when v < 0, motor B by
-   * (1 − v/100) when v > 0 — on every move, homing and jog. 0 = equal duty.
-   */
-  dcTrimPct?: number
-  /** DC only (pax-agent-1.8+): balance for "up" travel when `dcTrimPerDirection` is on. */
-  dcTrimUpPct?: number
-  /** DC only (pax-agent-1.8+): `dcTrimPct` for "down" travel, `dcTrimUpPct` for "up". */
-  dcTrimPerDirection?: boolean
   /** Servo only: treat the ALM inputs as healthy (ALM+/ALM− not wired). */
   servoIgnoreAlarm?: boolean
+  /**
+   * Servo only (pax-agent-1.9+): pulse source. A change rebuilds the agent's
+   * backend while idle, like a drive change. Omitted = keep the current one.
+   */
+  servoDriver?: ServoDriver
+  /**
+   * PUL/DIR only (pax-agent-1.9+): which kind of drive sits on the pulse
+   * lines. Picks the enable/alarm polarity, the pulse-rate ceiling and the
+   * wording of the release setting. Omitted = keep the agent's current one.
+   */
+  pulseDrive?: PulseDrive
+  /** PUL/DIR: override the profile's enable-input polarity (GPIO LOW = engaged). */
+  pulseEnableActiveLow?: boolean
+  /** PUL/DIR: override the profile's alarm-output polarity (pin LOW = fault). */
+  pulseAlarmActiveLow?: boolean
+  /** ESP32 controller: USB cable or header UART. */
+  esp32Link?: Esp32Link
+  /** ESP32 controller: explicit serial device ("" = auto-detect by link). */
+  esp32Port?: string
+  /** ESP32 controller: link baud, must match the firmware (default 460800). */
+  esp32Baud?: number
   /**
    * Servo only: idle seconds before the agent de-energises the drives so the
    * carousel can be moved by hand. 0 = never release (hold with full torque
@@ -165,11 +154,6 @@ export interface ConfigCommand {
   homeTimeoutS?: number
   /** Shelf timeout: seconds without a shelf flag before a move faults (pax-agent-1.7+). */
   shelfTimeoutS?: number
-  /** Chain sync at shelf 1 (DC, two motors; pax-agent-1.7+). */
-  chainSyncEnabled?: boolean
-  chainSyncToleranceMs?: number
-  chainSyncMaxWaitS?: number
-  chainSyncShelfSide?: "a" | "b"
   /** Sensor counting or calibrated pulses (pax-agent-1.5+). */
   positionMode?: PositionMode
   /**
@@ -178,22 +162,62 @@ export interface ConfigCommand {
    */
   servoCarouselPulses?: number
   servoIndexWindowPulses?: number
+  /** Re-zero on every home-flag pass in pulse positioning (default true). */
+  homeResync?: boolean
 }
 
 /**
- * How the carousel's two motors (one per chain, one on each side) are driven:
- * - "dc":    two brushed DC motors, each on its own BTS7960 bridge, speed = PWM duty.
- * - "servo": two iSV57T integrated servos on PUL/DIR, speed = pulse frequency.
+ * How the carousel is driven:
+ * - "dc":    one brushed DC motor on a BTS7960 bridge, speed = PWM duty.
+ * - "servo": any pulse + direction drive (integrated servo, AC servo or
+ *            closed-loop stepper), one per chain, speed = pulse frequency.
+ *            Which kind is `PulseDrive`; the mode name stays "servo" on the
+ *            wire so older agents keep working.
  */
 export type MotorMode = "dc" | "servo"
 
-/** Which motor a jog addresses. "both" moves the pair in lockstep. */
+/**
+ * The drive on the PUL/DIR lines (motorMode "servo"):
+ * - "integrated-servo":   iSV57T-class motor with the drive built in. No enable
+ *                          input, ALM conducts while healthy, up to 300 kHz.
+ * - "ac-servo":            A6-RS-class separate servo drive (DB44). S-ON enable,
+ *                          ALM conducts while healthy, up to 300 kHz.
+ * - "closed-loop-stepper": CL86Y-class closed-loop stepper drive. MF input frees
+ *                          the coils when active, ALM conducts ON a fault, up to
+ *                          200 kHz.
+ */
+export type PulseDrive = "integrated-servo" | "ac-servo" | "closed-loop-stepper"
+export const PULSE_DRIVES: readonly PulseDrive[] = ["integrated-servo", "ac-servo", "closed-loop-stepper"]
+
+/**
+ * Servo drive only: what generates the PUL/DIR trains.
+ * - "gpio":  the Pi header, bit-banged by the agent (iSV57T wiring).
+ * - "esp32": an ESP32 running pi-agent/esp32-servo (A6-RS wiring). It owns the
+ *            pulse timers AND both sensors; the agent talks to it over serial
+ *            and keeps all motion decisions (pax-agent-1.9+).
+ */
+export type ServoDriver = "gpio" | "esp32"
+/** How the Pi reaches the ESP32: its USB cable, or 3 wires on the GPIO header. */
+/**
+ * How the agent reaches the ESP32 controller. "wifi" = a standalone board
+ * with no Pi on its carousel; the agent instance connects to it over TCP
+ * (pax-esp32-xxxx.local:8766) and the board falls back to the master's
+ * hotspot when the router is gone.
+ */
+export type Esp32Link = "usb" | "uart" | "wifi"
+export const DEFAULT_ESP32_BAUD = 460800
+
+/**
+ * Which motor a jog addresses on the servo pair. "both" moves the pair in
+ * lockstep. A DC carousel has one motor, so the DC backend ignores this field
+ * (send "a").
+ */
 export type ServoMotorId = "a" | "b" | "both"
 
 /**
- * Nudge one motor (or both) for chain alignment. The amount is in the drive's
- * own unit: `pulses` (exact step count) on the servo pair, `ms` (run time at
- * `speed` duty) on the DC bridges. The agent answers with `state`
+ * Nudge the carousel by a small amount. Servo pair: one motor (or both) for
+ * chain alignment, `pulses` = exact step count. DC: the carousel's one motor,
+ * `ms` = run time at `speed` duty. The agent answers with `state`
  * (moving → idle) and a `servo` frame; an amount in the wrong unit for the
  * live drive is refused with a `fault`.
  */
@@ -280,7 +304,6 @@ export type NodeCommand =
   | (ReleaseCommand & Sided)
   | (HoldCommand & Sided)
   | (CalibrateCommand & Sided)
-  | (BalanceCalibrateCommand & Sided)
   | (ConfigCommand & Sided)
   | (JogCommand & Sided)
   | NetCommand
@@ -297,7 +320,8 @@ export function frameSide(data: string): TwinSide | undefined {
 }
 
 export type NetPin = "auto" | "router" | "ap"
-export type NetRole = "master" | "slave"
+/** "esp32": an agent instance that fronts a standalone Wi-Fi ESP32 carousel and only relays credentials to it. */
+export type NetRole = "master" | "slave" | "esp32"
 /**
  * router     on the workshop router
  * ap         (master) serving its standalone hotspot
@@ -336,6 +360,10 @@ export interface HelloEvent {
    * older agents, which only know the DC bridge.
    */
   motorMode?: MotorMode
+  /** The servo pulse source the agent is running (pax-agent-1.9+). */
+  servoDriver?: ServoDriver
+  /** The PUL/DIR drive profile the agent is running (pax-agent-1.9+). */
+  pulseDrive?: PulseDrive
 }
 
 /**
@@ -356,6 +384,24 @@ export interface ServoEvent {
   mirrorB?: boolean
   /** Servo drive: true while the motors are energised and holding position (pax-agent-1.4+). */
   held?: boolean
+  /** Servo drive (pax-agent-1.9+): which pulse source is live. */
+  driver?: ServoDriver
+  /** PUL/DIR (pax-agent-1.9+): the drive profile the backend is running. */
+  pulseDrive?: PulseDrive
+  /** ESP32 controller: the serial link is up and the board is streaming status. */
+  linkOk?: boolean
+  /** ESP32 controller: link type, device in use, baud and firmware version. */
+  link?: Esp32Link
+  port?: string | null
+  baud?: number
+  esp32Firmware?: string | null
+  /** ESP32 controller: why the link is down (null while it is up). */
+  linkError?: string | null
+  /** ESP32 over Wi-Fi (fw 1.2+): the board's mDNS name, which network it is on, signal and address. */
+  esp32Host?: string | null
+  esp32Wifi?: "router" | "ap" | "connecting" | "offline" | "disabled" | null
+  esp32Rssi?: number | null
+  esp32Ip?: string | null
   /** Servo drive: the agent's live idle auto-release timeout in seconds; 0 = never. */
   holdTimeoutS?: number
   /** The agent's effective homing time in seconds (pax-agent-1.6+). */
@@ -364,9 +410,6 @@ export interface ServoEvent {
   shelfTimeoutS?: number
   /** Measured seconds between two consecutive shelf flags at cruise, once learned. */
   shelfPitchS?: number | null
-  /** Last chain-sync pass at shelf 1: signed lead in ms (+ = shelf sensor first) and whether it corrected. */
-  chainSyncLastLeadMs?: number | null
-  chainSyncLastCorrected?: boolean
   /** DC drive: the longest timed jog the agent accepts, in ms. */
   jogMaxMs?: number
   /** Present on the frame emitted as a jog starts. */
@@ -439,31 +482,6 @@ export interface CalibrationEvent {
   /** Odometer correction applied at the most recent home pass, in pulses. */
   lastDriftPulses?: number | null
   restored?: boolean
-}
-
-/**
- * Progress and result of a `balance_calibrate` run (DC). `running` frames
- * carry the laps completed per motor; `done` carries both times and the trim
- * the agent has applied; `failed` explains why nothing was changed.
- */
-export interface BalanceEvent {
-  type: "balance"
-  phase: "running" | "done" | "failed"
-  message: string
-  turns?: number
-  lapsA?: number
-  lapsB?: number
-  /** Time to each chain's last trigger, ms. */
-  aMs?: number | null
-  bMs?: number | null
-  /** Trim the run was made under, percent (negative slows A). */
-  previousTrimPct?: number | null
-  /** Trim now applied by the agent, percent, to 0.001. */
-  trimPct?: number | null
-  /** The ideal trim exceeded ±20 % and was clamped. */
-  clamped?: boolean
-  /** Which way the carousel ran; the trim applies to this direction when per-direction balance is on. */
-  direction?: "up" | "down"
 }
 
 /**
@@ -559,6 +577,11 @@ export interface NetResultEvent {
 export interface NetSlave {
   hostname: string
   mac?: string | null
+  /** "esp32" = a standalone Wi-Fi controller board registered through its agent instance. */
+  kind?: "pi" | "esp32"
+  /** ESP32 boards: where the agent that drives it listens (the app connects there, not to the board). */
+  agentHost?: string | null
+  agentPort?: number | null
   online: boolean
   mode?: NetMode | null
   ssid?: string | null
@@ -583,7 +606,6 @@ export type NodeEvent =
   | ServoEvent
   | FaultEvent
   | CalibrationEvent
-  | BalanceEvent
   | SyncEvent
   | NetEvent
 
@@ -624,7 +646,6 @@ export function parseEvent(data: string): NodeEvent | null {
     case "servo":
     case "fault":
     case "calibration":
-    case "balance":
     case "sync":
     case "net.status":
     case "net.scan":

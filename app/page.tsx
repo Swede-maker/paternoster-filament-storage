@@ -1,6 +1,6 @@
 "use client"
 
-import { useEffect, useState } from "react"
+import { useEffect, useRef, useState } from "react"
 import { StoreProvider, useStore } from "@/lib/store"
 import { getStats } from "@/lib/selectors"
 import { dayKey } from "@/lib/statistics"
@@ -69,7 +69,30 @@ function AppShell() {
   // or synced. Keeping it out of the shared document means a background sync
   // reconcile (which can overwrite persisted settings mid-operation) can never
   // yank the user back to the other area while they're working.
-  const [area, setArea] = useState<TopArea>("filament")
+  // `null` until the store is ready; then seeded ONCE from the saved start-area
+  // preference. Later changes to that preference never move the user mid-session.
+  const [areaState, setArea] = useState<TopArea | null>(null)
+  if (ready && areaState === null) {
+    const saved = state.settings.startArea ?? "filament"
+    const hasUnits = (a: "filament" | "hardware") =>
+      state.nodes.some((n) => (n.system === "hardware" ? "hardware" : "filament") === a)
+    const other = saved === "filament" ? "hardware" : "filament"
+    setArea(!hasUnits(saved) && hasUnits(other) ? other : saved)
+  }
+  const area: TopArea = areaState ?? "filament"
+
+  // On startup into a non-filament area, focus a storage unit from that area so
+  // activeNode doesn't still point at a filament unit.
+  const focusedStartNode = useRef(false)
+  useEffect(() => {
+    if (areaState === null || focusedStartNode.current) return
+    focusedStartNode.current = true
+    if (areaState !== "hardware") return
+    const active = state.nodes.find((n) => n.id === state.activeNodeId)
+    if (active?.system === "hardware") return
+    const firstHw = state.nodes.find((n) => n.system === "hardware")
+    if (firstHw) dispatch({ type: "SET_ACTIVE_NODE", id: firstHw.id })
+  }, [areaState, state.nodes, state.activeNodeId, dispatch])
 
   // Switching area is a full context change: focus that area's first storage
   // unit (so activeNode resolves to a node in the shown area) and reset to the

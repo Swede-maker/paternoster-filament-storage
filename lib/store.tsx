@@ -47,15 +47,15 @@ import type {
   RfidReader,
 } from "./types"
 import type {
-  BalanceEvent,
   CalibrationEvent,
   MotorMode,
   NetResultEvent,
   NetSlave,
   NetStatusEvent,
+  PulseDrive,
   ServoEvent,
 } from "./node-protocol"
-import { printerAmsUnits, printerSlotCount, rampStepMs, newId, DEFAULT_RAMP_PCT } from "./filament"
+import { printerAmsUnits, printerSlotCount, rampStepMs, newId, DEFAULT_RAMP_PCT, pulseDriveProfile } from "./filament"
 import { pickRemainderDestination } from "./hardware-flow"
 import { shelfLabel, printerSlotLabel, nodeSystem } from "./selectors"
 import { shortestRotation } from "./balance"
@@ -188,7 +188,6 @@ function toPersisted(state: AppState): PersistedState {
         // separately as servoCarouselPulses / servoIndexWindowPulses.
         calibration: _calibration,
         calibrating: _calibrating,
-        balance: _balance,
         ...n
       }) => ({
         ...n,
@@ -381,17 +380,22 @@ const NODE_TUNING_KEYS = [
   "servoGearRatio",
   "servoJogPulses",
   "dcJogMs",
-  "dcTrimPct",
-  "dcTrimUpPct",
-  "dcTrimPerDirection",
   "servoMirrorB",
   "servoSingleMotor",
   "servoIgnoreAlarm",
+  "servoDriver",
+  "pulseDrive",
+  "pulseEnableActiveLow",
+  "pulseAlarmActiveLow",
+  "esp32Link",
+  "esp32Port",
+  "esp32Baud",
   "servoHoldTimeoutS",
   "motorMode",
   "positionMode",
   "servoCarouselPulses",
   "servoIndexWindowPulses",
+  "servoHomeResync",
   "servoCalibratedAt",
 ] as const satisfies readonly (keyof StorageNode)[]
 
@@ -699,6 +703,7 @@ function makeNode(opts: {
   driver?: NodeDriver
   port?: number
   motorMode?: MotorMode
+  pulseDrive?: PulseDrive
 }): StorageNode {
   nodeCounter += 1
   const type: NodeType = opts.type ?? "paternoster"
@@ -725,6 +730,11 @@ function makeNode(opts: {
     // Manual units have no motor at all; a carousel defaults to the DC bridge
     // unless the wizard / add-node form chose servos.
     motorMode: manual ? undefined : (opts.motorMode ?? "dc"),
+    // A PUL/DIR carousel remembers which drive is on the lines, and the drive
+    // decides the default pulse source (AC servo / stepper -> ESP32 controller).
+    ...(!manual && opts.motorMode === "servo" && opts.pulseDrive
+      ? { pulseDrive: opts.pulseDrive, servoDriver: pulseDriveProfile(opts.pulseDrive).defaultDriver }
+      : {}),
     storage: opts.storage,
     // A library is an unbounded single row of spools, so it ignores the
     // shelves/slots config and starts as one empty row that grows on demand.
@@ -779,6 +789,8 @@ export type Action =
       shelfMeta?: ShelfMeta[]
       /** Motor drive for the first carousel (ignored for manual units). */
       motorMode?: MotorMode
+      /** PUL/DIR drive kind when motorMode is "servo". */
+      pulseDrive?: PulseDrive
       settings: Partial<Settings>
     }
   | { type: "RESET_ALL" }
@@ -798,6 +810,7 @@ export type Action =
       driver?: NodeDriver
       port?: number
       motorMode?: MotorMode
+      pulseDrive?: PulseDrive
       /** Mark this unit as a real slave to be linked later via a pairing code. */
       pair?: boolean
     }
@@ -821,14 +834,19 @@ export type Action =
           | "servoGearRatio"
           | "servoJogPulses"
           | "dcJogMs"
-          | "dcTrimPct"
-          | "dcTrimUpPct"
-          | "dcTrimPerDirection"
           | "servoMirrorB"
           | "servoSingleMotor"
           | "servoIgnoreAlarm"
+          | "servoDriver"
+          | "pulseDrive"
+          | "pulseEnableActiveLow"
+          | "pulseAlarmActiveLow"
+          | "esp32Link"
+          | "esp32Port"
+          | "esp32Baud"
           | "servoHoldTimeoutS"
           | "positionMode"
+          | "servoHomeResync"
         >
       >
     }
@@ -857,7 +875,6 @@ export type Action =
   | { type: "NODE_CALIBRATION"; nodeId: string; calibration: CalibrationEvent }
   /** Calibrate pressed locally; cleared by the agent's answer. */
   | { type: "NODE_CALIBRATING"; nodeId: string; on: boolean }
-  | { type: "NODE_BALANCE"; nodeId: string; balance: BalanceEvent | null }
   /**
    * Simulated unit: run the calibration the Pi would — home, one full turn
    * through every shelf, stop at home — and produce a result from the servo
@@ -1171,7 +1188,10 @@ function onNodeArrived(state: AppState, nodeId: string): AppState {
       machine: { ...n.machine, status: "idle", targetShelf: null, direction: null, moveFrom: null },
     }))
   }
-  const status = job!.mode === "pick" ? "awaiting-pick-confirm" : "awaiting-store-confirm"
+  const servicedItem = current && current.nodeId === nodeId ? current : twinItem
+  const isTake =
+    job!.mode === "pick" || (job!.mode === "rebalance" && servicedItem?.rebalanceStep === "take")
+  const status = isTake ? "awaiting-pick-confirm" : "awaiting-store-confirm"
   return withNode(state, nodeId, (n) => ({
     ...n,
     machine: { ...n.machine, status, targetShelf: null, direction: null, moveFrom: null },
@@ -1431,6 +1451,7 @@ function coreReducer(state: AppState, action: Action): AppState {
         shelfMeta: action.shelfMeta,
         storage: action.storage,
         motorMode: action.motorMode,
+        pulseDrive: action.pulseDrive,
       })
       return {
         ...base,
@@ -1479,6 +1500,7 @@ function coreReducer(state: AppState, action: Action): AppState {
         driver: action.driver,
         port: action.port,
         motorMode: action.motorMode,
+        pulseDrive: action.pulseDrive,
       })
       // A real slave linked by code starts "unpaired"; it runs on the simulated
       // driver until (and after) a real agent phones home, so the app never
@@ -2488,20 +2510,6 @@ function coreReducer(state: AppState, action: Action): AppState {
     case "NODE_CALIBRATING":
       return withNode(state, action.nodeId, (n) => ({ ...n, calibrating: action.on }))
 
-    case "NODE_BALANCE": {
-      const ev = action.balance
-      return withNode(state, action.nodeId, (n) => {
-        const next: StorageNode = { ...n, balance: ev }
-        // The agent has already applied and saved the measured trim; mirror it
-        // so the slider, the Exact box and the next `config` all agree.
-        if (ev?.phase === "done" && typeof ev.trimPct === "number" && Number.isFinite(ev.trimPct)) {
-          if (ev.direction === "up" && n.dcTrimPerDirection === true) next.dcTrimUpPct = ev.trimPct
-          else next.dcTrimPct = ev.trimPct
-        }
-        return next
-      })
-    }
-
     case "SIM_CALIBRATE_START": {
       const node = getNode(state, action.nodeId)
       if (!node || node.driver === "hardware" || node.machine.status !== "idle" || state.job) return state
@@ -2644,7 +2652,7 @@ function coreReducer(state: AppState, action: Action): AppState {
       const job = state.job
       if (!job || job.mode === "pick") return state
       const item = job.items[job.currentIndex]
-      if (!item || item.occupantKind === "part") return state
+      if (!item || item.occupantKind === "part" || item.rebalanceStep === "take") return state
       const spool = state.spools[item.spoolId]
       if (!spool) return state
 
@@ -2694,7 +2702,32 @@ function coreReducer(state: AppState, action: Action): AppState {
       // the remainder; it is appended to this job below.
       let spilloverItem: QueueItem | null = null
 
-      if (job.mode === "pick" && item.occupantKind === "part") {
+      if (job.mode === "rebalance") {
+        // Take step: the operator lifted the spool out. Nothing is written yet,
+        // so the spool stays registered in its old slot until it is placed.
+        // Put step: move it from the old slot to the new one in one go.
+        if (item.rebalanceStep === "put") {
+          if (item.from) {
+            next = machineReducer(next, {
+              type: "SET_STORAGE_SLOT",
+              nodeId: item.from.nodeId,
+              shelf: item.from.shelf,
+              slot: item.from.slot,
+              spoolId: null,
+            })
+          }
+          if (typeof action.grams === "number") {
+            next = machineReducer(next, { type: "UPDATE_SPOOL", id: item.spoolId, changes: { grams: action.grams } })
+          }
+          next = machineReducer(next, {
+            type: "SET_STORAGE_SLOT",
+            nodeId: item.nodeId,
+            shelf: item.shelf,
+            slot: item.slot,
+            spoolId: item.spoolId,
+          })
+        }
+      } else if (job.mode === "pick" && item.occupantKind === "part") {
         // Hardware take-out. Decrement the box; HW_TAKE itself frees the slot and
         // deletes the part when it empties, so we don't clear the slot here. The
         // quantity is normally entered live at this stop (action.takeCount); fall
@@ -3320,6 +3353,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   // server. While this is true, a poll must not reload �� otherwise it can fetch
   // a version from before our write landed and clobber the local change.
   const saveInFlight = useRef(false)
+  const saveSeq = useRef(0)
   // Always-fresh view of state so the poll can consult the live job/state
   // without waiting for its effect to re-subscribe.
   const stateRef = useRef(state)
@@ -3394,6 +3428,11 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     if (sig === lastSavedSig.current) return
     if (saveTimer.current) clearTimeout(saveTimer.current)
     saveInFlight.current = true
+    // Only the most recently scheduled save may clear the in-flight flag. An
+    // older save finishing while a newer one is still debouncing used to drop
+    // the flag early, letting a poll reload a stale document over the newest
+    // local change (e.g. the last spool of a take-out reappearing in its slot).
+    const mySeq = ++saveSeq.current
     saveTimer.current = setTimeout(async () => {
       // Persist the NEWEST state, not the render that scheduled this timer.
       // Capturing `state` from the closure is why the carousel position jumped
@@ -3427,7 +3466,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       } catch (e) {
         console.log("[v0] system save failed:", (e as Error).message)
       } finally {
-        saveInFlight.current = false
+        if (saveSeq.current === mySeq) saveInFlight.current = false
       }
     }, 600)
     // Deliberately no cleanup cancelling the timer. The debounce is already
@@ -3470,19 +3509,25 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     if (!ready) return
     let cancelled = false
+    // Local edits not yet written to the database must never be replaced by a
+    // server snapshot; the pending save will carry them (merged) instead.
+    const blocked = () =>
+      !!stateRef.current.job ||
+      saveInFlight.current ||
+      persistedSig(stateRef.current) !== lastSavedSig.current
     const iv = setInterval(async () => {
       try {
         // Never reload on top of an in-progress operation or a pending write:
         // a job mid-flight or an unacknowledged save is local truth that a stale
         // server snapshot must not overwrite.
-        if (stateRef.current.job || saveInFlight.current) return
+        if (blocked()) return
         const { version } = await getSystemVersion()
         if (cancelled || version === 0 || version === dbVersion.current) return
         // Re-check the guards after the await — a job/save may have started while
         // the version request was in flight.
-        if (stateRef.current.job || saveInFlight.current) return
+        if (blocked()) return
         const { data, version: v } = await loadSystemState()
-        if (cancelled || !data || stateRef.current.job || saveInFlight.current) return
+        if (cancelled || !data || blocked()) return
         const incoming = migrate(data)
         const incomingPersisted = toPersisted(incoming)
         const incomingSig = JSON.stringify(incomingPersisted)

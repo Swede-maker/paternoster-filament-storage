@@ -1,4 +1,4 @@
-import type { AmsUnit, FilamentMaterial, Printer, Spool } from "./types"
+import type { AmsUnit, FilamentMaterial, Printer, PulseDrive, Spool } from "./types"
 
 export const MATERIALS: FilamentMaterial[] = [
   "PLA",
@@ -263,7 +263,7 @@ export const MAX_SERVO_JOG_PULSES = 20_000
 export const DEFAULT_SERVO_GEAR_RATIO = 1
 export const MIN_SERVO_GEAR_RATIO = 1
 export const MAX_SERVO_GEAR_RATIO = 1000
-/** Most dual-chain builds mount the two motors facing each other (both drives). */
+/** Servo pair: most dual-chain builds mount the two servos facing each other. */
 export const DEFAULT_SERVO_MIRROR_B = true
 /**
  * Idle seconds before the agent cuts the servo supply (via the optional relay
@@ -335,12 +335,120 @@ type ServoNode = {
   servoGearRatio?: number
   servoJogPulses?: number
   dcJogMs?: number
-  dcTrimPct?: number
   servoMirrorB?: boolean
   servoIgnoreAlarm?: boolean
   servoHoldTimeoutS?: number
   servoSingleMotor?: boolean
+  servoDriver?: "gpio" | "esp32"
+  pulseDrive?: PulseDrive
+  pulseEnableActiveLow?: boolean
+  pulseAlarmActiveLow?: boolean
+  esp32Link?: "usb" | "uart" | "wifi"
+  esp32Port?: string
+  esp32Baud?: number
   system?: "filament" | "hardware"
+}
+
+// ---- PUL/DIR drive profiles -------------------------------------------------
+// One motorMode ("servo") covers every pulse + direction drive; the profile
+// says which one is wired so the controller gets the right enable/alarm
+// polarity and the UI talks about the right thing (S-ON vs MF, 300 vs 200 kHz).
+export interface PulseDriveProfile {
+  id: PulseDrive
+  label: string
+  /** Short form for pills and the unit list. */
+  short: string
+  /** Example drives the profile was written for. */
+  examples: string
+  /** Default pulse source when this profile is picked. */
+  defaultDriver: "gpio" | "esp32"
+  /** Pulse ceiling the drive accepts (manual). */
+  maxPps: number
+  /** GPIO LOW on the enable line = engaged (opto common-anode hookups). */
+  enableActiveLow: boolean
+  /** The ALM output conducts (pin LOW) ON a fault rather than while healthy. */
+  alarmActiveLow: boolean
+  /** True when the drive has an enable / motor-free input the controller can use. */
+  hasEnableInput: boolean
+  /** Name of that input on the drive. */
+  enableInputName: string
+  /** Where the pulses-per-rev setting lives on the drive. */
+  pprHint: string
+  detail: string
+}
+
+export const PULSE_DRIVE_PROFILES: readonly PulseDriveProfile[] = [
+  {
+    id: "integrated-servo",
+    label: "Integrated servo",
+    short: "integrated servo",
+    examples: "iSV57T",
+    defaultDriver: "gpio",
+    maxPps: 300_000,
+    enableActiveLow: false,
+    alarmActiveLow: false,
+    hasEnableInput: false,
+    enableInputName: "supply relay",
+    pprHint: "DIP S1–S3 (all OFF = Pr0.08)",
+    detail:
+      "Motor and drive in one housing, PUL/DIR/ALM on a 6-pin lead. Has no enable input, so release needs the optional supply relay.",
+  },
+  {
+    id: "ac-servo",
+    label: "AC servo",
+    short: "AC servo",
+    examples: "A6-RS (DB44)",
+    defaultDriver: "esp32",
+    maxPps: 300_000,
+    enableActiveLow: false,
+    alarmActiveLow: false,
+    hasEnableInput: true,
+    enableInputName: "S-ON",
+    pprHint: "Pr0.08 (command pulses per revolution)",
+    detail:
+      "Separate 230 V servo drive. S-ON enables the motor, ALM conducts while healthy. Needs the 24 V I/O rail; the ESP32 controller is the usual pulse source.",
+  },
+  {
+    id: "closed-loop-stepper",
+    label: "Closed-loop stepper",
+    short: "closed-loop stepper",
+    examples: "CL86Y, CL57T",
+    defaultDriver: "esp32",
+    maxPps: 200_000,
+    enableActiveLow: false,
+    alarmActiveLow: true,
+    hasEnableInput: true,
+    enableInputName: "MF",
+    pprHint: "DIP SW3–SW6 (400–51 200 pulses/rev)",
+    detail:
+      "Stepper with an encoder and a separate drive. The MF input frees the coils, so Release after idle works without a relay. ALM conducts on a fault; max 200 kHz.",
+  },
+]
+
+export function pulseDriveProfile(id: PulseDrive): PulseDriveProfile {
+  return PULSE_DRIVE_PROFILES.find((p) => p.id === id) ?? PULSE_DRIVE_PROFILES[0]
+}
+/**
+ * The PUL/DIR drive on this node. Older nodes have no field: the GPIO wiring
+ * was written for the iSV57T and the ESP32 controller for the A6-RS.
+ */
+export function pulseDriveFor(node: ServoNode): PulseDrive {
+  const d = node.pulseDrive
+  if (d === "integrated-servo" || d === "ac-servo" || d === "closed-loop-stepper") return d
+  return node.servoDriver === "esp32" ? "ac-servo" : "integrated-servo"
+}
+export function pulseDriveProfileFor(node: ServoNode): PulseDriveProfile {
+  return pulseDriveProfile(pulseDriveFor(node))
+}
+export function pulseEnableActiveLowFor(node: ServoNode): boolean {
+  return node.pulseEnableActiveLow ?? pulseDriveProfileFor(node).enableActiveLow
+}
+export function pulseAlarmActiveLowFor(node: ServoNode): boolean {
+  return node.pulseAlarmActiveLow ?? pulseDriveProfileFor(node).alarmActiveLow
+}
+/** Pulse-rate ceiling for the node's drive (the "Pulse rate at 100 %" input max). */
+export function pulseDriveMaxPpsFor(node: ServoNode): number {
+  return Math.min(MAX_SERVO_MAX_PPS, pulseDriveProfileFor(node).maxPps)
 }
 /** One-servo drive: only for servo-driven HARDWARE carousels, never filament. */
 export function servoSingleMotorFor(node: ServoNode): boolean {
@@ -349,102 +457,37 @@ export function servoSingleMotorFor(node: ServoNode): boolean {
 export function servoIgnoreAlarmFor(node: ServoNode): boolean {
   return node.servoIgnoreAlarm === true
 }
+/** Servo pulse source; "gpio" unless the operator picked the ESP32 controller. */
+export function servoDriverFor(node: ServoNode): "gpio" | "esp32" {
+  return node.servoDriver === "esp32" ? "esp32" : "gpio"
+}
+export function esp32LinkFor(node: ServoNode): "usb" | "uart" | "wifi" {
+  return node.esp32Link === "uart" || node.esp32Link === "wifi" ? node.esp32Link : "usb"
+}
+/** Serial device for usb/uart, or host[:port] of a standalone Wi-Fi board. */
+export function esp32PortFor(node: ServoNode): string {
+  return (node.esp32Port ?? "").trim()
+}
+/** Default device the agent opens for each link type (what "auto" resolves to). */
+export function esp32DefaultPortFor(node: ServoNode): string {
+  const link = esp32LinkFor(node)
+  if (link === "wifi") return "pax-esp32-xxxx.local:8766"
+  return link === "uart" ? "/dev/serial0" : "/dev/ttyUSB0 (or /dev/serial/by-id/…)"
+}
+/** Accepts a hostname / IPv4 / mDNS name with an optional :port — what the agent dials for a Wi-Fi ESP32. */
+export const ESP32_HOST_PATTERN = /^[A-Za-z0-9][A-Za-z0-9.\-]{0,120}(:\d{1,5})?$/
+export const DEFAULT_ESP32_BAUD = 460800
+export const ESP32_BAUD_CHOICES = [115200, 230400, 460800, 921600] as const
+export function esp32BaudFor(node: ServoNode): number {
+  const b = node.esp32Baud
+  return typeof b === "number" && b >= 9600 && b <= 2_000_000 ? Math.round(b) : DEFAULT_ESP32_BAUD
+}
 
 export function isServoNode(node: ServoNode): boolean {
   return node.motorMode === "servo"
 }
 export function dcJogMsFor(node: ServoNode): number {
   return node.dcJogMs ?? DEFAULT_DC_JOG_MS
-}
-/** DC PWM balance (see StorageNode.dcTrimPct): 0 = equal duty on both bridges. */
-export const DEFAULT_DC_TRIM_PCT = 0
-export const MAX_DC_TRIM_PCT = 20
-/** The slider and nudge buttons move the balance in tenths of a percent. */
-export const DC_TRIM_STEP_PCT = 0.1
-/**
- * Stored to a thousandth of a percent so the auto-calibration can land exactly.
- * Rounding via integer scaling, not `round(v / step) * step`: that produced
- * -2.4000000000000004 for -2.4 and the artefact showed up in the Exact box.
- */
-export const DC_TRIM_DECIMALS = 3
-export function roundDcTrimPct(v: number): number {
-  const f = 10 ** DC_TRIM_DECIMALS
-  return Math.round(v * f) / f
-}
-/** "2.4", "2.437", "0.0" — magnitude only; callers add the A/B sign. */
-export function formatDcTrimPct(v: number): string {
-  const s = Math.abs(v).toFixed(DC_TRIM_DECIMALS).replace(/0+$/, "")
-  return s.endsWith(".") ? `${s}0` : s
-}
-export function dcTrimPctFor(node: ServoNode): number {
-  const v = node.dcTrimPct ?? DEFAULT_DC_TRIM_PCT
-  return Math.max(-MAX_DC_TRIM_PCT, Math.min(MAX_DC_TRIM_PCT, roundDcTrimPct(v)))
-}
-
-// Chain sync (see StorageNode.chainSyncEnabled).
-export const DEFAULT_CHAIN_SYNC_TOLERANCE_MS = 150
-export const MIN_CHAIN_SYNC_TOLERANCE_MS = 0
-export const MAX_CHAIN_SYNC_TOLERANCE_MS = 5000
-export function chainSyncEnabledFor(node: { chainSyncEnabled?: boolean }): boolean {
-  return node.chainSyncEnabled === true
-}
-export function chainSyncToleranceFor(node: { chainSyncToleranceMs?: number }): number {
-  const v = node.chainSyncToleranceMs
-  if (typeof v === "number" && Number.isFinite(v)) {
-    return Math.max(MIN_CHAIN_SYNC_TOLERANCE_MS, Math.min(MAX_CHAIN_SYNC_TOLERANCE_MS, Math.round(v)))
-  }
-  return DEFAULT_CHAIN_SYNC_TOLERANCE_MS
-}
-export const DEFAULT_CHAIN_SYNC_MAX_WAIT_S = 3
-export const MIN_CHAIN_SYNC_MAX_WAIT_S = 0.5
-export const MAX_CHAIN_SYNC_MAX_WAIT_S = 60
-export function chainSyncMaxWaitFor(node: { chainSyncMaxWaitS?: number }): number {
-  const v = node.chainSyncMaxWaitS
-  if (typeof v === "number" && Number.isFinite(v)) {
-    return Math.max(MIN_CHAIN_SYNC_MAX_WAIT_S, Math.min(MAX_CHAIN_SYNC_MAX_WAIT_S, Math.round(v * 10) / 10))
-  }
-  return DEFAULT_CHAIN_SYNC_MAX_WAIT_S
-}
-export function chainSyncShelfSideFor(node: { chainSyncShelfSide?: "a" | "b" }): "a" | "b" {
-  return node.chainSyncShelfSide === "b" ? "b" : "a"
-}
-/**
- * The trim that equalises two chains timed over the same number of turns under
- * `previousTrimPct`. Mirrors the agent's calculation; used by the simulator.
- * Negative slows A, positive slows B, clamped to ±MAX_DC_TRIM_PCT.
- */
-export function balanceTrimFromTimes(aMs: number, bMs: number, previousTrimPct: number): number {
-  const scaleA = previousTrimPct < 0 ? 1 + previousTrimPct / 100 : 1
-  const scaleB = previousTrimPct > 0 ? 1 - previousTrimPct / 100 : 1
-  const perDutyA = 1 / (aMs * scaleA)
-  const perDutyB = 1 / (bMs * scaleB)
-  const ideal = perDutyA > perDutyB ? -(1 - perDutyB / perDutyA) * 100 : (1 - perDutyA / perDutyB) * 100
-  return roundDcTrimPct(Math.max(-MAX_DC_TRIM_PCT, Math.min(MAX_DC_TRIM_PCT, ideal)))
-}
-/** Duty multipliers per bridge for a trim value; the faster motor is scaled below 1. */
-export function dcTrimScalesFromPct(t: number): { a: number; b: number } {
-  return { a: t < 0 ? 1 + t / 100 : 1, b: t > 0 ? 1 - t / 100 : 1 }
-}
-/** Duty multipliers per bridge for the node's (down / shared) trim. */
-export function dcTrimScalesFor(node: ServoNode): { a: number; b: number } {
-  return dcTrimScalesFromPct(dcTrimPctFor(node))
-}
-export type TravelDirection = "up" | "down"
-/** The direction homing runs in; a calibration without an explicit direction uses it too. */
-export const HOMING_TRAVEL_DIRECTION: TravelDirection = "up"
-export function dcTrimPerDirectionFor(node: { dcTrimPerDirection?: boolean }): boolean {
-  return node.dcTrimPerDirection === true
-}
-export function dcTrimUpPctFor(node: ServoNode & { dcTrimUpPct?: number }): number {
-  const v = node.dcTrimUpPct ?? DEFAULT_DC_TRIM_PCT
-  return Math.max(-MAX_DC_TRIM_PCT, Math.min(MAX_DC_TRIM_PCT, roundDcTrimPct(v)))
-}
-/** The trim the agent applies for travel in `direction`, honouring the per-direction switch. */
-export function dcTrimPctForDirection(
-  node: ServoNode & { dcTrimUpPct?: number; dcTrimPerDirection?: boolean },
-  direction: TravelDirection,
-): number {
-  return direction === "up" && dcTrimPerDirectionFor(node) ? dcTrimUpPctFor(node) : dcTrimPctFor(node)
 }
 export function servoPulsesPerRevFor(node: ServoNode): number {
   return node.servoPulsesPerRev ?? DEFAULT_SERVO_PULSES_PER_REV

@@ -7,11 +7,6 @@ import {
   MAX_HOME_TIMEOUT_S,
   MIN_SHELF_TIMEOUT_S,
   MAX_SHELF_TIMEOUT_S,
-  MIN_CHAIN_SYNC_TOLERANCE_MS,
-  MAX_CHAIN_SYNC_TOLERANCE_MS,
-  MIN_CHAIN_SYNC_MAX_WAIT_S,
-  MAX_CHAIN_SYNC_MAX_WAIT_S,
-  roundDcTrimPct,
 } from "@/lib/filament"
 
 export const runtime = "nodejs"
@@ -42,15 +37,6 @@ function parseBaseCommand(body: unknown): NodeCommand | null {
     case "hold":
     case "calibrate":
       return { type }
-    case "balance_calibrate": {
-      const { turns, direction } = body as { turns?: unknown; direction?: unknown }
-      const n = typeof turns === "number" && Number.isInteger(turns) && turns >= 1 && turns <= 10 ? turns : 3
-      return {
-        type: "balance_calibrate",
-        turns: n,
-        ...(direction === "up" || direction === "down" ? { direction } : {}),
-      }
-    }
     case "goto": {
       const shelf = (body as { shelf?: unknown }).shelf
       if (typeof shelf !== "number" || !Number.isInteger(shelf) || shelf < 0) return null
@@ -90,20 +76,21 @@ function parseBaseCommand(body: unknown): NodeCommand | null {
         servoSingleMotor?: unknown
         reverseDir?: unknown
         servoIgnoreAlarm?: unknown
-        dcTrimPct?: unknown
-        dcTrimUpPct?: unknown
-        dcTrimPerDirection?: unknown
+        servoDriver?: unknown
+        pulseDrive?: unknown
+        pulseEnableActiveLow?: unknown
+        pulseAlarmActiveLow?: unknown
+        esp32Link?: unknown
+        esp32Port?: unknown
+        esp32Baud?: unknown
         servoHoldTimeoutS?: unknown
         sensorArmS?: unknown
         homeTimeoutS?: unknown
         shelfTimeoutS?: unknown
-        chainSyncEnabled?: unknown
-        chainSyncToleranceMs?: unknown
-        chainSyncMaxWaitS?: unknown
-        chainSyncShelfSide?: unknown
         positionMode?: unknown
         servoCarouselPulses?: unknown
         servoIndexWindowPulses?: unknown
+        homeResync?: unknown
       }
       if (typeof b.shelves !== "number" || !Number.isInteger(b.shelves) || b.shelves <= 0) return null
       // Rebuilding the command field-by-field is what dropped the slider values:
@@ -131,37 +118,34 @@ function parseBaseCommand(body: unknown): NodeCommand | null {
       if (typeof b.servoSingleMotor === "boolean") cmd.servoSingleMotor = b.servoSingleMotor
       if (typeof b.reverseDir === "boolean") cmd.reverseDir = b.reverseDir
       if (typeof b.servoIgnoreAlarm === "boolean") cmd.servoIgnoreAlarm = b.servoIgnoreAlarm
-      // Motor balance (DC): -20..+20 %. 0 is meaningful (= equal duty) and must
-      // be forwarded too, otherwise a reset never reaches the Pi.
-      const trim = b.dcTrimPct
-      if (typeof trim === "number" && Number.isFinite(trim) && Math.abs(trim) <= 20) {
-        cmd.dcTrimPct = roundDcTrimPct(trim)
-      }
-      const trimUp = b.dcTrimUpPct
-      if (typeof trimUp === "number" && Number.isFinite(trimUp) && Math.abs(trimUp) <= 20) {
-        cmd.dcTrimUpPct = roundDcTrimPct(trimUp)
-      }
-      if (typeof b.dcTrimPerDirection === "boolean") cmd.dcTrimPerDirection = b.dcTrimPerDirection
-      if (typeof b.chainSyncEnabled === "boolean") cmd.chainSyncEnabled = b.chainSyncEnabled
-      const tol = b.chainSyncToleranceMs
+      // Servo pulse source + ESP32 link. The port is a device path the agent
+      // opens, so only accept something that looks like one.
+      if (b.servoDriver === "gpio" || b.servoDriver === "esp32") cmd.servoDriver = b.servoDriver
       if (
-        typeof tol === "number" &&
-        Number.isFinite(tol) &&
-        tol >= MIN_CHAIN_SYNC_TOLERANCE_MS &&
-        tol <= MAX_CHAIN_SYNC_TOLERANCE_MS
+        b.pulseDrive === "integrated-servo" ||
+        b.pulseDrive === "ac-servo" ||
+        b.pulseDrive === "closed-loop-stepper"
       ) {
-        cmd.chainSyncToleranceMs = Math.round(tol)
+        cmd.pulseDrive = b.pulseDrive
       }
-      const wait = b.chainSyncMaxWaitS
+      if (typeof b.pulseEnableActiveLow === "boolean") cmd.pulseEnableActiveLow = b.pulseEnableActiveLow
+      if (typeof b.pulseAlarmActiveLow === "boolean") cmd.pulseAlarmActiveLow = b.pulseAlarmActiveLow
+      if (b.esp32Link === "usb" || b.esp32Link === "uart" || b.esp32Link === "wifi") cmd.esp32Link = b.esp32Link
+      if (typeof b.esp32Port === "string") {
+        // A serial device for usb/uart, or host[:port] for a standalone Wi-Fi board.
+        const port = b.esp32Port.trim()
+        const isDevice = /^\/dev\/[A-Za-z0-9._\-/]{1,80}$/.test(port)
+        const isHost = /^[A-Za-z0-9][A-Za-z0-9.\-]{0,120}(:\d{1,5})?$/.test(port)
+        if (port === "" || isDevice || isHost) cmd.esp32Port = port
+      }
       if (
-        typeof wait === "number" &&
-        Number.isFinite(wait) &&
-        wait >= MIN_CHAIN_SYNC_MAX_WAIT_S &&
-        wait <= MAX_CHAIN_SYNC_MAX_WAIT_S
+        typeof b.esp32Baud === "number" &&
+        Number.isInteger(b.esp32Baud) &&
+        b.esp32Baud >= 9600 &&
+        b.esp32Baud <= 2_000_000
       ) {
-        cmd.chainSyncMaxWaitS = Math.round(wait * 10) / 10
+        cmd.esp32Baud = b.esp32Baud
       }
-      if (b.chainSyncShelfSide === "a" || b.chainSyncShelfSide === "b") cmd.chainSyncShelfSide = b.chainSyncShelfSide
       // 0 is meaningful here (= hold for ever), so it is not a "positive int".
       const hold = b.servoHoldTimeoutS
       if (typeof hold === "number" && Number.isInteger(hold) && hold >= 0 && hold <= 86_400) {
@@ -195,6 +179,7 @@ function parseBaseCommand(body: unknown): NodeCommand | null {
       const windowPulses = posInt(b.servoIndexWindowPulses, 100_000_000)
       if (carouselPulses !== undefined) cmd.servoCarouselPulses = carouselPulses
       if (windowPulses !== undefined) cmd.servoIndexWindowPulses = windowPulses
+      if (typeof b.homeResync === "boolean") cmd.homeResync = b.homeResync
       return cmd
     }
     default:

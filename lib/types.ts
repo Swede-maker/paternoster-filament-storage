@@ -1,17 +1,19 @@
 // Core domain types for the PAX paternoster filament storage system.
 
 import type {
-  BalanceEvent,
+  ServoDriver,
+  Esp32Link,
   CalibrationEvent,
   MotorMode,
   NetResultEvent,
   NetSlave,
   NetStatusEvent,
   PositionMode,
+  PulseDrive,
   ServoEvent,
 } from "@/lib/node-protocol"
 
-export type { MotorMode }
+export type { MotorMode, PulseDrive }
 
 /**
  * Filament material type. Common presets are listed in `MATERIALS`
@@ -479,8 +481,11 @@ export interface MachineFault {
  * - "pick": move spools from storage onto a printer
  * - "store": move spools from a printer into storage
  * - "place": place brand new spools into storage
+ * - "rebalance": relocate spools inside one paternoster to even out its load.
+ *   Items come in take/put pairs (see `QueueItem.rebalanceStep`) so the operator
+ *   handles exactly one spool at a time: pick it, then place it, then the next.
  */
-export type QueueMode = "pick" | "store" | "place"
+export type QueueMode = "pick" | "store" | "place" | "rebalance"
 
 export interface QueueItem {
   /**
@@ -531,6 +536,13 @@ export interface QueueItem {
    * the system never offers the same slot twice for the same spool.
    */
   rejectedSlots?: { nodeId: string; shelf: number; slot: number }[]
+  /**
+   * Rebalance jobs only. "take" = stop at the spool's current slot and have the
+   * operator lift it out (nothing is written yet, so cancelling here loses
+   * nothing). "put" = stop at the new slot; confirming moves the spool from
+   * `from` to this slot in one step.
+   */
+  rebalanceStep?: "take" | "put"
   done: boolean
 }
 
@@ -556,6 +568,26 @@ export interface Settings {
    * hardware area existed; falls back to `confirmBeforeMove` when absent.
    */
   confirmBeforeMoveHardware?: boolean
+  /**
+   * Which area opens when the app loads or refreshes. Shared by the filament and
+   * hardware Settings tabs. Only read on startup, so changing it never moves the
+   * user mid-session. Optional for older saves; defaults to "filament".
+   */
+  startArea?: "filament" | "hardware"
+  /**
+   * Carousel balance warning (filament paternosters). When enabled, a shelf whose
+   * weight differs from the unit's average shelf weight by more than
+   * `thresholdGrams` is flagged red in the Shelf Overview, and a Rebalance button
+   * offers a guided one-spool-at-a-time relocation queue.
+   */
+  balanceWarning?: { enabled: boolean; thresholdGrams: number }
+  /**
+   * USB webcam on the Pi (served by pi-agent/camera/pax_camera.py). `enabled`
+   * shows the live view in the Home sidebar; `popupOnMove` opens it by itself
+   * while a carousel is moving. `host` overrides the address (defaults to the
+   * shown carousel's Pi). Optional for older saves (= off).
+   */
+  camera?: { enabled: boolean; popupOnMove: boolean; port: number; host?: string }
   /** Full spool weight assumption (g) used for new spools. */
   defaultSpoolWeight: number
   /** User-saved material/type names (in addition to the built-in list). */
@@ -812,10 +844,10 @@ export interface StorageNode {
    */
   loadCompPct?: number
   /**
-   * How the carousel's two motors (one per chain) are driven on the Pi. "dc"
-   * (default, and what every node saved before this field existed runs) is two
-   * brushed motors, each on its own BTS7960 bridge; "servo" is two iSV57T
-   * integrated servos on PUL/DIR. The agent persists the choice and
+   * How the carousel is driven on the Pi. "dc" (default, and what every node
+   * saved before this field existed runs) is one brushed motor on a BTS7960
+   * bridge; "servo" is two iSV57T integrated servos (one per chain) on
+   * PUL/DIR. The agent persists the choice and
    * initialises the matching backend; the jog panel switches its unit
    * (milliseconds vs. pulses) and the servo alarm lamps appear only for servos.
    */
@@ -835,24 +867,7 @@ export interface StorageNode {
   servoJogPulses?: number
   /** DC only: how many milliseconds one jog tap runs the motor. */
   dcJogMs?: number
-  /**
-   * DC only: PWM balance between the two bridges, −20…+20 %. Two "identical"
-   * brushed motors never run at quite the same speed for the same duty, so one
-   * chain creeps ahead of the other. The faster side is trimmed DOWN by this
-   * much: negative slows motor A, positive slows motor B, 0 = both get the
-   * same duty. Applied by the agent to every move, homing and jog.
-   */
-  dcTrimPct?: number
-  /**
-   * DC only: a second balance used when the carousel travels "up" (the
-   * homing direction). Brushed motors and gearboxes often differ more one way
-   * than the other, so each direction can carry its own trim. Only applied
-   * when `dcTrimPerDirection` is on; otherwise `dcTrimPct` serves both ways.
-   */
-  dcTrimUpPct?: number
-  /** DC only: use `dcTrimPct` for "down" travel and `dcTrimUpPct` for "up". */
-  dcTrimPerDirection?: boolean
-  /** Invert motor B's direction (motors mounted facing each other). Both drives. */
+  /** Servo only: invert motor B's direction (servos mounted facing each other). */
   servoMirrorB?: boolean
   /**
    * Servo + HARDWARE carousels only: the carousel is driven by a single servo
@@ -873,6 +888,30 @@ export interface StorageNode {
    * unwired ALM+/ALM− reads as a permanent alarm and blocks every move.
    */
   servoIgnoreAlarm?: boolean
+  /**
+   * Servo only: who generates the PUL/DIR trains. "gpio" = the Pi header
+   * (iSV57T wiring). "esp32" = an ESP32 running pi-agent/esp32-servo, which
+   * also reads both sensors, talking to the Pi over a serial link (A6-RS
+   * wiring). Default gpio.
+   */
+  servoDriver?: ServoDriver
+  /**
+   * Servo only: which drive is on the PUL/DIR lines — integrated servo
+   * (iSV57T), AC servo (A6-RS) or closed-loop stepper (CL86Y). Decides the
+   * enable/alarm polarity the controller uses and the wording in Settings.
+   * Default: "integrated-servo" on Pi GPIO, "ac-servo" on the ESP32.
+   */
+  pulseDrive?: PulseDrive
+  /** Servo only: override the profile's enable polarity (true = GPIO LOW engages). */
+  pulseEnableActiveLow?: boolean
+  /** Servo only: override the profile's alarm polarity (true = pin LOW is a fault). */
+  pulseAlarmActiveLow?: boolean
+  /** ESP32 controller: "usb" = USB cable (/dev/ttyUSB0), "uart" = GPIO14/15 (/dev/serial0). */
+  esp32Link?: Esp32Link
+  /** ESP32 controller: explicit serial device; empty = auto by link type. */
+  esp32Port?: string
+  /** ESP32 controller: link baud (must match the firmware build, default 460800). */
+  esp32Baud?: number
   /**
    * Servo only: idle seconds before the agent releases the servos so the
    * carousel can be moved by hand. 0 = hold always (until the supply is off).
@@ -897,20 +936,6 @@ export interface StorageNode {
    */
   shelfTimeoutS?: number
   /**
-   * Chain sync (DC, two motors): shelf 1 carries both the shelf flag and the
-   * home flag, so the two sensors should fire together as it passes. When on,
-   * every pass of shelf 1 is driven at Approach speed and, if one sensor leads
-   * the other by more than `chainSyncToleranceMs`, the leading side's motor is
-   * paused until the lagging sensor fires — realigning the chains each lap.
-   */
-  chainSyncEnabled?: boolean
-  /** Lead one sensor may have over the other before a correction starts (ms). */
-  chainSyncToleranceMs?: number
-  /** Safety stop: seconds the lagging sensor may stay silent (one motor driving alone) before both are cut. */
-  chainSyncMaxWaitS?: number
-  /** Which motor's chain carries the SHELF sensor ("a" default); the home sensor is on the other. */
-  chainSyncShelfSide?: "a" | "b"
-  /**
    * How `goto` finds a shelf: "sensor" counts shelf-flag edges (default, and
    * the only option on DC); "pulses" (servo) drives a calibrated distance from
    * the home datum and re-syncs on every index pass.
@@ -923,6 +948,11 @@ export interface StorageNode {
    */
   servoCarouselPulses?: number
   servoIndexWindowPulses?: number
+  /**
+   * Pulse positioning: re-zero the odometer every time the home flag passes
+   * during a move (default true). Off = only Home / Calibrate set zero.
+   */
+  servoHomeResync?: boolean
   /** Epoch ms of the calibration above. */
   servoCalibratedAt?: number
   /**
@@ -935,8 +965,6 @@ export interface StorageNode {
   calibration?: CalibrationEvent | null
   /** True from pressing Calibrate until the agent answers. Runtime only. */
   calibrating?: boolean
-  /** Last `balance` frame (motor balance auto-calibration progress/result). Runtime only. */
-  balance?: BalanceEvent | null
   storage: StorageConfig
   /** shelf -> slot -> spoolId | null */
   slots: (string | null)[][]
