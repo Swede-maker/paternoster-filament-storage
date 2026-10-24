@@ -413,7 +413,14 @@ export function NetworkPanel({ node }: { node: StorageNode }) {
                   aria-hidden="true"
                 />
                 <span className="min-w-0 flex-1">
-                  <span className="block truncate font-mono font-medium text-foreground">{s.hostname}.local</span>
+                  <span className="block truncate font-mono font-medium text-foreground">
+                    {s.hostname}.local
+                    {s.kind === "esp32" && (
+                      <span className="ml-2 rounded bg-muted px-1.5 py-0.5 font-sans text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
+                        ESP32
+                      </span>
+                    )}
+                  </span>
                   <span className="block truncate text-xs text-muted-foreground">
                     {s.online ? "Online" : "Last seen offline"}
                     {s.mode ? ` · ${NET_MODE_LABEL[s.mode]}` : ""}
@@ -422,8 +429,10 @@ export function NetworkPanel({ node }: { node: StorageNode }) {
                   </span>
                 </span>
                 {(() => {
-                  const linked = state.nodes.find(
-                    (n) => n.ip.toLowerCase() === `${s.hostname}.local`.toLowerCase() || (!!s.ip && n.ip === s.ip),
+                  const linked = state.nodes.find((n) =>
+                    s.kind === "esp32" && s.agentHost
+                      ? n.ip.toLowerCase() === s.agentHost.toLowerCase() && (!s.agentPort || n.port === s.agentPort)
+                      : n.ip.toLowerCase() === `${s.hostname}.local`.toLowerCase() || (!!s.ip && n.ip === s.ip),
                   )
                   return linked ? (
                     <span className="flex shrink-0 items-center gap-1 text-xs text-muted-foreground">

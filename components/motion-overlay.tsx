@@ -136,6 +136,10 @@ export function MotionOverlay() {
   const total = job.items.length
   const step = job.currentIndex + 1
   const isStore = job.mode === "store" || job.mode === "place"
+  const isRebalance = job.mode === "rebalance"
+  // On a rebalance pick, preview where this spool goes next (the paired put).
+  const rebalanceDest =
+    isRebalance && item?.rebalanceStep === "take" ? job.items[job.currentIndex + 1] ?? null : null
   // When the last "Doesn't fit" found nowhere to go, the item is left on the
   // slot it just rejected — so "current slot is in the rejected list" means
   // the system has run out of slots to offer.
@@ -233,7 +237,11 @@ export function MotionOverlay() {
         {/* progress */}
         <div className="mb-4 flex items-center justify-between text-xs text-muted-foreground">
           <span className="uppercase tracking-wider">
-            {isPart
+            {isRebalance
+              ? item?.rebalanceStep === "take"
+                ? "Rebalance · pick spool"
+                : "Rebalance · place spool"
+              : isPart
               ? job.mode === "pick"
                 ? "Retrieving hardware"
                 : "Placing hardware"
@@ -248,7 +256,7 @@ export function MotionOverlay() {
           </span>
           <div className="flex items-center gap-2">
             <span className="font-mono">
-              {step} / {total}
+              {isRebalance ? `Spool ${Math.floor(job.currentIndex / 2) + 1} / ${Math.ceil(total / 2)}` : `${step} / ${total}`}
             </span>
             {isPart && (
               <button
@@ -389,6 +397,20 @@ export function MotionOverlay() {
                   </>
                 )
               })()
+            ) : rebalanceDest ? (
+              <>
+                <p className="mb-4 text-sm text-muted-foreground text-pretty">
+                  Hold on to it — next the carousel rotates to{" "}
+                  <span className="font-mono font-semibold text-foreground">
+                    {node ? shelfLabel(node, rebalanceDest.shelf) : `Shelf ${rebalanceDest.shelf + 1}`} · Slot{" "}
+                    {rebalanceDest.slot + 1}
+                  </span>{" "}
+                  where you place it.
+                </p>
+                <Button size="lg" className="w-full" onClick={() => dispatch({ type: "CONFIRM_STOP" })}>
+                  <CheckCircle2 className="h-5 w-5" /> Picked — go to new slot
+                </Button>
+              </>
             ) : (
               <Button size="lg" className="w-full" onClick={() => dispatch({ type: "CONFIRM_STOP" })}>
                 <CheckCircle2 className="h-5 w-5" /> Confirm pick
@@ -535,6 +557,10 @@ export function MotionOverlay() {
                 ? "Confirm without scanning"
                 : isPart && partRemainder > 0
                 ? `Store ${partPlaced} here & continue`
+                : isRebalance
+                ? job.currentIndex + 1 < total
+                  ? "Placed — next spool"
+                  : "Placed — finish"
                 : "Confirm store"}
             </Button>
             {/* The offered slot may be physically too tight for this spool. Let

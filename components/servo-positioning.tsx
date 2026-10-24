@@ -42,6 +42,7 @@ export function ServoPositioning({ node }: { node: StorageNode }) {
   const calibrated = (node.servoCarouselPulses ?? 0) > 0
   const shelves = node.storage.shelves
   const mode: PositionMode = node.positionMode ?? "sensor"
+  const homeResync = node.servoHomeResync !== false
   const pulsesPerShelf = calibrated ? Math.round((node.servoCarouselPulses ?? 0) / shelves) : null
   const flagsMismatch =
     cal?.ok === true && typeof cal.shelfFlagsSeen === "number" && cal.shelfFlagsSeen !== (cal.shelves ?? shelves)
@@ -89,7 +90,7 @@ export function ServoPositioning({ node }: { node: StorageNode }) {
           {(
             [
               { value: "sensor", label: "Shelf sensor", icon: ScanLine },
-              { value: "pulses", label: "Servo pulses", icon: Ruler },
+              { value: "pulses", label: "Pulses", icon: Ruler },
               { value: "index", label: "Home only", icon: Home },
             ] as const
           ).map((opt) => {
@@ -122,9 +123,48 @@ export function ServoPositioning({ node }: { node: StorageNode }) {
         {mode === "sensor"
           ? "Each shelf is counted as its flag reaches the proximity sensor. Edges that arrive less than half a shelf after the previous one — a bouncing chain, or the shelf you were parked beside being dragged back in — are ignored."
           : mode === "index"
-            ? `No shelf sensor needed: only the home sensor is wired. Calibrate once to measure a full turn; shelves are then spaced evenly${pulsesPerShelf ? ` (${nf.format(pulsesPerShelf)} pulses each)` : ""} from home, and the position is corrected every time the home flag passes. Moving to a shelf is blocked until calibrated; jogging and Home always work.`
-            : `Each shelf is ${pulsesPerShelf ? nf.format(pulsesPerShelf) : "…"} pulses from the next. The carousel drives that distance from the home datum and corrects its odometer every time the home flag passes the index sensor, without stopping. The shelf sensor is only reported, never used to stop.`}
+            ? `No shelf sensor needed: only the home sensor is wired. Calibrate once to measure a full turn and the home flag; position 0 is the middle of the flag and shelves are spaced evenly${pulsesPerShelf ? ` (${nf.format(pulsesPerShelf)} pulses each)` : ""} from there. Moving to a shelf is blocked until calibrated; jogging and Home always work.`
+            : `Each shelf is ${pulsesPerShelf ? nf.format(pulsesPerShelf) : "…"} pulses from the next, counted from the middle of the home flag. The shelf sensor is only reported, never used to stop.`}
       </p>
+
+      {mode !== "sensor" && (
+        <div className="mt-3 flex items-center justify-between gap-3 rounded-md border border-border bg-background px-3 py-2">
+          <div className="min-w-0">
+            <p id={`resync-${node.id}`} className="text-sm font-medium text-foreground">
+              Re-zero on every home pass
+            </p>
+            <p className="text-xs leading-relaxed text-muted-foreground text-pretty">
+              {homeResync
+                ? "Each time the home flag passes during a move, any drift is corrected without stopping."
+                : "Off: only Home and Calibrate set position 0. Drift is not corrected while moving."}
+            </p>
+          </div>
+          <button
+            type="button"
+            role="switch"
+            aria-checked={homeResync}
+            aria-labelledby={`resync-${node.id}`}
+            onClick={() =>
+              dispatch({ type: "UPDATE_NODE", id: node.id, changes: { servoHomeResync: !homeResync } })
+            }
+            className="flex min-h-11 min-w-11 shrink-0 items-center justify-center"
+          >
+            <span
+              className={cn(
+                "flex h-6 w-11 items-center rounded-full p-0.5 transition-colors",
+                homeResync ? "bg-primary" : "bg-muted",
+              )}
+            >
+              <span
+                className={cn(
+                  "size-5 rounded-full bg-background shadow-sm transition-transform",
+                  homeResync ? "translate-x-5" : "translate-x-0",
+                )}
+              />
+            </span>
+          </button>
+        </div>
+      )}
 
       <div className="mt-3 flex flex-wrap items-start justify-between gap-3">
         <div className="min-w-0 flex-1">
@@ -139,7 +179,7 @@ export function ServoPositioning({ node }: { node: StorageNode }) {
                 <dd className="text-foreground">{pulsesPerShelf !== null ? nf.format(pulsesPerShelf) : "—"} pulses</dd>
               </div>
               <div>
-                <dt className="text-muted-foreground">Index window</dt>
+                <dt className="text-muted-foreground">Home flag</dt>
                 <dd className="text-foreground">
                   {node.servoIndexWindowPulses ? `${nf.format(node.servoIndexWindowPulses)} pulses` : "—"}
                 </dd>
@@ -195,7 +235,9 @@ export function ServoPositioning({ node }: { node: StorageNode }) {
 
       {calibrating && (
         <p className="mt-2 text-xs text-muted-foreground">
-          One full turn at homing speed: homes on the index flag, measures the way round, and stops at home again.
+          One full turn at homing speed, crawling over the home flag at 1/3 speed to measure its length, then
+              backing up to the middle of the flag as position 0. Homing reuses the measured flag at full homing
+              speed; if it was never measured, the first Home measures it the same slow way.
           {!hardware && " (Simulated: the result is derived from the pulses-per-revolution and gear ratio above.)"}
         </p>
       )}
@@ -212,7 +254,7 @@ export function ServoPositioning({ node }: { node: StorageNode }) {
       )}
       {hardware && online && !agentIsServo && (
         <p className="mt-1 text-xs text-warning">
-          The agent has not confirmed the servo drive yet; calibration is a servo-only feature.
+          The agent has not confirmed a pulse drive yet; calibration needs a servo or closed-loop stepper.
         </p>
       )}
       {hardware && !online && <p className="mt-1 text-xs text-muted-foreground">Unit offline.</p>}

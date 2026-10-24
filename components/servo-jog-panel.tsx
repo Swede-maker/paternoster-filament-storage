@@ -29,15 +29,16 @@ const SERVO_PRESETS = [10, 40, 100, 400, 1000]
 const DC_PRESETS = [50, 100, 150, 300, 600, 1000]
 
 /**
- * Per-motor alignment tools for the two chain motors (A on one side, B on the
- * other): nudge motor A, motor B or both, with an adjustable step size.
+ * Jog controls with an adjustable step size.
  *
- * The unit follows the drive. The iSV57T servos take an exact pulse count,
- * so a tap is "N pulses". A DC bridge has no step unit, so a tap is "run for
- * N milliseconds" at the unit's move duty. Both solve the same problem: the
- * shelves hang a few millimetres off level after assembly or a slipped
- * coupling, and nudging ONE motor fixes it without touching the other. The
- * servo drives' ALM lamps are shown only in servo mode.
+ * Servo pair: per-motor alignment for the two chain servos (A on one side, B
+ * on the other) — nudge motor A, motor B or both. A tap is an exact pulse
+ * count, so nudging ONE motor levels a shelf that hangs crooked. The drives'
+ * ALM lamps are shown here too.
+ *
+ * DC: a carousel has ONE motor, so there is a single chip and a tap is "run
+ * the motor for N milliseconds" at the unit's move duty — enough to creep the
+ * carousel to a shelf or free a snag.
  */
 export function ServoJogPanel({ node }: { node: StorageNode }) {
   const { state, dispatch } = useStore()
@@ -151,15 +152,20 @@ export function ServoJogPanel({ node }: { node: StorageNode }) {
     })
   }
 
-  // One-servo hardware carousel: a single chip. It sends "both" so the agent
-  // counts the jog as carousel movement; with one servo it only pulses A.
-  const MOTORS: { id: ServoMotorId; label: string; alarm?: boolean }[] = single
-    ? [{ id: "both", label: "Servo", alarm: alarmA }]
-    : [
-        { id: "a", label: "Motor A", alarm: alarmA },
-        { id: "b", label: "Motor B", alarm: alarmB },
-        { id: "both", label: "Both" },
-      ]
+  // One chip when the carousel has one motor: a DC carousel always, and a
+  // one-servo hardware carousel. The servo case sends "both" so the agent
+  // counts the jog as carousel movement (with one servo it only pulses A);
+  // the DC agent ignores the motor field and drives its one bridge.
+  const oneMotor = single || !servo
+  const MOTORS: { id: ServoMotorId; label: string; alarm?: boolean }[] = !servo
+    ? [{ id: "a", label: "Motor" }]
+    : single
+      ? [{ id: "both", label: "Servo", alarm: alarmA }]
+      : [
+          { id: "a", label: "Motor A", alarm: alarmA },
+          { id: "b", label: "Motor B", alarm: alarmB },
+          { id: "both", label: "Both" },
+        ]
   const selectedLabel = MOTORS.find((m) => m.id === selected)?.label
 
   const MotorChip = ({ id, label, alarm }: { id: ServoMotorId; label: string; alarm?: boolean }) => {
@@ -197,7 +203,7 @@ export function ServoJogPanel({ node }: { node: StorageNode }) {
           </span>
         ) : (
           <span className={cn("text-[10px]", active ? "text-primary-foreground/80" : "text-muted-foreground")}>
-            {id === "a" ? "left side" : "right side"}
+            whole carousel
           </span>
         )}
       </button>
@@ -360,11 +366,11 @@ export function ServoJogPanel({ node }: { node: StorageNode }) {
           ? "One tap sends exactly this many pulses to the servo and creeps the whole carousel."
           : servo
           ? "One tap sends exactly this many pulses. Jog a single motor to level a shelf that hangs crooked; jog both to creep the whole carousel."
-          : "One tap runs the motor for this long at the Motor speed PWM. Jog a single motor to level a shelf that hangs crooked; jog both to creep the whole carousel."}
+          : "One tap runs the motor for this long at the Motor speed PWM and creeps the whole carousel — handy to reach a shelf by hand or free a snag before homing."}
       </p>
 
       <div
-        className={cn("mt-3 grid gap-1.5", single ? "grid-cols-1" : "grid-cols-3")}
+        className={cn("mt-3 grid gap-1.5", oneMotor ? "grid-cols-1" : "grid-cols-3")}
         role="radiogroup"
         aria-label="Motor to jog"
       >

@@ -32,9 +32,10 @@ import { useTheme } from "@/lib/use-theme"
 import { cn } from "@/lib/utils"
 import { nodeSlotCount, nodesForSystem, getHardwareStats, masterNode } from "@/lib/selectors"
 import { NetworkPanel } from "../network/network-panel"
+import { StartAreaToggle } from "../start-area-toggle"
 import { newId } from "@/lib/filament"
 import { HARDWARE_COLORS } from "@/lib/hardware"
-import type { MotorMode, StorageNode } from "@/lib/types"
+import type { MotorMode, PulseDrive, StorageNode } from "@/lib/types"
 import { Button } from "../ui/button"
 import { Field, Input, Checkbox } from "../ui/field"
 import { NumberInput } from "../ui/number-input"
@@ -80,6 +81,7 @@ export function HardwareSettingsView() {
       {/* Appearance — per-device theme (same control as filament Settings). */}
       <Section icon={<Sun className="h-5 w-5 text-primary" />} title="Appearance">
         <ThemeToggle />
+        <StartAreaToggle />
       </Section>
 
       {/* Storage units */}
@@ -381,7 +383,7 @@ function NodeList() {
                       alert("Empty the Right carousel and finish any running queue on these carousels first.")
                       return
                     }
-                    if (confirm("Merge back into one carousel driven by both motors? The Right carousel is removed.")) {
+                    if (confirm("Merge back into one carousel on motor A? The Right carousel is removed.")) {
                       dispatch({ type: "UNTWIN", id: node.id })
                     }
                   }}
@@ -686,6 +688,7 @@ function AddNodeRow() {
   // "Real Pi" here means a physical slave linked by pairing code (no IP typed).
   const [hardware, setHardware] = useState(false)
   const [motorMode, setMotorMode] = useState<MotorMode>("dc")
+  const [pulseDrive, setPulseDrive] = useState<PulseDrive>("integrated-servo")
 
   const isShelf = draft.nodeType === "shelf"
   const isManual = draft.nodeType === "shelf" || draft.nodeType === "library"
@@ -694,6 +697,7 @@ function AddNodeRow() {
     setDraft(makeDraft("paternoster"))
     setHardware(false)
     setMotorMode("dc")
+    setPulseDrive("integrated-servo")
   }
 
   const canAdd = draft.name.trim().length > 0
@@ -713,7 +717,13 @@ function AddNodeRow() {
       {!isManual && (
         <div>
           <p className="mb-1.5 text-sm font-medium text-muted-foreground">Motor drive</p>
-          <MotorDrivePicker value={motorMode} onChange={setMotorMode} compact />
+          <MotorDrivePicker
+            value={motorMode}
+            onChange={setMotorMode}
+            pulseDrive={pulseDrive}
+            onPulseDriveChange={setPulseDrive}
+            compact
+          />
         </div>
       )}
 
@@ -781,6 +791,7 @@ function AddNodeRow() {
               driver: "simulated",
               pair: !isManual && hardware,
               motorMode: !isManual ? motorMode : undefined,
+              pulseDrive: !isManual && motorMode === "servo" ? pulseDrive : undefined,
             })
             reset()
           }}

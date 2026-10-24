@@ -4,7 +4,7 @@ import { useState } from "react"
 import { Boxes, Check, Scale, Layers, Wrench, Cog } from "lucide-react"
 import { useStore } from "@/lib/store"
 import { cn } from "@/lib/utils"
-import type { MotorMode, SystemKind } from "@/lib/types"
+import type { MotorMode, PulseDrive, SystemKind } from "@/lib/types"
 import { Button } from "./ui/button"
 import { draftToConfig, makeDraft, StorageLayoutEditor } from "./storage-layout-editor"
 import { MotorDrivePicker } from "./motor-drive-picker"
@@ -21,6 +21,8 @@ export function SetupWizard() {
   // How the carousel motor is driven on the Pi. Saved on the node so the agent
   // initialises the matching control logic (DC bridge vs. servo PUL/DIR).
   const [motorMode, setMotorMode] = useState<MotorMode>("dc")
+  // Which PUL/DIR drive is wired when motorMode is "servo".
+  const [pulseDrive, setPulseDrive] = useState<PulseDrive>("integrated-servo")
 
   const isShelf = draft.nodeType === "shelf"
   const isLibrary = draft.nodeType === "library"
@@ -41,6 +43,7 @@ export function SetupWizard() {
       storage,
       shelfMeta,
       motorMode: isManual ? undefined : motorMode,
+      pulseDrive: !isManual && motorMode === "servo" ? pulseDrive : undefined,
       settings: {
         systemName: draft.name.trim() || "PAX System",
         showUsageCardOnHome,
@@ -118,10 +121,19 @@ export function SetupWizard() {
                 <p className="text-xs text-muted-foreground">What turns the carousel? The Pi agent loads the matching control logic.</p>
               </div>
             </div>
-            <MotorDrivePicker value={motorMode} onChange={setMotorMode} />
+            <MotorDrivePicker
+              value={motorMode}
+              onChange={setMotorMode}
+              pulseDrive={pulseDrive}
+              onPulseDriveChange={setPulseDrive}
+            />
             <p className="mt-2 text-xs leading-relaxed text-muted-foreground text-pretty">
               {motorMode === "servo"
-                ? "Servo mode adds per-motor micro-jog for chain alignment and shows the drives' alarm lamps. Wiring for two iSV57T servos is in the README."
+                ? pulseDrive === "closed-loop-stepper"
+                  ? "Closed-loop steppers are run from the ESP32 controller, which pulses both drives in hardware and frees the coils (MF) when the carousel has been idle. Wiring for two CL86Y drives is in pi-agent/esp32-servo/README.md."
+                  : pulseDrive === "ac-servo"
+                    ? "AC servos are run from the ESP32 controller, which pulses both drives in hardware and toggles S-ON for release. Wiring for two A6-RS drives is in pi-agent/esp32-servo/README.md."
+                    : "PUL/DIR mode adds per-motor micro-jog for chain alignment and shows the drives' alarm lamps. Wiring for two iSV57T servos is in the README."
                 : "DC mode keeps the standard run/stop control with PWM speed, soft start and approach tuning."}
             </p>
           </div>

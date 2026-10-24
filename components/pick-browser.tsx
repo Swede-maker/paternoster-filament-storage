@@ -1,7 +1,8 @@
 "use client"
 
 import { useMemo, useState } from "react"
-import { Search, X, PackagePlus, Printer } from "lucide-react"
+import { Search, X, PackagePlus, Printer, ListChecks } from "lucide-react"
+import { Button } from "./ui/button"
 import { useStore } from "@/lib/store"
 import { cn } from "@/lib/utils"
 import { Dialog, DialogHeader, DialogBody } from "./ui/dialog"
@@ -30,6 +31,7 @@ export function PickBrowser({
   onInspect,
   onInspectLoaded,
   onNew,
+  onInspectMany,
   excludeIds = [],
   title = "Pick filament from storage",
   readOnly = false,
@@ -47,12 +49,31 @@ export function PickBrowser({
   /** When provided, shows a "Create new spool" option that loads a fresh spool
    *  straight onto the printer (no storage step). */
   onNew?: () => void
+  /** When provided (search mode), stored spools get a checkbox; acting on two or
+   *  more marked spools calls this with all of them. */
+  onInspectMany?: (entries: { spool: Spool; loc: BrowserLocation }[]) => void
   excludeIds?: string[]
   title?: string
   readOnly?: boolean
 }) {
   const { state } = useStore()
   const [q, setQ] = useState("")
+  const [selected, setSelected] = useState<Set<string>>(() => new Set())
+  const selectable = Boolean(onInspectMany) && !onPick
+
+  function close() {
+    setSelected(new Set())
+    onClose()
+  }
+
+  function toggle(id: string) {
+    setSelected((prev) => {
+      const next = new Set(prev)
+      if (next.has(id)) next.delete(id)
+      else next.add(id)
+      return next
+    })
+  }
 
   const entries = useMemo(() => {
     const all = storedSpools(state).filter((e) => !excludeIds.includes(e.spool.id))
@@ -68,14 +89,34 @@ export function PickBrowser({
 
   const nothingFound = entries.length === 0 && onPrinter.length === 0
 
+  // Resolve marks against ALL stored spools (not just the filtered view) so a
+  // spool stays marked while the user searches for the next one.
+  const selectedEntries = useMemo(() => {
+    if (selected.size === 0) return []
+    return storedSpools(state)
+      .filter((e) => selected.has(e.spool.id))
+      .map((e) => ({ spool: e.spool, loc: { nodeId: e.nodeId, shelf: e.loc.shelf, slot: e.loc.slot } }))
+  }, [state, selected])
+  const selectedCount = selectedEntries.length
+  const allVisibleSelected = entries.length > 0 && entries.every((e) => selected.has(e.spool.id))
+
+  function actOnSelected() {
+    const list = selectedEntries
+    setSelected(new Set())
+    if (list.length === 1) onInspect?.(list[0].spool, list[0].loc)
+    else if (list.length > 1) onInspectMany?.(list)
+  }
+
   return (
-    <Dialog open={open} onClose={onClose} className="max-w-2xl">
+    <Dialog open={open} onClose={close} className="max-w-2xl">
       <DialogHeader
         icon={<Search className="h-5 w-5" />}
         title={title}
         description={
           onInspect && !onPick
-            ? "Tap a stored spool to load it onto a printer or take it out. Tap a spool on a printer to move it into storage."
+            ? selectable
+              ? "Tap a stored spool to act on it, or tick several to act on them together. Tap a spool on a printer to move it into storage."
+              : "Tap a stored spool to load it onto a printer or take it out. Tap a spool on a printer to move it into storage."
             : readOnly
               ? "Browse all filament in storage and on your printers."
               : onNew
@@ -135,26 +176,66 @@ export function PickBrowser({
           <div className="max-h-[50vh] space-y-4 overflow-y-auto scrollbar-thin">
             {entries.length > 0 && (
               <section aria-label="In storage">
-                {onPrinter.length > 0 && (
-                  <h3 className="mb-2 text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
-                    In storage
-                  </h3>
+                {(onPrinter.length > 0 || selectable) && (
+                  <div className="mb-2 flex items-center justify-between gap-2">
+                    <h3 className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
+                      In storage
+                    </h3>
+                    {selectable && (
+                      <button
+                        type="button"
+                        onClick={() =>
+                          setSelected((prev) => {
+                            const next = new Set(prev)
+                            for (const e of entries) {
+                              if (allVisibleSelected) next.delete(e.spool.id)
+                              else next.add(e.spool.id)
+                            }
+                            return next
+                          })
+                        }
+                        className="rounded-md px-2 py-1 text-xs font-medium text-primary hover:bg-primary/10"
+                      >
+                        {allVisibleSelected ? "Unmark all" : q ? "Mark all results" : "Mark all"}
+                      </button>
+                    )}
+                  </div>
                 )}
                 <ul className="grid grid-cols-2 gap-2 sm:grid-cols-3">
-            {entries.map(({ spool, loc, nodeId, nodeName, shelfName }) => (
-              <li key={spool.id}>
+            {entries.map(({ spool, loc, nodeId, nodeName, shelfName }) => {
+              const isMarked = selected.has(spool.id)
+              const label = `${spool.material} ${spool.colorName}, ${shelfName} slot ${loc.slot + 1}`
+              return (
+              <li key={spool.id} className="relative">
+                {selectable && (
+                  <input
+                    type="checkbox"
+                    checked={isMarked}
+                    onChange={() => toggle(spool.id)}
+                    aria-label={`Mark ${label}`}
+                    className="absolute left-2.5 top-2.5 z-10 h-6 w-6 cursor-pointer rounded-md border-2 border-primary bg-background accent-primary"
+                  />
+                )}
                 <button
                   type="button"
                   disabled={!onPick && !onInspect}
+                  aria-pressed={selectable && selected.size > 0 ? isMarked : undefined}
                   onClick={() => {
+                    // Once anything is marked, tapping a card adds/removes it
+                    // instead of opening it, so building a selection is quick.
+                    if (selectable && selected.size > 0) {
+                      toggle(spool.id)
+                      return
+                    }
                     const nodeLoc = { nodeId, shelf: loc.shelf, slot: loc.slot }
                     if (onPick) onPick(spool, nodeLoc)
                     else onInspect?.(spool, nodeLoc)
                   }}
-                  className={
-                    "flex w-full flex-col items-center gap-2 rounded-xl border border-border bg-background/50 p-3 text-center transition-colors " +
-                    (!onPick && !onInspect ? "cursor-default" : "hover:border-primary/60 hover:bg-primary/5")
-                  }
+                  className={cn(
+                    "flex w-full flex-col items-center gap-2 rounded-xl border bg-background/50 p-3 text-center transition-colors",
+                    isMarked ? "border-primary bg-primary/10" : "border-border",
+                    !onPick && !onInspect ? "cursor-default" : "hover:border-primary/60 hover:bg-primary/5",
+                  )}
                 >
                   <SpoolDisc color={spool.color} color2={discColor2(spool)} size={56} fill={spoolFill(spool)} boxed={!!spool.containerId} />
                   <span
@@ -173,10 +254,11 @@ export function PickBrowser({
                   </span>
                 </button>
                 {!onPick && (
-                  <GoToShelfButton nodeId={nodeId} shelf={loc.shelf} onDone={onClose} className="mt-1.5 w-full" />
+                  <GoToShelfButton nodeId={nodeId} shelf={loc.shelf} onDone={close} className="mt-1.5 w-full" />
                 )}
               </li>
-            ))}
+              )
+            })}
                 </ul>
               </section>
             )}
@@ -237,6 +319,29 @@ export function PickBrowser({
                 </ul>
               </section>
             )}
+          </div>
+        )}
+
+        {selectable && selectedCount > 0 && (
+          <div
+            role="region"
+            aria-label="Marked spools"
+            className="flex items-center gap-2 rounded-xl border border-primary/50 bg-primary/10 p-2 pl-3"
+          >
+            <ListChecks className="h-5 w-5 shrink-0 text-primary" aria-hidden />
+            <span className="min-w-0 flex-1 text-sm font-medium">
+              {selectedCount} {selectedCount === 1 ? "spool" : "spools"} marked
+            </span>
+            <button
+              type="button"
+              onClick={() => setSelected(new Set())}
+              className="rounded-md px-2 py-1.5 text-sm text-muted-foreground hover:text-foreground"
+            >
+              Clear
+            </button>
+            <Button size="sm" onClick={actOnSelected}>
+              {selectedCount === 1 ? "Open" : `Act on ${selectedCount}`}
+            </Button>
           </div>
         )}
       </DialogBody>

@@ -29,17 +29,22 @@ import {
   Package as PackageIcon,
   Wifi,
   DownloadCloud,
+  Scale,
+  Video,
 } from "lucide-react"
+import { balanceWarningSetting } from "@/lib/rebalance"
+import { cameraSetting, DEFAULT_CAMERA_PORT, type CameraSetting } from "@/lib/camera"
 import { useStore } from "@/lib/store"
 import { useTheme } from "@/lib/use-theme"
 import { cn } from "@/lib/utils"
 import { getStats, masterNode, nodeSlotCount, nodesForSystem, shelfLabel } from "@/lib/selectors"
 import { NetworkPanel } from "./network/network-panel"
 import { UpdateSection } from "./update-section"
-import { newId, formatGrams } from "@/lib/filament"
+import { StartAreaToggle } from "./start-area-toggle"
+import { newId, formatGrams, pulseDriveFor } from "@/lib/filament"
 import { newQrTagId, qrPayload, allBindings, describeTarget } from "@/lib/tags"
 import { QrPrintButton } from "./qr-print-button"
-import type { Container, MotorMode, StorageNode, TagBinding } from "@/lib/types"
+import type { Container, MotorMode, PulseDrive, StorageNode, TagBinding } from "@/lib/types"
 import { Button } from "./ui/button"
 import { MotorDrivePicker, motorModeLabel } from "./motor-drive-picker"
 import { MotorDriveEditor } from "./motor-drive-editor"
@@ -86,9 +91,16 @@ export function SettingsView() {
         />
       </Section>
 
+      {/* Carousel balance */}
+      <BalanceWarningSection />
+
+      {/* Webcam */}
+      <CameraSection />
+
       {/* Appearance */}
       <Section icon={<Sun className="h-5 w-5 text-primary" />} title="Appearance">
         <ThemeToggle />
+        <StartAreaToggle />
       </Section>
 
       {/* General */}
@@ -384,7 +396,7 @@ function NodeList() {
                         {node.driver === "hardware" ? "hardware" : "simulated"}
                       </span>
                       <span className="rounded-md bg-muted px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
-                        {motorModeLabel(node.motorMode)}
+                        {motorModeLabel(node.motorMode, pulseDriveFor(node))}
                       </span>
                       <LinkChip node={node} />
                     </>
@@ -584,6 +596,7 @@ function AddNodeRow() {
   const [draft, setDraft] = useState<StorageDraft>(() => makeDraft("paternoster"))
   const [hardware, setHardware] = useState(false)
   const [motorMode, setMotorMode] = useState<MotorMode>("dc")
+  const [pulseDrive, setPulseDrive] = useState<PulseDrive>("integrated-servo")
   const [ip, setIp] = useState("")
   const [port, setPort] = useState(8765)
   const clamp = (v: number, min: number, max: number) => Math.max(min, Math.min(max, v))
@@ -596,6 +609,7 @@ function AddNodeRow() {
     setDraft(makeDraft("paternoster"))
     setHardware(false)
     setMotorMode("dc")
+    setPulseDrive("integrated-servo")
     setIp("")
     setPort(8765)
   }
@@ -622,7 +636,13 @@ function AddNodeRow() {
         <>
           <div>
             <p className="mb-1.5 text-sm font-medium text-muted-foreground">Motor drive</p>
-            <MotorDrivePicker value={motorMode} onChange={setMotorMode} compact />
+            <MotorDrivePicker
+              value={motorMode}
+              onChange={setMotorMode}
+              pulseDrive={pulseDrive}
+              onPulseDriveChange={setPulseDrive}
+              compact
+            />
           </div>
 
           <div>
@@ -693,6 +713,7 @@ function AddNodeRow() {
               driver: !isManual && hardware ? "hardware" : "simulated",
               port: !isManual && hardware ? port : undefined,
               motorMode: !isManual ? motorMode : undefined,
+              pulseDrive: !isManual && motorMode === "servo" ? pulseDrive : undefined,
             })
             reset()
           }}
@@ -1127,6 +1148,120 @@ function TagRow({ binding, onErase }: { binding: TagBinding; onErase: () => void
         <Link2Off className="h-4 w-4" />
       </button>
     </li>
+  )
+}
+
+function CameraSection() {
+  const { state, dispatch } = useStore()
+  const camera = cameraSetting(state)
+  const [port, setPort] = useState<number | null>(camera.port)
+  const [host, setHost] = useState(camera.host ?? "")
+  const save = (changes: Partial<CameraSetting>) =>
+    dispatch({ type: "UPDATE_SETTINGS", settings: { camera: { ...camera, ...changes } } })
+  const dirty =
+    (port != null && port > 0 && port <= 65535 && port !== camera.port) || host.trim() !== (camera.host ?? "")
+
+  return (
+    <Section icon={<Video className="h-5 w-5 text-primary" />} title="Webcam">
+      <Checkbox
+        checked={camera.enabled}
+        onChange={(v) => save({ enabled: v })}
+        label="Use a webcam on the Pi"
+        description="Adds a Camera button to the bottom-left corner of Home. Tap it to watch the carousel live; tap X to turn the camera off again."
+      />
+      {camera.enabled && (
+        <>
+          <Checkbox
+            checked={camera.popupOnMove}
+            onChange={(v) => save({ popupOnMove: v })}
+            label="Pop up while the carousel moves"
+            description="The live view opens by itself when a carousel starts moving and closes a few seconds after it stops."
+          />
+          <div className="grid gap-3 sm:grid-cols-[1fr_8rem]">
+            <Field label="Camera address (optional)">
+              <Input
+                value={host}
+                onChange={(e) => setHost(e.target.value)}
+                placeholder="Same as the carousel's Pi"
+                aria-label="Camera address"
+              />
+            </Field>
+            <Field label="Port">
+              <NumField
+                value={port ?? undefined}
+                min={1}
+                max={65535}
+                ariaLabel="Camera port"
+                onValue={setPort}
+              />
+            </Field>
+          </div>
+          <Button
+            disabled={!dirty}
+            onClick={() =>
+              save({
+                port: port != null && port > 0 ? port : DEFAULT_CAMERA_PORT,
+                host: host.trim() || undefined,
+              })
+            }
+          >
+            <Save className="h-4 w-4" /> Save
+          </Button>
+          <div className="rounded-xl border border-border bg-background p-3 text-xs leading-relaxed text-muted-foreground">
+            <p className="font-medium text-foreground">Setting up the Pi</p>
+            <p className="mt-1 text-pretty">
+              Plug a USB webcam into the Pi, then run once on the Pi:
+            </p>
+            <code className="mt-1.5 block overflow-x-auto whitespace-nowrap rounded-lg bg-secondary px-2 py-1.5 font-mono text-foreground">
+              sudo ./pi-agent/camera/install-camera.sh
+            </code>
+            <p className="mt-1.5 text-pretty">
+              The camera only runs while someone is watching. Nothing is recorded.
+            </p>
+          </div>
+        </>
+      )}
+    </Section>
+  )
+}
+
+function BalanceWarningSection() {
+  const { state, dispatch } = useStore()
+  const balance = balanceWarningSetting(state)
+  const [threshold, setThreshold] = useState<number | null>(balance.thresholdGrams)
+  const dirty = threshold != null && threshold > 0 && threshold !== balance.thresholdGrams
+  const save = (changes: Partial<{ enabled: boolean; thresholdGrams: number }>) =>
+    dispatch({ type: "UPDATE_SETTINGS", settings: { balanceWarning: { ...balance, ...changes } } })
+
+  return (
+    <Section icon={<Scale className="h-5 w-5 text-primary" />} title="Carousel balance">
+      <Checkbox
+        checked={balance.enabled}
+        onChange={(v) => save({ enabled: v })}
+        label="Warn when a shelf is out of balance"
+        description="Shelves heavier or lighter than the average shelf by more than the limit turn red in the Shelf Overview, and a Rebalance button plans spool moves to even the load."
+      />
+      {balance.enabled && (
+        <Field label="Allowed difference per shelf (g)">
+          <div className="flex gap-2">
+            <NumField
+              value={threshold ?? undefined}
+              min={1}
+              max={20000}
+              ariaLabel="Allowed weight difference per shelf in grams"
+              onValue={setThreshold}
+            />
+            <Button disabled={!dirty} onClick={() => threshold != null && save({ thresholdGrams: threshold })}>
+              <Save className="h-4 w-4" /> Save
+            </Button>
+          </div>
+          <p className="mt-1.5 text-xs text-muted-foreground text-pretty">
+            Compared with the average shelf weight of the carousel. Example: 500 g flags a shelf more than half a
+            spool heavier or lighter than the rest.
+          </p>
+        </Field>
+      )}
+    </Section>
   )
 }
 

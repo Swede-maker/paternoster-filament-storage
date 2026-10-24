@@ -19,11 +19,13 @@ import { PickBrowser } from "./pick-browser"
 import { PlaceDialog } from "./place-dialog"
 import { LibraryAddDialog } from "./library-add-dialog"
 import { SlotActionDialog } from "./slot-action-dialog"
+import { BulkActionDialog, type BulkEntry } from "./bulk-action-dialog"
 import { UnloadDialog } from "./unload-dialog"
 import { NewSpoolDialog } from "./new-spool-dialog"
 import { SlotPickerDialog } from "./slot-picker-dialog"
 import { PrinterPickerDialog } from "./printer-picker-dialog"
 import { QueuePlaceDialog } from "./queue-place-dialog"
+import { CameraPip } from "./camera-pip"
 import { activeNode, nodesForSystem, printerSlotLabel, shelfLabel } from "@/lib/selectors"
 import { newId } from "@/lib/filament"
 import type { SpoolDraft } from "./spool-form"
@@ -61,6 +63,8 @@ export function HomeView() {
   // loading a tapped stored spool onto a printer.
   const [printerPickTarget, setPrinterPickTarget] = useState<{ spool: Spool; loc: NodeLocation } | null>(null)
   const [searchLoad, setSearchLoad] = useState<{ spool: Spool; loc: NodeLocation; printer: Printer } | null>(null)
+  // Several spools marked in search → one action sheet that applies to all.
+  const [bulkEntries, setBulkEntries] = useState<BulkEntry[] | null>(null)
 
   // Consume an "act on this spool" request handed off from the All Filament In
   // Storage tab: focus that spool's unit and open the FULL slot action hub
@@ -280,6 +284,10 @@ export function HomeView() {
 
   return (
     <div className="flex flex-col gap-3 p-3 lg:min-h-0 lg:flex-1 lg:flex-row">
+      <CameraPip
+        node={currentNode}
+        nodes={filamentNodes.filter((n) => (n.type ?? "paternoster") === "paternoster")}
+      />
       {/* Left sidebar. Manual shelf storage has no carousel to navigate and shows
           every shelf full-width in the main column, so the sidebar (overview +
           controls + summary) is paternoster-only — dropping it lets the shelf
@@ -438,6 +446,14 @@ export function HomeView() {
         onPick={pickTarget ? handlePicked : undefined}
         onInspect={pickTarget ? undefined : handleInspect}
         onInspectLoaded={pickTarget ? undefined : handleInspectLoaded}
+        onInspectMany={
+          pickTarget
+            ? undefined
+            : (list) => {
+                setBrowserOpen(false)
+                setBulkEntries(list)
+              }
+        }
         onNew={pickTarget ? handleChooseNew : undefined}
         excludeIds={flow.outItems.map((i) => i.spool.id)}
         title={pickTarget ? "Choose filament to load" : "Search filament"}
@@ -552,6 +568,21 @@ export function HomeView() {
           flow.startMove(spool, loc, destNodeId)
         }}
         onClose={() => setSlotTarget(null)}
+      />
+
+      <BulkActionDialog
+        entries={bulkEntries}
+        onTakeOut={(list) => {
+          setBulkEntries(null)
+          for (const e of list) flow.startRetrieve(e.spool, e.loc)
+        }}
+        onMove={(list, destNodeId) => {
+          setBulkEntries(null)
+          for (const e of list) {
+            if (e.loc.nodeId !== destNodeId) flow.startMove(e.spool, e.loc, destNodeId)
+          }
+        }}
+        onClose={() => setBulkEntries(null)}
       />
 
       <UnloadDialog

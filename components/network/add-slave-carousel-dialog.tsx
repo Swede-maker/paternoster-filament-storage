@@ -38,13 +38,17 @@ export function AddSlaveCarouselDialog({
   onClose: () => void
 }) {
   const { dispatch } = useStore()
-  const host = `${slave.hostname}.local`
+  // A Wi-Fi ESP32 board is driven by an agent instance on another Pi; the
+  // app must connect to that agent, not to the board itself.
+  const isEsp32 = slave.kind === "esp32"
+  const host = isEsp32 && slave.agentHost ? slave.agentHost : `${slave.hostname}.local`
+  const port = isEsp32 && slave.agentPort ? slave.agentPort : AGENT_PORT
 
   const [system, setSystem] = useState<System>("filament")
   const [name, setName] = useState(() => defaultName(slave.hostname))
   const [shelves, setShelves] = useState("9")
   const [slots, setSlots] = useState("8")
-  const [motorMode, setMotorMode] = useState<MotorMode>("dc")
+  const [motorMode, setMotorMode] = useState<MotorMode>(isEsp32 ? "servo" : "dc")
   const [added, setAdded] = useState<System | null>(null)
 
   const shelvesNum = Number.parseInt(shelves, 10)
@@ -81,7 +85,7 @@ export function AddSlaveCarouselDialog({
       storage,
       ip: host,
       driver: "hardware",
-      port: AGENT_PORT,
+      port,
       motorMode,
     })
     setAdded(system)
@@ -95,7 +99,11 @@ export function AddSlaveCarouselDialog({
             <Check className="mt-0.5 h-5 w-5 shrink-0 text-primary" aria-hidden="true" />
             <p className="leading-relaxed text-pretty">
               <span className="font-medium">{name.trim()}</span> is linked to{" "}
-              <span className="font-mono">{host}</span> and will connect on its own within a few seconds.
+              <span className="font-mono">
+                {host}
+                {port !== AGENT_PORT ? `:${port}` : ""}
+              </span>{" "}
+              and will connect on its own within a few seconds.
             </p>
           </div>
           <p className="leading-relaxed text-muted-foreground text-pretty">
@@ -117,7 +125,11 @@ export function AddSlaveCarouselDialog({
       open={open}
       onClose={close}
       title="Add as carousel"
-      description={`Create a paternoster driven by ${host}.`}
+      description={
+        isEsp32
+          ? `Create a paternoster for the Wi-Fi ESP32 board ${slave.hostname}, driven by the agent at ${host}:${port}.`
+          : `Create a paternoster driven by ${host}.`
+      }
       className="max-w-md"
     >
       <div className="flex flex-col gap-4">

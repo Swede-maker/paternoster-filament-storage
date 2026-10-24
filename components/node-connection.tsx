@@ -15,18 +15,18 @@ import {
   servoMaxPpsFor,
   servoMirrorBFor,
   servoSingleMotorFor,
-  dcTrimPctFor,
-  dcTrimUpPctFor,
-  dcTrimPerDirectionFor,
   servoIgnoreAlarmFor,
+  servoDriverFor,
+  pulseDriveFor,
+  pulseEnableActiveLowFor,
+  pulseAlarmActiveLowFor,
+  esp32LinkFor,
+  esp32PortFor,
+  esp32BaudFor,
   servoHoldTimeoutFor,
   sensorArmFor,
   homeTimeoutFor,
   shelfTimeoutFor,
-  chainSyncEnabledFor,
-  chainSyncToleranceFor,
-  chainSyncMaxWaitFor,
-  chainSyncShelfSideFor,
 } from "@/lib/filament"
 import { nodeLoadGrams } from "@/lib/selectors"
 
@@ -171,12 +171,23 @@ export function NodeConnection() {
               const storedMode = node?.motorMode ?? "dc"
               const storedPos = node?.positionMode ?? "sensor"
               const needsPosReset = ev.motorMode === "dc" && storedPos !== "sensor"
-              if (node && (storedMode !== ev.motorMode || needsPosReset)) {
+              // Same rule for the PUL/DIR drive kind: `install.sh --pulse-drive`
+              // writes it next to the mode, so a Pi reinstalled for a stepper
+              // is not flipped back to "servo" wording by a stale node field.
+              const agentDrive =
+                ev.pulseDrive === "integrated-servo" ||
+                ev.pulseDrive === "ac-servo" ||
+                ev.pulseDrive === "closed-loop-stepper"
+                  ? ev.pulseDrive
+                  : undefined
+              const driveDiffers = agentDrive !== undefined && node?.pulseDrive !== agentDrive
+              if (node && (storedMode !== ev.motorMode || needsPosReset || driveDiffers)) {
                 dispatch({
                   type: "UPDATE_NODE",
                   id: nodeId,
                   changes: {
                     motorMode: ev.motorMode,
+                    ...(driveDiffers ? { pulseDrive: agentDrive } : {}),
                     ...(needsPosReset ? { positionMode: "sensor" as const } : {}),
                   },
                 })
@@ -233,10 +244,6 @@ export function NodeConnection() {
             // on connect. A run ends homed, so the `homed` frame that
             // accompanies a success clears the command state.
             dispatch({ type: "NODE_CALIBRATION", nodeId, calibration: ev })
-            break
-          case "balance":
-            // Motor balance auto-calibration progress / result.
-            dispatch({ type: "NODE_BALANCE", nodeId, balance: ev })
             break
           case "sync":
             dispatch({ type: "NODE_SYNC", nodeId, driftPulses: ev.driftPulses })
@@ -454,21 +461,22 @@ export function NodeConnection() {
         servoMaxPpsFor(n),
         servoMirrorBFor(n),
         servoSingleMotorFor(n),
-        dcTrimPctFor(n),
-        dcTrimUpPctFor(n),
-        dcTrimPerDirectionFor(n) ? 1 : 0,
         servoIgnoreAlarmFor(n),
+        servoDriverFor(n),
+        pulseDriveFor(n),
+        pulseEnableActiveLowFor(n) ? 1 : 0,
+        pulseAlarmActiveLowFor(n) ? 1 : 0,
+        esp32LinkFor(n),
+        esp32PortFor(n),
+        esp32BaudFor(n),
         servoHoldTimeoutFor(n),
         sensorArmFor(n),
         homeTimeoutFor(n),
         shelfTimeoutFor(n),
-        chainSyncEnabledFor(n),
-        chainSyncToleranceFor(n),
-        chainSyncMaxWaitFor(n),
-        chainSyncShelfSideFor(n),
         n.positionMode ?? "sensor",
         n.servoCarouselPulses ?? 0,
         n.servoIndexWindowPulses ?? 0,
+        n.servoHomeResync === false ? 0 : 1,
         n.twinSide ?? "",
         n.twinReverse ? 1 : 0,
       ].join(":")
@@ -508,19 +516,20 @@ export function NodeConnection() {
               servoMirrorB: servoMirrorBFor(node),
               servoSingleMotor: servoSingleMotorFor(node),
               ...(node.twinSide ? { reverseDir: node.twinReverse ?? false } : {}),
-              dcTrimPct: dcTrimPctFor(node),
-              dcTrimUpPct: dcTrimUpPctFor(node),
-              dcTrimPerDirection: dcTrimPerDirectionFor(node),
               servoIgnoreAlarm: servoIgnoreAlarmFor(node),
+              servoDriver: servoDriverFor(node),
+              pulseDrive: pulseDriveFor(node),
+              pulseEnableActiveLow: pulseEnableActiveLowFor(node),
+              pulseAlarmActiveLow: pulseAlarmActiveLowFor(node),
+              esp32Link: esp32LinkFor(node),
+              esp32Port: esp32PortFor(node),
+              esp32Baud: esp32BaudFor(node),
               servoHoldTimeoutS: servoHoldTimeoutFor(node),
               sensorArmS: sensorArmFor(node),
               homeTimeoutS: homeTimeoutFor(node),
               shelfTimeoutS: shelfTimeoutFor(node),
-              chainSyncEnabled: chainSyncEnabledFor(node),
-              chainSyncToleranceMs: chainSyncToleranceFor(node),
-              chainSyncMaxWaitS: chainSyncMaxWaitFor(node),
-              chainSyncShelfSide: chainSyncShelfSideFor(node),
               positionMode: node.positionMode ?? "sensor",
+              homeResync: node.servoHomeResync !== false,
               // Our copy of the calibration, for an agent that lost its own.
               ...(node.servoCarouselPulses ? { servoCarouselPulses: node.servoCarouselPulses } : {}),
               ...(node.servoIndexWindowPulses ? { servoIndexWindowPulses: node.servoIndexWindowPulses } : {}),

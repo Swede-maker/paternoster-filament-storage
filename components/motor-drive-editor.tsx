@@ -13,7 +13,11 @@ import {
   MIN_HOME_TIMEOUT_S,
   MAX_HOME_TIMEOUT_S,
   MIN_SERVO_MAX_PPS,
-  MAX_SERVO_MAX_PPS,
+  pulseDriveFor,
+  pulseDriveProfile,
+  pulseDriveProfileFor,
+  pulseDriveMaxPpsFor,
+  pulseAlarmActiveLowFor,
   servoHoldTimeoutFor,
   servoMaxPpsFor,
   servoGearRatioFor,
@@ -28,25 +32,12 @@ import {
   servoIgnoreAlarmFor,
   servoPulsesPerRevFor,
   servoRpmFor,
-  dcTrimPctFor,
-  dcTrimUpPctFor,
-  dcTrimPerDirectionFor,
   shelfTimeoutFor,
   defaultShelfTimeoutFor,
   DEFAULT_SHELF_TIMEOUT_DC_S,
   DEFAULT_SHELF_TIMEOUT_SERVO_S,
   MIN_SHELF_TIMEOUT_S,
   MAX_SHELF_TIMEOUT_S,
-  chainSyncEnabledFor,
-  chainSyncToleranceFor,
-  chainSyncShelfSideFor,
-  DEFAULT_CHAIN_SYNC_TOLERANCE_MS,
-  MIN_CHAIN_SYNC_TOLERANCE_MS,
-  MAX_CHAIN_SYNC_TOLERANCE_MS,
-  chainSyncMaxWaitFor,
-  DEFAULT_CHAIN_SYNC_MAX_WAIT_S,
-  MIN_CHAIN_SYNC_MAX_WAIT_S,
-  MAX_CHAIN_SYNC_MAX_WAIT_S,
 } from "@/lib/filament"
 import type { StorageNode } from "@/lib/types"
 import { cn } from "@/lib/utils"
@@ -54,8 +45,7 @@ import { Field, Checkbox } from "./ui/field"
 import { NumberInput } from "./ui/number-input"
 import { MotorDrivePicker } from "./motor-drive-picker"
 import { ServoPositioning } from "./servo-positioning"
-import { MotorBalanceCalibrate } from "./motor-balance-calibrate"
-import { DIRECTION_ARROW, DIRECTION_LABEL, MotorTrimSlider } from "./motor-trim-slider"
+import { ServoControllerEditor } from "./servo-controller-editor"
 
 /** iSV57T DIP S1–S3 table (manual §4.1). "Pr0.08" = all OFF, software value. */
 const DIP_PULSES = [1600, 2000, 3200, 4000, 5000, 6400, 8000]
@@ -71,10 +61,9 @@ const HOLD_PRESETS: { value: number; label: string }[] = [
 
 /**
  * Settings → per-unit "Motor drive": switch an existing carousel between the
- * two DC bridges and the servo pair, and tune what the agent needs (servo
- * pulses per rev and top pulse rate; motor-B mirroring for both drives). Every
- * change goes to the agent in the next `config`, which hot-swaps its backend
- * while idle.
+ * single DC motor and the servo pair, and tune what the agent needs (servo
+ * pulses per rev, top pulse rate and motor-B mirroring). Every change goes to
+ * the agent in the next `config`, which hot-swaps its backend while idle.
  */
 export function MotorDriveEditor({ node }: { node: StorageNode }) {
   const { dispatch } = useStore()
@@ -99,12 +88,20 @@ export function MotorDriveEditor({ node }: { node: StorageNode }) {
   const agentMode = node.servo?.mode
   const agentHoldTimeout = node.servo?.holdTimeoutS
   const agentHomeTimeout = node.servo?.homeTimeoutS
+  const pulseDrive = pulseDriveFor(node)
+  const profile = pulseDriveProfileFor(node)
+  const driveMaxPps = pulseDriveMaxPpsFor(node)
+  const isStepper = pulseDrive === "closed-loop-stepper"
 
   const update = (
     changes: Partial<
       Pick<
         StorageNode,
         | "motorMode"
+        | "pulseDrive"
+        | "servoDriver"
+        | "pulseEnableActiveLow"
+        | "pulseAlarmActiveLow"
         | "servoPulsesPerRev"
         | "servoMaxPps"
         | "servoGearRatio"
@@ -115,27 +112,10 @@ export function MotorDriveEditor({ node }: { node: StorageNode }) {
         | "sensorArmS"
         | "homeTimeoutS"
         | "shelfTimeoutS"
-        | "dcTrimPct"
-        | "dcTrimUpPct"
-        | "dcTrimPerDirection"
-        | "chainSyncEnabled"
-        | "chainSyncToleranceMs"
-        | "chainSyncMaxWaitS"
-        | "chainSyncShelfSide"
         | "twinReverse"
       >
     >,
   ) => dispatch({ type: "UPDATE_NODE", id: node.id, changes })
-
-  const trimPct = dcTrimPctFor(node)
-  const trimUpPct = dcTrimUpPctFor(node)
-  const trimPerDirection = dcTrimPerDirectionFor(node)
-  const chainSyncOn = chainSyncEnabledFor(node)
-  const chainSyncTol = chainSyncToleranceFor(node)
-  const chainSyncWait = chainSyncMaxWaitFor(node)
-  const chainSyncShelfSide = chainSyncShelfSideFor(node)
-  const chainSyncLastLead = node.servo?.chainSyncLastLeadMs
-  const chainSyncLastCorrected = node.servo?.chainSyncLastCorrected
 
   const setHoldTimeout = (value: number) =>
     update({ servoHoldTimeoutS: Math.max(0, Math.min(MAX_SERVO_HOLD_TIMEOUT_S, Math.round(value))) })
@@ -150,12 +130,33 @@ export function MotorDriveEditor({ node }: { node: StorageNode }) {
           </span>
         )}
       </div>
-      <MotorDrivePicker value={mode} onChange={(m) => update({ motorMode: m })} disabled={busy} compact />
+      <MotorDrivePicker
+        value={mode}
+        onChange={(m) => update({ motorMode: m })}
+        pulseDrive={pulseDrive}
+        onPulseDriveChange={(d) => {
+          // A new drive kind resets the polarity overrides (they described the
+          // old drive) and, unless this is a twin Pi, moves the pulses to the
+          // controller that kind is normally wired to.
+          const next = pulseDriveProfile(d)
+          update({
+            pulseDrive: d,
+            pulseEnableActiveLow: undefined,
+            pulseAlarmActiveLow: undefined,
+            ...(node.twinSide ? {} : { servoDriver: next.defaultDriver }),
+          })
+          if (maxPps > next.maxPps) update({ servoMaxPps: next.maxPps })
+        }}
+        disabled={busy}
+        compact
+      />
       {busy && (
         <p className="mt-2 text-xs text-warning">
           The drive can only be changed while the carousel is idle; the agent ignores a switch mid-move.
         </p>
       )}
+
+      {mode === "servo" && node.driver === "hardware" && <ServoControllerEditor node={node} disabled={busy} />}
 
       {mode === "servo" && (
         <div className="mt-3 grid grid-cols-1 gap-3 sm:grid-cols-2">
@@ -174,22 +175,25 @@ export function MotorDriveEditor({ node }: { node: StorageNode }) {
               ))}
             </datalist>
             <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
-              Must match DIP S1–S3 on both drives (factory {DEFAULT_SERVO_PULSES_PER_REV}). Set all three OFF to use
-              Pr0.08 instead.
+              Must match {profile.pprHint} on both drives
+              {pulseDrive === "integrated-servo" ? ` (factory ${DEFAULT_SERVO_PULSES_PER_REV})` : ""}.
+              {isStepper && " A 1.8° stepper at 1600 pulses/rev is 1/8 microstepping; the encoder keeps the position whatever you pick."}
             </p>
           </Field>
           <Field label="Pulse rate at 100 % (pulses/s)" htmlFor={`pps-${node.id}`}>
             <NumberInput
               id={`pps-${node.id}`}
               min={MIN_SERVO_MAX_PPS}
-              max={MAX_SERVO_MAX_PPS}
+              max={driveMaxPps}
               unit="pulses/s"
-              value={maxPps}
-              onCommit={(v) => update({ servoMaxPps: v })}
+              value={Math.min(maxPps, driveMaxPps)}
+              onCommit={(v) => update({ servoMaxPps: Math.min(v, driveMaxPps) })}
             />
             <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
-              Top speed the Motor speed slider maps to: {Math.round(servoRpmFor(node, 1))} rpm at the motor shaft. The
-              drive accepts up to 300 kHz; keep G × N / 60 ≤ 300 k.
+              Top speed the Motor speed slider maps to: {Math.round(servoRpmFor(node, 1))} rpm at the motor shaft. The{" "}
+              {profile.label.toLowerCase()} drive accepts up to {Math.round(driveMaxPps / 1000)} kHz; keep G × N / 60 ≤{" "}
+              {Math.round(driveMaxPps / 1000)} k.
+              {isStepper && " Steppers lose torque fast above ~600 rpm at the shaft, so stay well under the ceiling."}
             </p>
           </Field>
           <Field label="Gear ratio (motor : sprocket)" htmlFor={`gear-${node.id}`}>
@@ -228,177 +232,11 @@ export function MotorDriveEditor({ node }: { node: StorageNode }) {
         </div>
       )}
 
-      {mode === "dc" && (
-        <div className="mt-3 rounded-lg border border-border bg-secondary/30 p-3">
-          <MotorTrimSlider
-            id={`trim-${node.id}`}
-            node={node}
-            label={trimPerDirection ? `Motor balance · ${DIRECTION_LABEL.down} ${DIRECTION_ARROW.down}` : "Motor balance"}
-            value={trimPct}
-            onChange={(v) => update({ dcTrimPct: v })}
-            disabled={busy}
-            testDirection={trimPerDirection ? "down" : undefined}
-          />
-          {trimPerDirection && (
-            <div className="mt-3 border-t border-border pt-3">
-              <MotorTrimSlider
-                id={`trim-up-${node.id}`}
-                node={node}
-                label={`Motor balance · ${DIRECTION_LABEL.up} ${DIRECTION_ARROW.up}`}
-                value={trimUpPct}
-                onChange={(v) => update({ dcTrimUpPct: v })}
-                disabled={busy}
-                testDirection="up"
-              />
-            </div>
-          )}
-          <div className="mt-3 border-t border-border pt-3">
-            <Checkbox
-              checked={trimPerDirection}
-              onChange={(v) => update({ dcTrimPerDirection: v })}
-              disabled={busy}
-              label="Separate balance for each direction"
-              description={`Off: one slider trims both ways. On: the ${DIRECTION_LABEL.down} slider applies when the carousel runs ${DIRECTION_ARROW.down} and the ${DIRECTION_LABEL.up} slider when it runs ${DIRECTION_ARROW.up} (the homing direction). Whether that is clockwise or counter-clockwise depends on how your motors are mounted — press Test next to a slider to run the carousel that way for 1.5 s and see.`}
-            />
-          </div>
-          <p className="mt-2 text-xs leading-relaxed text-muted-foreground text-pretty">
-            Two brushed motors never run at exactly the same speed for the same PWM, so one chain creeps ahead and
-            the shelves tilt. Watch which side leads during a move and trim that motor&apos;s duty down — drag the
-            slider, type an exact value, or nudge in 0.1 % steps; the other motor keeps the full Motor speed setting.
-            The trim rides on top of every move, homing and jog, and goes to the Pi with the next config.
-          </p>
-          <MotorBalanceCalibrate node={node} busy={busy} />
-        </div>
-      )}
-
-      {mode === "dc" && !node.twinSide && (
-        <div className="mt-3 rounded-lg border border-border bg-secondary/30 p-3">
-          <Checkbox
-            checked={chainSyncOn}
-            onChange={(v) => update({ chainSyncEnabled: v })}
-            label="Auto-correct chains at shelf 1"
-            description="Shelf 1 carries both the shelf flag and the home flag, so its two sensors should fire at the same instant. When this is on, every pass of shelf 1 is driven at Approach speed; if one sensor fires first and the other has not followed within the tolerance below, the motor on the leading side is paused until the lagging sensor fires, then both run again. The chains are realigned on every lap without touching the Motor balance. Safety stop: if the lagging sensor still has not fired within the time set below, both motors are cut, the position is dropped and a fault names the silent sensor. Level the chains with Jog and Home before moving again."
-          />
-          {chainSyncOn && (
-            <div className="mt-3 flex flex-col gap-3 border-t border-border pt-3">
-              <Field label="Allowed lead" htmlFor={`chain-tol-${node.id}`}>
-                <div className="flex flex-wrap items-start gap-2">
-                  <div className="w-32">
-                    <NumberInput
-                      id={`chain-tol-${node.id}`}
-                      min={MIN_CHAIN_SYNC_TOLERANCE_MS}
-                      max={MAX_CHAIN_SYNC_TOLERANCE_MS}
-                      integer
-                      step={10}
-                      unit="ms"
-                      value={chainSyncTol}
-                      disabled={busy}
-                      onCommit={(v) => update({ chainSyncToleranceMs: Math.round(v) })}
-                      aria-label="Milliseconds one sensor may lead the other before the leading motor is paused"
-                    />
-                  </div>
-                  <span className="flex h-11 items-center text-xs text-muted-foreground">milliseconds</span>
-                  {chainSyncTol !== DEFAULT_CHAIN_SYNC_TOLERANCE_MS && (
-                    <button
-                      type="button"
-                      onClick={() => update({ chainSyncToleranceMs: undefined })}
-                      className="flex h-11 items-center rounded-lg border border-border px-3 font-mono text-xs text-muted-foreground transition-colors hover:text-foreground"
-                    >
-                      Reset to {DEFAULT_CHAIN_SYNC_TOLERANCE_MS} ms
-                    </button>
-                  )}
-                </div>
-                <p className="mt-1 text-xs leading-relaxed text-muted-foreground text-pretty">
-                  How far apart the two sensors may fire before a correction starts. Below this the pass is accepted
-                  as-is, so the carousel is not nudged for every tiny difference. 0 corrects on every pass.
-                </p>
-              </Field>
-              <Field label="Safety stop after" htmlFor={`chain-wait-${node.id}`}>
-                <div className="flex flex-wrap items-start gap-2">
-                  <div className="w-32">
-                    <NumberInput
-                      id={`chain-wait-${node.id}`}
-                      min={MIN_CHAIN_SYNC_MAX_WAIT_S}
-                      max={MAX_CHAIN_SYNC_MAX_WAIT_S}
-                      integer={false}
-                      step={0.1}
-                      unit="s"
-                      value={chainSyncWait}
-                      disabled={busy}
-                      onCommit={(v) => update({ chainSyncMaxWaitS: Math.round(v * 10) / 10 })}
-                      aria-label="Seconds the lagging sensor may stay silent before both motors are cut"
-                    />
-                  </div>
-                  <span className="flex h-11 items-center text-xs text-muted-foreground">seconds</span>
-                  {chainSyncWait !== DEFAULT_CHAIN_SYNC_MAX_WAIT_S && (
-                    <button
-                      type="button"
-                      onClick={() => update({ chainSyncMaxWaitS: undefined })}
-                      className="flex h-11 items-center rounded-lg border border-border px-3 font-mono text-xs text-muted-foreground transition-colors hover:text-foreground"
-                    >
-                      Reset to {DEFAULT_CHAIN_SYNC_MAX_WAIT_S} s
-                    </button>
-                  )}
-                </div>
-                <p className="mt-1 text-xs leading-relaxed text-muted-foreground text-pretty">
-                  While one motor is paused the other drives alone to catch up. If the lagging sensor still has not
-                  fired after this long, both motors are cut, the position is dropped and a fault names the silent
-                  sensor. Set it a little longer than the time a chain needs to make up the biggest lag you expect.
-                </p>
-              </Field>
-
-              <div>
-                <span className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
-                  Shelf sensor sits on the chain of
-                </span>
-                <div className="mt-1 flex gap-2" role="radiogroup" aria-label="Which motor's chain carries the shelf sensor">
-                  {(["a", "b"] as const).map((side) => {
-                    const active = chainSyncShelfSide === side
-                    return (
-                      <button
-                        key={side}
-                        type="button"
-                        role="radio"
-                        aria-checked={active}
-                        disabled={busy}
-                        onClick={() => update({ chainSyncShelfSide: side })}
-                        className={cn(
-                          "rounded-lg border px-3 py-2 font-mono text-xs transition-colors disabled:cursor-not-allowed disabled:opacity-50",
-                          active
-                            ? "border-primary bg-primary/10 text-primary"
-                            : "border-border text-muted-foreground hover:text-foreground",
-                        )}
-                      >
-                        Motor {side.toUpperCase()}
-                      </button>
-                    )
-                  })}
-                </div>
-                <p className="mt-1 text-xs leading-relaxed text-muted-foreground text-pretty">
-                  The home sensor is on the other chain. With the shelf sensor on motor{" "}
-                  {chainSyncShelfSide.toUpperCase()}: shelf sensor first → motor {chainSyncShelfSide.toUpperCase()} pauses
-                  until the home sensor fires; home sensor first → motor {chainSyncShelfSide === "a" ? "B" : "A"} pauses
-                  until the shelf sensor fires. If a correction makes the tilt worse, swap this.
-                </p>
-              </div>
-
-              {typeof chainSyncLastLead === "number" && (
-                <p className="font-mono text-[11px] text-muted-foreground">
-                  Last pass: {chainSyncLastLead > 0 ? "shelf" : chainSyncLastLead < 0 ? "home" : "both"} sensor
-                  {chainSyncLastLead === 0 ? " together" : ` led by ${Math.abs(chainSyncLastLead)} ms`}
-                  {chainSyncLastCorrected ? " · corrected" : " · within tolerance"}
-                </p>
-              )}
-            </div>
-          )}
-        </div>
-      )}
-
       {mode === "servo" && <ServoPositioning node={node} />}
 
       {mode === "servo" && (
         <div className="mt-3">
-          <Field label="Release servos after idle" htmlFor={`hold-${node.id}`}>
+          <Field label={isStepper ? "Release steppers after idle" : "Release servos after idle"} htmlFor={`hold-${node.id}`}>
             <div className="flex flex-wrap items-center gap-1.5">
               {HOLD_PRESETS.map((p) => (
                 <button
@@ -425,7 +263,7 @@ export function MotorDriveEditor({ node }: { node: StorageNode }) {
                     unit="s"
                     value={holdTimeout}
                     onCommit={setHoldTimeout}
-                    aria-label="Release servos after this many idle seconds (0 = hold always)"
+                    aria-label="Release the motors after this many idle seconds (0 = hold always)"
                   />
                 </div>
                 <span className="flex h-11 items-center text-xs text-muted-foreground">seconds</span>
@@ -433,8 +271,14 @@ export function MotorDriveEditor({ node }: { node: StorageNode }) {
             </div>
             <p className="mt-1 text-xs leading-relaxed text-muted-foreground text-pretty">
               {holdTimeout === 0
-                  ? "Always on: the servos hold with full torque, so the carousel cannot be turned by hand — use the jog arrows in Manual control to move it. This is the normal setting; the iSV57T has no enable input."
-                  : `Only works with the optional supply relay on GPIO 17/25. After ${holdTimeout} s with no movement the agent cuts the servo supply so the carousel can be turned by hand; any move or jog powers it up again first. Without the relay this setting has no effect.`}
+                ? isStepper
+                  ? "Always on: the steppers hold with full current, so the carousel cannot be turned by hand and the coils stay warm — use the jog arrows in Manual control to move it."
+                  : "Always on: the servos hold with full torque, so the carousel cannot be turned by hand — use the jog arrows in Manual control to move it. This is the normal setting; the iSV57T has no enable input."
+                : isStepper
+                  ? `After ${holdTimeout} s with no movement the controller asserts the drives' MF (motor-free) input, which cuts the coil current so the carousel can be turned by hand and the motors cool down. Any move or jog re-energises them first and waits for the drive to settle. The closed-loop encoder keeps the position, but the agent re-homes on the next index flag anyway.`
+                  : profile.hasEnableInput
+                    ? `After ${holdTimeout} s with no movement the controller drops ${profile.enableInputName} so the carousel can be turned by hand; any move or jog enables the drives again first.`
+                    : `Only works with the optional supply relay on GPIO 17/25. After ${holdTimeout} s with no movement the agent cuts the servo supply so the carousel can be turned by hand; any move or jog powers it up again first. Without the relay this setting has no effect.`}
               {node.driver === "hardware" && node.link === "online" && agentHoldTimeout !== undefined && agentHoldTimeout !== holdTimeout && (
                 <span className="text-warning"> Agent still reports {agentHoldTimeout || "always on"}; it updates on the next config push.</span>
               )}
@@ -599,17 +443,13 @@ export function MotorDriveEditor({ node }: { node: StorageNode }) {
         </div>
       )}
 
-      {!singleMotor && !node.twinSide && (
+      {mode === "servo" && !singleMotor && !node.twinSide && (
       <div className="mt-3">
         <Checkbox
           checked={mirrorB}
           onChange={(v) => update({ servoMirrorB: v })}
           label="Mirror motor B direction"
-          description={
-            mode === "servo"
-              ? "On when the two servos face each other across the carousel so both chains pull the same way. If the carousel fights itself after switching to servos, flip this."
-              : "On when the two motors face each other across the carousel so both chains pull the same way. If the two sides fight each other, flip this instead of rewiring M+/M− on bridge B."
-          }
+          description="On when the two servos face each other across the carousel so both chains pull the same way. If the carousel fights itself after switching to servos, flip this."
         />
       </div>
       )}
@@ -620,7 +460,11 @@ export function MotorDriveEditor({ node }: { node: StorageNode }) {
             checked={servoIgnoreAlarmFor(node)}
             onChange={(v) => update({ servoIgnoreAlarm: v })}
             label="Ignore the drives' alarm outputs (ALM not wired)"
-            description="The Pi's ALM inputs have a pull-up, so with ALM+/ALM− left unconnected both drives look permanently tripped and no move is allowed. Turn this on until you wire them; turn it off afterwards so a real fault stops the motor."
+            description={
+              pulseAlarmActiveLowFor(node)
+                ? `This drive's ALM output conducts on a fault, so an unwired ALM reads as healthy and this is rarely needed. Turn it on only if a ${profile.label.toLowerCase()} drive reports a fault you have checked is false.`
+                : `${node.servoDriver === "esp32" ? "The ESP32's" : "The Pi's"} ALM inputs have a pull-up, so with ALM+/ALM− left unconnected both drives look permanently tripped and no move is allowed. Turn this on until you wire them; turn it off afterwards so a real fault stops the motor.`
+            }
           />
         </div>
       )}

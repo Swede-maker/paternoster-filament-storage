@@ -664,9 +664,9 @@ export function ManualControl({
         </div>
       )}
 
-          {/* Per-motor jog for chain alignment on both drives: exact pulses on
-              the servo pair (plus ALM lamps), timed milliseconds on the two DC
-              bridges. */}
+          {/* Jog: per-motor chain alignment in exact pulses on the servo pair
+              (plus ALM lamps); timed milliseconds on the DC carousel's one
+              motor. */}
           {isCarousel && !stopped && <ServoJogPanel node={node} />}
 
       <div className="mt-4 rounded-xl border border-border bg-background/50 p-3">
