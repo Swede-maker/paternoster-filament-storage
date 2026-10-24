@@ -1,0 +1,46 @@
+# systemd unit so the agent starts on boot and restarts on crash.
+#
+# DO NOT copy this file directly — the __PLACEHOLDERS__ below must be filled in
+# with the real user and path first. Run the installer instead:
+#
+#   sudo ./install.sh
+#
+# It fills in the placeholders, adds the user to the `gpio` group, picks the
+# right pin factory for your Pi model, and enables the service.
+#
+# Check status / logs:
+#   systemctl status paternoster-agent
+#   journalctl -u paternoster-agent -f
+#
+# Why placeholders instead of a real user: this file used to hardcode `User=pi`
+# and `/home/pi/...`. Raspberry Pi OS no longer creates a `pi` user by default,
+# so on any system with a different username systemd refused to start with
+# `status=217/USER` ("Failed to determine user credentials"). Worse, reinstalling
+# restored the hardcoded values and silently re-broke a working setup. Leaving
+# them obviously-invalid makes that failure impossible to repeat quietly.
+
+[Unit]
+Description=PAX paternoster GPIO agent
+# paxnet drives nmcli from inside the agent, so NetworkManager must be up
+# first. network-online.target is deliberately NOT a hard dependency: the whole
+# point of the fallback watchdog is to start even when there is no network.
+After=NetworkManager.service network.target
+Wants=NetworkManager.service
+
+[Service]
+Type=simple
+User=__USER__
+WorkingDirectory=__DIR__
+# Without this, Python block-buffers stdout because the journal is a pipe rather
+# than a terminal, so agent log lines are withheld — often indefinitely. That
+# makes `journalctl` show only systemd's own "Started ..." lines and none of the
+# agent's, which reads as a dead agent even when it is running perfectly.
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 __DIR__/paternoster_agent.py --name "__NAME__" --shelves __SHELVES__ --port __PORT__ __EXTRA_ARGS__
+# Set by install.sh when needed (a Pi 5 requires the lgpio pin factory).
+__ENVIRONMENT__
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

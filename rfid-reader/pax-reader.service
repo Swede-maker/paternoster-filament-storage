@@ -1,0 +1,29 @@
+# PAX wireless RFID reader — systemd unit
+# Install:
+#   sudo cp pax-reader.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now pax-reader
+# Edit the ExecStart line below: set your app host, token, reader type, and the
+# path to the checkout. Check status with: systemctl status pax-reader
+
+[Unit]
+Description=PAX wireless RFID reader
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Adjust User and WorkingDirectory to wherever you cloned the project.
+User=pi
+WorkingDirectory=/home/pi/pax/pi-agent/rfid-reader
+# Use the venv's python if you created one (recommended).
+ExecStart=/home/pi/pax/pi-agent/rfid-reader/.venv/bin/python pi_reader.py \
+  --app-host http://192.168.1.50:3000 \
+  --token PASTE_TOKEN_FROM_APP \
+  --reader pn532 \
+  --name "Pi reader"
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
