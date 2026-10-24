@@ -403,8 +403,8 @@ static void IRAM_ATTR jogTick(void*) {
   for (int m = 0; m < 2; m++) {
     if (g_jogTargets[m]) digitalWrite(pulPin(m), g_jogPhaseHigh ? HIGH : LOW);
   }
-  if (!g_jogPhaseHigh) g_jogSentPulses++;   // count on the falling half
-  g_jogRemainingHalf--;
+  if (!g_jogPhaseHigh) g_jogSentPulses = g_jogSentPulses + 1;   // count on the falling half
+  g_jogRemainingHalf = g_jogRemainingHalf - 1;
   if (g_jogRemainingHalf == 0) g_jogDoneFlag = true;
 }
 
