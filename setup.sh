@@ -110,6 +110,17 @@ warn() { printf '%s\n' "${YELLOW}warning:${RESET} $*" >&2; }
 die()  { printf '%s\n' "${RED}error:${RESET} $*" >&2; exit 1; }
 tty_say() { printf '%s\n' "$*" > /dev/tty; }
 
+# Any unexpected failure under `set -e` used to drop straight back to the
+# prompt with no message. Say where it stopped instead.
+on_error() {
+  local code=$? line=$1 cmd=$2
+  printf '\n%s\n' "${RED}error:${RESET} the installer stopped at line ${line} (exit ${code}):" >&2
+  printf '%s\n' "    ${DIM}${cmd}${RESET}" >&2
+  printf '%s\n' "Nothing is half-removed: your data and backups are untouched. Fix the cause and run the same command again." >&2
+  exit "$code"
+}
+trap 'on_error "$LINENO" "$BASH_COMMAND"' ERR
+
 # Prompts read from the terminal, not stdin, so they work when the script is
 # piped in from curl.
 ask() {
@@ -494,9 +505,17 @@ if [[ $HAS_APP -eq 1 ]]; then
   fi
   note "node $(node -v)"
   if ! command -v pnpm >/dev/null 2>&1; then
+    # Pinned to 10.x: newer pnpm majors drop Node 20, and an unpinned install
+    # fails on Pis that already have Node 20.
     say "Installing pnpm"
-    npm install -g pnpm >/dev/null 2>&1
+    if ! PNPM_LOG="$(npm install -g pnpm@10 2>&1)"; then
+      printf '%s\n' "$PNPM_LOG" | tail -n 15 >&2
+      die "could not install pnpm (see the npm output above). Check the internet connection and re-run setup.sh"
+    fi
+    hash -r
+    command -v pnpm >/dev/null 2>&1 || die "pnpm was installed but is not on PATH ($(npm prefix -g)/bin)"
   fi
+  note "pnpm $(pnpm -v)"
 
   # `next build` peaks at ~1.5 GB. On a 2 GB Pi that only survives with swap.
   if [[ $MEM_MB -lt 3000 ]]; then
