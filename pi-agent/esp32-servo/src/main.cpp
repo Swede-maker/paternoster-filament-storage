@@ -122,6 +122,13 @@ static const uint32_t MIN_PPS = 50;
 static const uint32_t WATCHDOG_MS = 1500;    // no line from the Pi -> stop (default; CFG wd_ms=)
 static const size_t LINE_MAX = 200;
 
+// Arduino-ESP32 3.x makes constrain() a template that needs all three
+// arguments to be the exact same type, and on the newer Xtensa toolchain
+// uint32_t is `unsigned long` while `200000u` is `unsigned int`.
+static inline uint32_t clampU32(uint32_t v, uint32_t lo, uint32_t hi) {
+  return v < lo ? lo : (v > hi ? hi : v);
+}
+
 // ---------------------------------------------------------------------------
 // Drive profiles (selected at runtime by CFG profile=...)
 // ---------------------------------------------------------------------------
@@ -604,12 +611,15 @@ static void handleCfg(char* rest) {
       g_level[0] = activeLevel(PIN_SHELF);
       g_level[1] = activeLevel(PIN_HOME);
     }
-    else if (!strcmp(k, "maxpps")) cfg.maxPps = constrain(nv, MIN_PPS, min(ABS_MAX_PPS, cfg.ceilingPps));
-    else if (!strcmp(k, "bounce_us")) cfg.bounceUs = constrain(nv, 0u, 200000u);
-    else if (!strcmp(k, "dirsetup_us")) cfg.dirSetupUs = constrain(nv, 5u, 20000u);
-    else if (!strcmp(k, "jogpps")) cfg.jogPps = constrain(nv, MIN_PPS, 20000u);
-    else if (!strcmp(k, "status_hz")) cfg.statusHz = constrain(nv, 1u, 100u);
-    else if (!strcmp(k, "wd_ms")) cfg.watchdogMs = constrain(nv, 500u, 10000u);
+    else if (!strcmp(k, "maxpps")) {
+      uint32_t ceiling = cfg.ceilingPps < ABS_MAX_PPS ? cfg.ceilingPps : ABS_MAX_PPS;
+      cfg.maxPps = clampU32(nv, MIN_PPS, ceiling);
+    }
+    else if (!strcmp(k, "bounce_us")) cfg.bounceUs = clampU32(nv, 0, 200000);
+    else if (!strcmp(k, "dirsetup_us")) cfg.dirSetupUs = clampU32(nv, 5, 20000);
+    else if (!strcmp(k, "jogpps")) cfg.jogPps = clampU32(nv, MIN_PPS, 20000);
+    else if (!strcmp(k, "status_hz")) cfg.statusHz = clampU32(nv, 1, 100);
+    else if (!strcmp(k, "wd_ms")) cfg.watchdogMs = clampU32(nv, 500, 10000);
     else if (!strcmp(k, "profile")) {
       // The profile resets both polarities to the drive's defaults, so the
       // Pi sends it BEFORE any ena_low / alm_low override on the same line.
