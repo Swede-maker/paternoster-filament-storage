@@ -2575,19 +2575,29 @@ function coreReducer(state: AppState, action: Action): AppState {
       // the operator explicitly chooses to home.
       // The job and the queue behind it are KEPT: once homing finishes,
       // `resumeJobAfterHoming` heads for the stop that was interrupted.
-      return withNode(state, action.nodeId, (n) => ({
-        ...n,
-        machine: {
-          ...n.machine,
-          status: "idle",
-          homed: false,
-          targetShelf: null,
-          direction: null,
-          moveFrom: null,
-          resumeStatus: null,
-          fault: { message: action.message, at: Date.now(), acknowledged: false },
-        },
-      }))
+      // A held drive alarm (ALM) is re-reported on every agent status update.
+      // While the node is still in that same unresolved fault, keep the
+      // operator's "Not now" and the original time so the dialog does not
+      // reopen; only the message is refreshed for the sidebar warning. Homing
+      // clears `fault`, so the next fault after that prompts again.
+      return withNode(state, action.nodeId, (n) => {
+        const existing = n.machine.fault
+        return {
+          ...n,
+          machine: {
+            ...n.machine,
+            status: "idle",
+            homed: false,
+            targetShelf: null,
+            direction: null,
+            moveFrom: null,
+            resumeStatus: null,
+            fault: existing
+              ? { ...existing, message: action.message }
+              : { message: action.message, at: Date.now(), acknowledged: false },
+          },
+        }
+      })
 
     case "ACK_NODE_FAULT":
       // Operator chose "Not now" in the position-lost dialog. The carousel stays
