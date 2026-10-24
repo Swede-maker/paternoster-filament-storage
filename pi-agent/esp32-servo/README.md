@@ -79,7 +79,7 @@ Three wires, all 3.3 V — no level shifter needed:
 | GND (pin 6) | — | GND |
 
 Power the ESP32 from the Pi's 5 V (pin 2/4) to **VIN**, or from its own USB
-supply. Run `sudo ./install.sh --esp32-link uart` once: it frees the UART
+supply. Run `sudo ./install.sh --esp32-link uart` once or `cd /pax/pi-agent`  `sudo bash install.sh --esp32-link uart`: it frees the UART
 from the login console, enables it (`/dev/serial0`) and, on Pi 3/4/Zero W,
 moves the full UART back to GPIO14/15. **Reboot afterwards.**
 
