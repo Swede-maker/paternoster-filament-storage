@@ -30,9 +30,23 @@ It asks **what this Pi should do**:
 | `2` | **Master** | The web app **and** it drives one paternoster from this Pi. Host for the whole system: `.local` hostnames, hotspot fallback, slave provisioning. |
 | `3` | **Slave** | Carousel agent only; follows the master. A Pi Zero 2 W is enough. |
 
-For `2` and `3` it also asks **which motors** are wired up (integrated servos with
-PUL/DIR, or DC motors on an H-bridge) and **how many shelves** the carousel has. A
-slave is additionally asked for its number and, optionally, the master's hotspot
+For `2` and `3` it also asks **which motors** are wired up and **how many shelves**
+the carousel has:
+
+| Answer | Motors | Who makes the step pulses |
+|---|---|---|
+| `1` | **Integrated servos** — iSV57T or similar, drive built into the motor | The Pi itself (GPIO header) |
+| `2` | **Closed-loop steppers** — CL57T / CL86Y or similar with a separate drive | An **ESP32** motor controller |
+| `3` | **AC servos** — A6-RS or similar with a separate drive | An **ESP32** motor controller |
+| `4` | **DC motors** — brushed motors on an H-bridge (L298N / BTS7960) | The Pi itself (PWM) |
+
+For `2` and `3` it then asks **how the ESP32 is connected**: USB cable (default),
+UART on GPIO14/15 (needs one reboot), or Wi-Fi (an ESP32 with no cable to the Pi;
+you enter its hostname). See [ESP32 motor controller](#esp32-motor-controller-closed-loop-steppers-and-ac-servos)
+below — flash the ESP32 before or after installing, the agent connects as soon
+as it answers.
+
+A slave is additionally asked for its number and, optionally, the master's hotspot
 password. Then it installs everything — Node, the app as a service on port 80, the
 carousel agent with the right motor backend, mDNS, hotspot, sudoers — without further
 questions.
@@ -64,7 +78,8 @@ so on an installed Pi the same command recognises the setup and asks what you wa
 - **Update** — newest code, same setup, no questions.
 - **Add carousel control** (shown on a filament-only Pi) — turns it into the master
   and only asks the hardware questions. Everything you have entered in the app stays.
-- **Change motor type** (shown on a master/slave) — switch servos ↔ DC.
+- **Change motor type** (shown on a master/slave) — switch between integrated
+  servos, closed-loop steppers, AC servos and DC, or change how the ESP32 is connected.
 - **Reconfigure** — asks everything again.
 
 Your data is never touched by any of these. It lives outside the code checkout in
@@ -74,6 +89,7 @@ password), and a timestamped copy of the database is made in `/var/lib/pax/backu
 before every update.
 
 Scripted installs: `sudo ./setup.sh --role master --motor servo --shelves 9`,
+`--role master --pulse-drive closed-loop-stepper --esp32-link usb --shelves 9`,
 `--role app`, `--role slave --motor dc --number 1 …`, or `-y` to update with the saved
 answers.
 
@@ -136,6 +152,8 @@ For a motorised carousel the wizard also asks for the **Motor drive**:
 | --- | --- | --- |
 | **Standard DC motors** (default) | Two brushed DC motors — one per chain, one on each side — each on its own BTS7960 / IBT-2 bridge | Same PWM duty on both bridges in lockstep, soft start, run/stop, per-motor **timed jog** (milliseconds) for chain alignment |
 | **Integrated servo motors (PUL/DIR)** | Two StepperOnline **iSV57T** servos (e.g. iSV57T-090(S)) | Pulse/direction on both motors in lockstep, speed by pulse frequency, per-motor **micro-jog** (exact pulses) for chain alignment, drive alarm lamps |
+| **Closed-loop stepper (PUL/DIR)** | Two closed-loop steppers on separate drives (StepperOnline **CL57T / CL86Y** or similar) + an **ESP32** | Same as servos, but the pulses come from the ESP32. Calibrate measures pulses per turn and the home flag, and zeroes on the flag's middle |
+| **AC servo (PUL/DIR)** | Two AC servos on separate drives (StepperOnline **A6-RS** or similar) + an **ESP32** | Same as closed-loop steppers |
 
 Every carousel has two motors; the drive option only decides *what kind*. The
 choice is saved with the unit and pushed to the agent, which persists it and
@@ -220,6 +238,30 @@ GND.
 Servo power: `VDC` → +24…36 V, `GND` → supply minus, and supply minus → Pi GND.
 The relays on GPIO 17/25 are only needed for the *Release* button / idle release;
 without them, leave *Release servos after idle* on **Always on**.
+
+### ESP32 motor controller (closed-loop steppers and AC servos)
+
+Closed-loop steppers and AC servos are pulsed by an **ESP32 DevKit** that sits
+between the Pi and the two drives. The Pi still makes every decision (which
+shelf, speed, ramps, homing, calibration); the ESP32 only does the timing Linux
+cannot do reliably: both pulse trains from one hardware timer, the shelf and home
+sensors on interrupts, and an instant stop on the flag.
+
+1. **Flash** `pi-agent/esp32-servo` onto the ESP32 (`cd pi-agent/esp32-servo && pio run -t upload`).
+   One firmware covers closed-loop steppers, AC servos and integrated servos; the Pi
+   tells it which drive is wired.
+2. **Wire the drives and both sensors to the ESP32**, not to the Pi. In this setup
+   the Pi's motor and sensor pins above are not used.
+3. **Connect it to the Pi:** USB cable, UART (GPIO14 → ESP32 GPIO21, GPIO15 ← ESP32
+   GPIO22, GND), or Wi-Fi. The installer asks which.
+
+Pins, drive wiring (PUL / DIR / ENA / ALM) and the Wi-Fi option are in
+[`pi-agent/esp32-servo/README.md`](pi-agent/esp32-servo/README.md).
+
+> **Not the same as the ESP32 slave.** [`esp32-agent`](esp32-agent/README.md) is a
+> different firmware that turns an ESP32 into a complete slave carousel with no Pi
+> of its own (DC motors or integrated servos). `esp32-servo` is the motor controller
+> for a Pi.
 
 ### Twin carousels (one Pi, two carousels)
 

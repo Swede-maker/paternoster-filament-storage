@@ -15,8 +15,10 @@
 #                      + provisions slaves. This Pi is the host for the whole system.
 #   3  SLAVE           drives one carousel and follows the master (Pi Zero 2 W)
 #
-# For 2 and 3 it also asks which motors are wired up (integrated servos or DC
-# motors) and how many shelves the carousel has.
+# For 2 and 3 it also asks which motors are wired up (integrated servos,
+# closed-loop steppers, AC servos or DC motors) and how many shelves the
+# carousel has. Closed-loop steppers and AC servos are pulsed by an ESP32
+# (pi-agent/esp32-servo), so for those it also asks how the ESP32 is connected.
 #
 # The answers are remembered in /etc/pax-install.conf. Running the same command
 # again on an installed Pi does NOT start over: it shows what is installed and
@@ -33,7 +35,14 @@
 # Non-interactive use (for scripting / re-imaging):
 #   sudo ./setup.sh --role app
 #   sudo ./setup.sh --role master --motor servo --shelves 9
+#   sudo ./setup.sh --role master --pulse-drive closed-loop-stepper --esp32-link usb --shelves 9
 #   sudo ./setup.sh --role slave  --motor dc --number 1 --shelves 9 --master pax-master.local --ap-psk <pw>
+#
+#   --pulse-drive integrated-servo|closed-loop-stepper|ac-servo   (implies --motor servo)
+#   --servo-driver gpio|esp32       who makes the pulses (default: gpio for
+#                                   integrated servos, esp32 for the others)
+#   --esp32-link usb|uart|wifi      how the ESP32 reaches this Pi
+#   --esp32-host <host[:port]>      the ESP32's address when --esp32-link wifi
 #   sudo ./setup.sh -y            # re-run with the saved answers (update only)
 #
 # One-line update over SSH (never asks anything, never installs from scratch):
@@ -55,6 +64,10 @@ MOTOR_CONF=/var/lib/pax-agent/motor.json
 
 ROLE=""
 MOTOR=""
+PULSE_DRIVE=""
+SERVO_DRIVER=""
+ESP32_LINK=""
+ESP32_HOST=""
 SHELVES=""
 NUMBER=""
 MASTER_HOST=""
@@ -68,6 +81,10 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --role) ROLE="$2"; shift 2 ;;
     --motor) MOTOR="$2"; shift 2 ;;
+    --pulse-drive) PULSE_DRIVE="$2"; shift 2 ;;
+    --servo-driver) SERVO_DRIVER="$2"; shift 2 ;;
+    --esp32-link) ESP32_LINK="$2"; shift 2 ;;
+    --esp32-host) ESP32_HOST="$2"; shift 2 ;;
     --shelves) SHELVES="$2"; shift 2 ;;
     --number) NUMBER="$2"; shift 2 ;;
     --master) MASTER_HOST="$2"; shift 2 ;;
@@ -78,7 +95,7 @@ while [[ $# -gt 0 ]]; do
     --reconfigure) RECONFIGURE=1; shift ;;
     -y|--yes) ASSUME_YES=1; shift ;;
     --update) UPDATE_ONLY=1; ASSUME_YES=1; shift ;;
-    -h|--help) sed -n '2,39p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,50p' "$0"; exit 0 ;;
     *) echo "unknown option: $1" >&2; exit 2 ;;
   esac
 done
@@ -123,9 +140,18 @@ role_label() {
     *) printf '%s' "$1" ;;
   esac
 }
+# motor_label <mode> [pulse drive] [servo driver] [esp32 link]
 motor_label() {
+  local via=""
+  [[ "${3:-}" == "esp32" ]] && via=" via ESP32 (${4:-usb})"
   case "$1" in
-    servo) printf 'integrated servos (PUL/DIR)' ;;
+    servo)
+      case "${2:-}" in
+        closed-loop-stepper) printf 'closed-loop steppers (PUL/DIR)%s' "$via" ;;
+        ac-servo) printf 'AC servos (PUL/DIR)%s' "$via" ;;
+        *) printf 'integrated servos (PUL/DIR)%s' "$via" ;;
+      esac
+      ;;
     dc) printf 'DC motors (H-bridge)' ;;
     *) printf 'not set' ;;
   esac
@@ -153,6 +179,7 @@ printf '\n'
 # What is already here? (saved answers from a previous run)
 # --------------------------------------------------------------------------
 OLD_ROLE=""; OLD_MOTOR=""; OLD_SHELVES=""; OLD_NUMBER=""; OLD_MASTER=""; OLD_APP_DIR=""; OLD_HOSTNAME=""
+OLD_PULSE_DRIVE=""; OLD_SERVO_DRIVER=""; OLD_ESP32_LINK=""; OLD_ESP32_HOST=""
 if [[ -f "$STATE_FILE" ]]; then
   # shellcheck disable=SC1090
   OLD_ROLE="$(awk -F= '$1=="role"{print $2}' "$STATE_FILE")"
@@ -162,6 +189,22 @@ if [[ -f "$STATE_FILE" ]]; then
   OLD_MASTER="$(awk -F= '$1=="master_host"{print $2}' "$STATE_FILE")"
   OLD_APP_DIR="$(awk -F= '$1=="app_dir"{print $2}' "$STATE_FILE")"
   OLD_HOSTNAME="$(awk -F= '$1=="hostname"{print $2}' "$STATE_FILE")"
+  OLD_PULSE_DRIVE="$(awk -F= '$1=="pulse_drive"{print $2}' "$STATE_FILE")"
+  OLD_SERVO_DRIVER="$(awk -F= '$1=="servo_driver"{print $2}' "$STATE_FILE")"
+  OLD_ESP32_LINK="$(awk -F= '$1=="esp32_link"{print $2}' "$STATE_FILE")"
+  OLD_ESP32_HOST="$(awk -F= '$1=="esp32_host"{print $2}' "$STATE_FILE")"
+fi
+# Installs from before these questions existed: the agent's motor.json knows
+# what the app picked, so show and default to that.
+if [[ -f "$MOTOR_CONF" && -z "$OLD_PULSE_DRIVE$OLD_SERVO_DRIVER" ]]; then
+  read -r OLD_PULSE_DRIVE OLD_SERVO_DRIVER OLD_ESP32_LINK < <(python3 -c '
+import json, sys
+c = json.load(open(sys.argv[1]))
+print(c.get("pulseDrive") or "-", c.get("servoDriver") or "-", c.get("esp32Link") or "-")
+' "$MOTOR_CONF" 2>/dev/null || echo "- - -")
+  [[ "$OLD_PULSE_DRIVE" == "-" ]] && OLD_PULSE_DRIVE=""
+  [[ "$OLD_SERVO_DRIVER" == "-" ]] && OLD_SERVO_DRIVER=""
+  [[ "$OLD_ESP32_LINK" == "-" ]] && OLD_ESP32_LINK=""
 fi
 # Older installs (before the state file existed) can still be recognised by
 # their services. Treat them as master/slave so we do not ask from scratch.
@@ -188,7 +231,7 @@ if [[ $UPDATE_ONLY -eq 1 ]]; then
 elif [[ -n "$OLD_ROLE" && $RECONFIGURE -eq 0 && -z "$ROLE" ]]; then
   tty_say "${GREEN}PAX is already installed on this Pi.${RESET}"
   tty_say "    setup   : $(role_label "$OLD_ROLE")"
-  [[ "$OLD_ROLE" != "app" ]] && tty_say "    motors  : $(motor_label "$OLD_MOTOR")${OLD_SHELVES:+, $OLD_SHELVES shelves}"
+  [[ "$OLD_ROLE" != "app" ]] && tty_say "    motors  : $(motor_label "$OLD_MOTOR" "$OLD_PULSE_DRIVE" "$OLD_SERVO_DRIVER" "$OLD_ESP32_LINK")${OLD_SHELVES:+, $OLD_SHELVES shelves}"
   [[ -f "$DATA_DIR/paternoster.db" ]] && tty_say "    data    : $DATA_DIR/paternoster.db ($(du -h "$DATA_DIR/paternoster.db" | cut -f1)) — will be kept"
   tty_say ""
   tty_say "What do you want to do?"
@@ -198,7 +241,7 @@ elif [[ -n "$OLD_ROLE" && $RECONFIGURE -eq 0 && -z "$ROLE" ]]; then
       tty_say "  ${BOLD}2${RESET}) Add carousel control: make this Pi the MASTER that drives a paternoster"
       ;;
     master|slave)
-      tty_say "  ${BOLD}2${RESET}) Change the motor type (currently $(motor_label "$OLD_MOTOR"))"
+      tty_say "  ${BOLD}2${RESET}) Change the motor type (currently $(motor_label "$OLD_MOTOR" "$OLD_PULSE_DRIVE" "$OLD_SERVO_DRIVER" "$OLD_ESP32_LINK"))"
       ;;
   esac
   tty_say "  ${BOLD}3${RESET}) Reconfigure from the start (asks every question again; data is still kept)"
@@ -219,13 +262,20 @@ case "$ACTION" in
   update)
     ROLE="$OLD_ROLE"; MOTOR="${MOTOR:-$OLD_MOTOR}"; SHELVES="${SHELVES:-$OLD_SHELVES}"
     NUMBER="${NUMBER:-$OLD_NUMBER}"; MASTER_HOST="${MASTER_HOST:-$OLD_MASTER}"
+    # Only re-send drive choices the installer itself saved; otherwise leave
+    # motor.json (what the app chose) untouched.
+    PULSE_DRIVE="${PULSE_DRIVE:-$(awk -F= '$1=="pulse_drive"{print $2}' "$STATE_FILE" 2>/dev/null || true)}"
+    SERVO_DRIVER="${SERVO_DRIVER:-$(awk -F= '$1=="servo_driver"{print $2}' "$STATE_FILE" 2>/dev/null || true)}"
+    ESP32_LINK="${ESP32_LINK:-$(awk -F= '$1=="esp32_link"{print $2}' "$STATE_FILE" 2>/dev/null || true)}"
+    ESP32_HOST="${ESP32_HOST:-$(awk -F= '$1=="esp32_host"{print $2}' "$STATE_FILE" 2>/dev/null || true)}"
+    DRIVE_ASKED=1
     ;;
   add-hardware)
     ROLE="master"
     ;;
   change-motor)
     ROLE="$OLD_ROLE"; SHELVES="${SHELVES:-$OLD_SHELVES}"; NUMBER="${NUMBER:-$OLD_NUMBER}"; MASTER_HOST="${MASTER_HOST:-$OLD_MASTER}"
-    MOTOR=""   # force the question
+    MOTOR=""; PULSE_DRIVE=""; SERVO_DRIVER=""; ESP32_LINK=""; ESP32_HOST=""   # force the questions
     ;;
   reconfigure)
     # Saved answers become defaults, not silent choices.
@@ -263,22 +313,69 @@ HAS_APP=0; HAS_AGENT=0
 # --------------------------------------------------------------------------
 # Question 2: motors (carousel roles only)
 # --------------------------------------------------------------------------
+if [[ -n "$PULSE_DRIVE" ]]; then
+  case "$PULSE_DRIVE" in integrated-servo|closed-loop-stepper|ac-servo) ;; *) die "--pulse-drive must be integrated-servo, closed-loop-stepper or ac-servo" ;; esac
+  [[ "$MOTOR" == "dc" ]] && die "--pulse-drive needs --motor servo"
+  MOTOR=servo
+fi
 if [[ $HAS_AGENT -eq 1 && -z "$MOTOR" ]]; then
   tty_say ""
   tty_say "Which motors turn this carousel?"
-  tty_say "  ${BOLD}1${RESET}) Integrated servos – iSV57T or similar, PUL/DIR step pulses, holds position, ALM feedback"
-  tty_say "  ${BOLD}2${RESET}) DC motors         – brushed motors on an H-bridge (L298N / BTS7960), PWM speed"
+  tty_say "  ${BOLD}1${RESET}) Integrated servos    – iSV57T or similar, drive built into the motor, pulsed from this Pi"
+  tty_say "  ${BOLD}2${RESET}) Closed-loop steppers – CL57T / CL86Y or similar with a separate drive, pulsed by an ESP32"
+  tty_say "  ${BOLD}3${RESET}) AC servos            – A6-RS or similar with a separate drive, pulsed by an ESP32"
+  tty_say "  ${BOLD}4${RESET}) DC motors            – brushed motors on an H-bridge (L298N / BTS7960), PWM speed"
   DEFAULT_MOTOR=1
-  [[ "$OLD_MOTOR" == "dc" ]] && DEFAULT_MOTOR=2
+  if [[ "$OLD_MOTOR" == "dc" ]]; then DEFAULT_MOTOR=4
+  elif [[ "$OLD_PULSE_DRIVE" == "closed-loop-stepper" ]]; then DEFAULT_MOTOR=2
+  elif [[ "$OLD_PULSE_DRIVE" == "ac-servo" ]]; then DEFAULT_MOTOR=3
+  fi
   case "$(ask "Choose" "$DEFAULT_MOTOR")" in
-    1|s|servo|servos) MOTOR=servo ;;
-    2|d|dc|DC)        MOTOR=dc ;;
-    *) die "answer 1 or 2" ;;
+    1|s|servo|servos) MOTOR=servo; PULSE_DRIVE=integrated-servo ;;
+    2|c|stepper|cl)   MOTOR=servo; PULSE_DRIVE=closed-loop-stepper ;;
+    3|ac)             MOTOR=servo; PULSE_DRIVE=ac-servo ;;
+    4|d|dc|DC)        MOTOR=dc ;;
+    *) die "answer 1, 2, 3 or 4" ;;
   esac
 fi
 if [[ $HAS_AGENT -eq 1 ]]; then
   [[ "$MOTOR" == "servo" || "$MOTOR" == "dc" ]] || die "--motor must be servo or dc"
 fi
+
+# Who makes the step pulses. Separate drives (closed-loop stepper, AC servo)
+# need an ESP32 running pi-agent/esp32-servo; integrated servos are pulsed
+# from the Pi header unless told otherwise.
+if [[ $HAS_AGENT -eq 1 && "$MOTOR" == "servo" && "${DRIVE_ASKED:-0}" -eq 0 ]]; then
+  if [[ -z "$SERVO_DRIVER" ]]; then
+    if [[ -n "$ESP32_LINK" || ( -n "$PULSE_DRIVE" && "$PULSE_DRIVE" != "integrated-servo" ) ]]; then
+      SERVO_DRIVER=esp32
+    else
+      SERVO_DRIVER=gpio
+    fi
+  fi
+  [[ "$SERVO_DRIVER" == "gpio" || "$SERVO_DRIVER" == "esp32" ]] || die "--servo-driver must be gpio or esp32"
+  if [[ "$SERVO_DRIVER" == "esp32" && -z "$ESP32_LINK" ]]; then
+    tty_say ""
+    tty_say "How is the ESP32 motor controller connected to this Pi?"
+    tty_say "${DIM}(flash it first with pi-agent/esp32-servo — see its README)${RESET}"
+    tty_say "  ${BOLD}1${RESET}) USB cable – DevKit micro-USB to a Pi USB port, also powers the ESP32"
+    tty_say "  ${BOLD}2${RESET}) UART      – 3 wires on the Pi header (GPIO14/15 + GND), needs one reboot"
+    tty_say "  ${BOLD}3${RESET}) Wi-Fi     – ESP32 on its own, no cable to this Pi (you enter its hostname)"
+    DEFAULT_LINK=1
+    case "$OLD_ESP32_LINK" in uart) DEFAULT_LINK=2 ;; wifi) DEFAULT_LINK=3 ;; esac
+    case "$(ask "Choose" "$DEFAULT_LINK")" in
+      1|usb)  ESP32_LINK=usb ;;
+      2|uart) ESP32_LINK=uart ;;
+      3|wifi) ESP32_LINK=wifi ;;
+      *) die "answer 1, 2 or 3" ;;
+    esac
+  fi
+  if [[ "$ESP32_LINK" == "wifi" && -z "$ESP32_HOST" ]]; then
+    ESP32_HOST="$(ask "ESP32 hostname or IP (printed on its USB console)" "${OLD_ESP32_HOST:-pax-esp32-xxxx.local}")"
+    [[ "$ESP32_HOST" == *xxxx* ]] && die "enter the ESP32's real hostname, e.g. pax-esp32-1a2b.local"
+  fi
+fi
+[[ "$MOTOR" == "dc" ]] && { PULSE_DRIVE=""; SERVO_DRIVER=""; ESP32_LINK=""; ESP32_HOST=""; }
 
 # --------------------------------------------------------------------------
 # Question 3: shelves, and for a slave its number + master hotspot password
@@ -321,7 +418,8 @@ fi
 
 printf '\n'
 SUMMARY="$(role_label "$ROLE")"
-[[ $HAS_AGENT -eq 1 ]] && SUMMARY="$SUMMARY — $(motor_label "$MOTOR"), $SHELVES shelves"
+MOTOR_TEXT="$(motor_label "$MOTOR" "$PULSE_DRIVE" "$SERVO_DRIVER" "$ESP32_LINK")"
+[[ $HAS_AGENT -eq 1 ]] && SUMMARY="$SUMMARY — $MOTOR_TEXT, $SHELVES shelves"
 say "Installing: ${BOLD}$SUMMARY${RESET}"
 note "hostname $HOSTNAME_NEW.local"
 [[ "$ACTION" == "add-hardware" ]] && note "your existing filament data stays exactly as it is"
@@ -548,8 +646,12 @@ fi
 # Carousel agent + networking (master and slave; delegates to pi-agent/install.sh)
 # --------------------------------------------------------------------------
 if [[ $HAS_AGENT -eq 1 ]]; then
-  say "Installing the carousel agent ($(motor_label "$MOTOR")) and network manager"
+  say "Installing the carousel agent ($MOTOR_TEXT) and network manager"
   AGENT_ARGS=(--role "$ROLE" --hostname "$HOSTNAME_NEW" --name "$UNIT_NAME" --shelves "$SHELVES" --port "$AGENT_PORT" --motor "$MOTOR")
+  [[ -n "$PULSE_DRIVE" ]] && AGENT_ARGS+=(--pulse-drive "$PULSE_DRIVE")
+  [[ -n "$SERVO_DRIVER" ]] && AGENT_ARGS+=(--servo-driver "$SERVO_DRIVER")
+  [[ -n "$ESP32_LINK" ]] && AGENT_ARGS+=(--esp32-link "$ESP32_LINK")
+  [[ -n "$ESP32_HOST" ]] && AGENT_ARGS+=(--esp32-host "$ESP32_HOST")
   if [[ "$ROLE" == "slave" ]]; then
     AGENT_ARGS+=(--master "$MASTER_HOST")
     [[ -n "$AP_SSID" ]] && AGENT_ARGS+=(--ap-ssid "$AP_SSID")
@@ -567,6 +669,10 @@ cat > "$STATE_FILE" <<EOF
 # Written by PAX setup.sh — re-running the installer reads this to offer an update.
 role=$ROLE
 motor=$MOTOR
+pulse_drive=$PULSE_DRIVE
+servo_driver=$SERVO_DRIVER
+esp32_link=$ESP32_LINK
+esp32_host=$ESP32_HOST
 shelves=$SHELVES
 number=$NUMBER
 master_host=$MASTER_HOST
@@ -592,8 +698,9 @@ if [[ $HAS_APP -eq 1 ]]; then
     [[ -n "$IP" ]] && printf '    %s\n' "${DIM}or http://$IP${APP_PORT/#80/}${RESET}"
     if [[ "$ROLE" == "master" ]]; then
       printf '\n%s\n' "In the app, under Settings → Storage units, set the master paternoster's address to"
-      printf '%s\n' "${BOLD}127.0.0.1${RESET} (this Pi drives its own carousel) and pick ${BOLD}$(motor_label "$MOTOR")${RESET}"
+      printf '%s\n' "${BOLD}127.0.0.1${RESET} (this Pi drives its own carousel) and pick ${BOLD}$MOTOR_TEXT${RESET}"
       printf '%s\n' "under Motor drive. Link slaves as ${BOLD}pax-slave-1.local${RESET}, …"
+      printf '%s\n' "${DIM}A slave can also be an ESP32 with no Pi at all: see esp32-agent/README.md.${RESET}"
       printf '\n%s\n' "Write down the hotspot password printed above. If the Wi-Fi ever disappears, this Pi"
       printf '%s\n' "opens that hotspot and the app is at ${BOLD}http://10.42.0.1${RESET}."
       printf '\n%s\n' "${DIM}Install a slave: run this same command on it and answer 3.${RESET}"
@@ -608,10 +715,15 @@ if [[ $HAS_APP -eq 1 ]]; then
     exit 1
   fi
 else
-  printf '%s\n' "${GREEN}${BOLD}Done.${RESET} This slave ($(motor_label "$MOTOR")) is now following ${BOLD}$MASTER_HOST${RESET}."
+  printf '%s\n' "${GREEN}${BOLD}Done.${RESET} This slave ($MOTOR_TEXT) is now following ${BOLD}$MASTER_HOST${RESET}."
   printf '%s\n' "It appears under Settings → Network → Slave units on the master within a minute."
   printf '%s\n' "Link it in the app as ${BOLD}$HOSTNAME_NEW.local${RESET} (port $AGENT_PORT) and pick"
-  printf '%s\n' "${BOLD}$(motor_label "$MOTOR")${RESET} under Motor drive for that unit."
+  printf '%s\n' "${BOLD}$MOTOR_TEXT${RESET} under Motor drive for that unit."
+fi
+if [[ $HAS_AGENT -eq 1 && "$SERVO_DRIVER" == "esp32" ]]; then
+  printf '\n%s\n' "${BOLD}ESP32 motor controller:${RESET} flash pi-agent/esp32-servo onto the ESP32 if you have not yet,"
+  printf '%s\n' "and wire the drives and both sensors to the ESP32, not to this Pi (pi-agent/esp32-servo/README.md)."
+  [[ "$ESP32_LINK" == "uart" ]] && printf '%s\n' "${YELLOW}Reboot this Pi once${RESET} so the UART on GPIO14/15 is free for the ESP32:  sudo reboot"
 fi
 printf '\n%s\n' "${DIM}Update later from Settings → Update, or over SSH:  curl -fsSL <same URL>/setup.sh | sudo bash -s -- --update"
 printf '%s\n' "${DIM} Logs: journalctl -u pax-app -f  /  journalctl -u paternoster-agent -f${RESET}"
