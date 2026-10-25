@@ -212,22 +212,38 @@ export function ServoJogPanel({ node }: { node: StorageNode }) {
 
   const JogArrow = ({ direction }: { direction: "up" | "down" }) => {
     const Icon = direction === "up" ? ArrowUp : ArrowDown
-    const busy =
+    const busy = Boolean(
       (selected && pending === `${selected}:${direction}`) ||
-      (jogging && node.servo?.motor === selected && node.servo?.direction === direction)
+        (jogging && node.servo?.motor === selected && node.servo?.direction === direction),
+    )
+    // While the OTHER arrow's jog runs this one is only waiting its turn: keep
+    // it at full strength so the two arrows never look pressed together.
+    const jogInProgress = Boolean(pending?.includes(":")) || jogging
+    const waiting = !busy && jogInProgress && Boolean(selected) && online && agentReady
     return (
       <button
         type="button"
         disabled={!canJog || !selected}
+        aria-pressed={busy}
         aria-label={
           selected
             ? `Jog ${selectedLabel} ${direction} by ${step} ${unit}`
             : `Jog ${direction} (select a motor first)`
         }
         onClick={() => selected && void jog(selected, direction)}
-        className="flex h-20 items-center justify-center rounded-xl border border-border bg-background/60 text-foreground transition-colors hover:border-primary/50 hover:bg-secondary/70 disabled:opacity-30 disabled:hover:border-border disabled:hover:bg-background/60"
+        className={cn(
+          "flex h-20 items-center justify-center rounded-xl border transition-colors",
+          busy
+            ? "border-primary bg-primary/15 text-foreground"
+            : "border-border bg-background/60 text-foreground hover:border-primary/50 hover:bg-secondary/70 disabled:hover:border-border disabled:hover:bg-background/60",
+          waiting ? "disabled:cursor-wait" : "disabled:opacity-30",
+        )}
       >
-        {busy ? <Loader2 className="h-9 w-9 animate-spin text-primary" /> : <Icon className="h-9 w-9 text-primary" />}
+        {busy ? (
+          <Loader2 className="h-9 w-9 animate-spin text-primary" />
+        ) : (
+          <Icon className={cn("h-9 w-9", waiting ? "text-muted-foreground" : "text-primary")} />
+        )}
       </button>
     )
   }
