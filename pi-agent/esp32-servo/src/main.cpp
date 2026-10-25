@@ -535,8 +535,12 @@ static void sensorsSettle() {
   }
 }
 
+// A noisy sensor line can refill the ring as fast as it drains; capping the
+// lines per pass keeps loop() reaching the status and watchdog steps.
+static const int EDGES_PER_PASS = 16;
+
 static void drainEdges() {
-  while (g_edgeTail != g_edgeHead) {
+  for (int sent = 0; sent < EDGES_PER_PASS && g_edgeTail != g_edgeHead; sent++) {
     Edge e;
     portENTER_CRITICAL(&g_mux);
     e.sensor = g_edges[g_edgeTail].sensor;
