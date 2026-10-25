@@ -448,8 +448,12 @@ export function pulseAlarmActiveLowFor(node: ServoNode): boolean {
 }
 /** Pulse-rate ceiling for the node's drive (the "Pulse rate at 100 %" input max). */
 export function pulseDriveMaxPpsFor(node: ServoNode): number {
-  return Math.min(MAX_SERVO_MAX_PPS, pulseDriveProfileFor(node).maxPps)
+  const drive = Math.min(MAX_SERVO_MAX_PPS, pulseDriveProfileFor(node).maxPps)
+  // The Pi header times PWM in software (lgpio) and tops out at 10 kHz; the
+  // ESP32's hardware timer has no such limit. Mirrors SERVO_GPIO_MAX_PPS.
+  return servoDriverFor(node) === "gpio" ? Math.min(drive, PI_GPIO_MAX_PPS) : drive
 }
+export const PI_GPIO_MAX_PPS = 10_000
 /** One-servo drive: only for servo-driven HARDWARE carousels, never filament. */
 export function servoSingleMotorFor(node: ServoNode): boolean {
   return node.system === "hardware" && node.motorMode === "servo" && node.servoSingleMotor === true
