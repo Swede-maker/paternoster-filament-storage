@@ -191,8 +191,10 @@ export function MotorDriveEditor({ node }: { node: StorageNode }) {
             />
             <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
               Top speed the Motor speed slider maps to: {Math.round(servoRpmFor(node, 1))} rpm at the motor shaft. The{" "}
-              {profile.label.toLowerCase()} drive accepts up to {Math.round(driveMaxPps / 1000)} kHz; keep G × N / 60 ≤{" "}
-              {Math.round(driveMaxPps / 1000)} k.
+              {node.servoDriver === "esp32"
+                ? `${profile.label.toLowerCase()} drive accepts up to ${Math.round(driveMaxPps / 1000)} kHz`
+                : `Pi GPIO pins can pulse up to ${Math.round(driveMaxPps / 1000)} kHz (switch to the ESP32 for more)`}
+              ; keep G × N / 60 ≤ {Math.round(driveMaxPps / 1000)} k.
               {isStepper && " Steppers lose torque fast above ~600 rpm at the shaft, so stay well under the ceiling."}
             </p>
           </Field>
