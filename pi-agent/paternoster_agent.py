@@ -161,6 +161,15 @@ SERVO_ENA_ACTIVE_RELEASES = True
 # edge arrives. The iSV57T needs ~1 s after power-up; the step pulses sent
 # before that are lost.
 SERVO_ENABLE_SETTLE_S = 1.2
+# Drives with a real enable input (closed-loop stepper MF, AC servo S-ON) stay
+# powered while released, so re-engaging only waits for the coils / servo loop
+# to lock, not for a boot.
+SERVO_ENA_INPUT_SETTLE_S = 0.3
+# Highest pulse rate the Pi header can produce. gpiozero's lgpio pin factory
+# (the default on Bookworm / Pi 5) times PWM in software and refuses
+# frequencies above 10 kHz. At 800 pulses/rev that is still 750 rpm at the
+# motor shaft. The ESP32 controller (hardware LEDC timer) is not capped by this.
+SERVO_GPIO_MAX_PPS = 10_000
 # Idle seconds before the servos are released automatically. 0 = never release
 # (hold with full torque). Defaults to 0 because release only does something
 # with the optional supply relay wired. The app overrides this per unit via
@@ -1068,7 +1077,7 @@ class ServoHardware(RealHardware):
         self.has_enable_input = bool(prof["has_enable"])
         self.drive_max_pps = int(prof["max_pps"])
         self.pulses_per_rev = max(1, int(pulses_per_rev))
-        self.max_pps = max(SERVO_MIN_PPS, min(self.drive_max_pps, int(max_pps)))
+        self.max_pps = max(SERVO_MIN_PPS, min(self._pps_ceiling(), int(max_pps)))
         self.mirror_b = bool(mirror_b)
         # One-servo hardware carousel: only channel A is pulsed and monitored.
         self.single_motor = bool(single_motor)
@@ -1076,6 +1085,84 @@ class ServoHardware(RealHardware):
         # drive. Builds without ALM+/ALM- connected set this to run anyway.
         self.ignore_alarm = bool(ignore_alarm)
         super().__init__(motor_index=motor_index, shelf_pin=shelf_pin, index_pin=index_pin)
+
+    # Hardware-style stop on a sensor edge, the Pi-header twin of the ESP32's
+    # ARM command. Class defaults so subclasses that skip _init_motor (the
+    # ESP32 backend) see a disarmed state and the callbacks stay pass-through.
+    _gpio_arm: Optional[str] = None
+    _gpio_arm_ready = False
+    _gpio_arm_gap_s = 0.0
+    _gpio_off_since = {"shelf": 0.0, "index": 0.0}
+    _jog_abort = False
+
+    def _pps_ceiling(self) -> int:
+        """Highest pulse rate this controller can produce for the drive."""
+        return min(self.drive_max_pps, SERVO_GPIO_MAX_PPS)
+
+    def _init_sensors(self, shelf_pin: int, index_pin: int) -> None:
+        super()._init_sensors(shelf_pin, index_pin)
+        self._gpio_off_since = {"shelf": time.monotonic(), "index": time.monotonic()}
+        # The base class only binds the index ARRIVAL edge; the arm needs the
+        # departure too, to know how long the window has been empty.
+        if SENSOR_INVERT:
+            self.index.when_activated = self._on_index_exit
+        else:
+            self.index.when_deactivated = self._on_index_exit
+
+    def _arm_left(self, sensor: str) -> None:
+        self._gpio_off_since = {**self._gpio_off_since, sensor: time.monotonic()}
+        if self._gpio_arm == sensor:
+            self._gpio_arm_ready = True
+
+    def _arm_arrived(self, sensor: str) -> None:
+        """Mirror of the firmware's armCheck(): cut the train on the armed arrival."""
+        if self._gpio_arm != sensor or not self._gpio_arm_ready:
+            return
+        if time.monotonic() - self._gpio_off_since.get(sensor, 0.0) < self._gpio_arm_gap_s:
+            # A flag rocking back into the window: wait for a real departure.
+            self._gpio_arm_ready = False
+            return
+        self._gpio_arm = None
+        # Straight from the GPIO callback thread: PUL goes low now, before the
+        # Carousel worker even sees the edge. Like the ESP32 this is not a latch;
+        # the next forward()/backward() starts the train again.
+        self.stop()
+
+    def _on_shelf_exit(self) -> None:
+        super()._on_shelf_exit()
+        self._arm_left("shelf")
+
+    def _on_index_exit(self) -> None:
+        self._arm_left("index")
+
+    def _on_shelf(self) -> None:
+        self._arm_arrived("shelf")
+        super()._on_shelf()
+
+    def _on_index(self) -> None:
+        self._arm_arrived("index")
+        super()._on_index()
+
+    def arm_stop(self, sensor: str = "shelf", min_gap_s: float = 0.0) -> None:
+        """
+        Stop the pulse train on the next ARRIVAL edge of `sensor` ("shelf" or
+        "index") from the sensor callback itself, the same contract as the
+        ESP32 backend: the edge still reaches the counters, only the stop
+        happens earlier. `min_gap_s` = how long the window must have been empty.
+        """
+        sensor = "index" if sensor == "index" else "shelf"
+        level = self._index_level() if sensor == "index" else self._shelf_level()
+        self._gpio_arm_gap_s = max(0.0, float(min_gap_s))
+        # Ready only once the window has been seen empty since arming.
+        self._gpio_arm_ready = not level
+        self._gpio_arm = sensor
+
+    def disarm(self) -> None:
+        self._gpio_arm = None
+
+    def abort_jog(self) -> None:
+        """Cut a running jog between two pulses (estop / Stop button)."""
+        self._jog_abort = True
 
     def _channels(self) -> tuple:
         """Servo channels this backend owns: both, or just its twin-side one."""
@@ -1171,12 +1258,13 @@ class ServoHardware(RealHardware):
                 return
             for e in _present(self.ena):
                 e.off()
-            time.sleep(SERVO_ENABLE_SETTLE_S)
+            time.sleep(SERVO_ENA_INPUT_SETTLE_S if self.has_enable_input else SERVO_ENABLE_SETTLE_S)
             self._held = True
 
     def release(self) -> None:
         """De-energise both servos so the carousel can be moved by hand."""
         with self._motor_lock:
+            self._gpio_arm = None
             self._odo_segment(0, 0)
             for p in _present(self.pul):
                 p.value = 0
@@ -1320,7 +1408,7 @@ class ServoHardware(RealHardware):
         if pulses_per_rev is not None:
             self.pulses_per_rev = max(1, int(pulses_per_rev))
         if max_pps is not None:
-            self.max_pps = max(SERVO_MIN_PPS, min(self.drive_max_pps, int(max_pps)))
+            self.max_pps = max(SERVO_MIN_PPS, min(self._pps_ceiling(), int(max_pps)))
         if mirror_b is not None:
             self.mirror_b = bool(mirror_b)
         if ignore_alarm is not None:
@@ -1877,6 +1965,10 @@ class Esp32ServoHardware(ServoHardware):
             self._armed = None
             self._send("STOP")
             self._pulsing = False
+
+    def _pps_ceiling(self) -> int:
+        # The LEDC timer is hardware: the drive's own rating is the only limit.
+        return self.drive_max_pps
 
     def abort_jog(self) -> None:
         self._jog_abort = True
@@ -2722,7 +2814,7 @@ class Carousel:
             return
         steps = max(1, int(ramp / RAMP_STEP_SECONDS))
         # Start from MIN_DUTY so the carousel breaks away instead of humming at a
-        # duty too low to turn it — but never ABOVE the duty asked for. Hardcoding
+        # duty too low to turn it ��� but never ABOVE the duty asked for. Hardcoding
         # MIN_DUTY here meant a 12% request was driven at 25%: the operator's PWM
         # setting was silently doubled, the carousel arrived far too fast to stop
         # on the flag, and dragging the slider down did nothing at all.

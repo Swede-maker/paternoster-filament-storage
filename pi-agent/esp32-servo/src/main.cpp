@@ -85,7 +85,7 @@
 #include "paxnet.h"
 
 #ifndef PAX_FW_VERSION
-#define PAX_FW_VERSION "1.2"
+#define PAX_FW_VERSION "1.4"
 #endif
 #ifndef PAX_LINK_BAUD
 #define PAX_LINK_BAUD 460800
@@ -207,9 +207,9 @@ static uint32_t g_posLastUs = 0;
 // Jog
 static esp_timer_handle_t g_jogTimer = nullptr;
 static volatile bool g_jogActive = false;
-static volatile uint32_t g_jogRemainingHalf = 0;   // half-periods left
-static volatile uint32_t g_jogSentPulses = 0;
-static volatile bool g_jogPhaseHigh = false;
+static uint32_t g_jogPulses = 0;
+static uint32_t g_jogPps = 0;
+static uint32_t g_jogStartUs = 0;
 static volatile bool g_jogDoneFlag = false;
 static bool g_jogTargets[2] = {false, false};
 static int g_jogDir = +1;
@@ -292,17 +292,11 @@ static void pulseFreq(int pin, int ch, uint32_t hz) {
   ledcChangeFrequency(ch, hz, LEDC_RES_BITS);
 #endif
 }
-static void pulseDetach(int pin) {
-#if ESP_ARDUINO_VERSION_MAJOR >= 3
-  ledcDetach(pin);
-#else
-  ledcDetachPin(pin);
-#endif
-  pinMode(pin, OUTPUT);
-  digitalWrite(pin, LOW);
-}
-static void pulseReattach(int pin, int ch) {
-  pulseSetup(pin, ch);
+// Both PUL outputs stay attached to LEDC for the whole uptime and always get
+// the same frequency, so the two chains can never run at different speeds.
+static void setTrainFreq(uint32_t hz) {
+  pulseFreq(PIN_PUL_A, LEDC_CH_A, hz);
+  pulseFreq(PIN_PUL_B, LEDC_CH_B, hz);
 }
 
 static inline int pulPin(int m) { return m == 0 ? PIN_PUL_A : PIN_PUL_B; }
@@ -369,8 +363,7 @@ static void trainRun(int dir, uint32_t hz) {
   }
   g_dir = dir;
   g_hz = hz;
-  // Both channels sit on timer 0: one frequency change moves both.
-  pulseFreq(PIN_PUL_A, LEDC_CH_A, hz);
+  setTrainFreq(hz);
   for (int m = 0; m < 2; m++) {
     bool on = motorUsed(m) && !g_held[m];
     pulseDuty(pulPin(m), ledcCh(m), on ? LEDC_DUTY_ON : 0);
@@ -393,35 +386,28 @@ static void freeOne(int m, int dir, uint32_t hz) {
 }
 
 // ---------------------------------------------------------------------------
-// Jog: exact pulse count via esp_timer (half-period callback)
+// Jog: the selected channel(s) of the shared LEDC train for pulses/pps seconds.
+// The pins are never detached from LEDC (re-attaching them left one motor on
+// its own timer/frequency), so a jog can't desync the motors afterwards.
 // ---------------------------------------------------------------------------
 static void IRAM_ATTR jogTick(void*) {
-  if (g_jogRemainingHalf == 0) {
-    g_jogDoneFlag = true;
-    return;
-  }
-  g_jogPhaseHigh = !g_jogPhaseHigh;
-  for (int m = 0; m < 2; m++) {
-    if (g_jogTargets[m]) digitalWrite(pulPin(m), g_jogPhaseHigh ? HIGH : LOW);
-  }
-  if (!g_jogPhaseHigh) g_jogSentPulses = g_jogSentPulses + 1;   // count on the falling half
-  g_jogRemainingHalf = g_jogRemainingHalf - 1;
-  if (g_jogRemainingHalf == 0) g_jogDoneFlag = true;
+  g_jogDoneFlag = true;
 }
 
 static void jogFinish() {
   if (g_jogTimer) esp_timer_stop(g_jogTimer);
-  for (int m = 0; m < 2; m++) {
-    if (g_jogTargets[m]) {
-      digitalWrite(pulPin(m), LOW);
-      pulseReattach(pulPin(m), ledcCh(m));
-    }
-    g_jogTargets[m] = false;
+  pulseDuty(PIN_PUL_A, LEDC_CH_A, 0);
+  pulseDuty(PIN_PUL_B, LEDC_CH_B, 0);
+  uint32_t sent = g_jogPulses;
+  if (!g_jogDoneFlag) {
+    uint64_t est = (uint64_t)(uint32_t)(micros() - g_jogStartUs) * g_jogPps / 1000000ULL;
+    if (est < sent) sent = (uint32_t)est;
   }
-  if (g_jogMovesCarousel) g_pos += (double)g_jogDir * (double)g_jogSentPulses;
+  g_jogTargets[0] = g_jogTargets[1] = false;
+  if (g_jogMovesCarousel) g_pos += (double)g_jogDir * (double)sent;
   g_jogActive = false;
   g_jogDoneFlag = false;
-  outf("JOGDONE %u", (unsigned)g_jogSentPulses);
+  outf("JOGDONE %u", (unsigned)sent);
 }
 
 static bool jogStart(const char* which, int dir, uint32_t pulses, uint32_t pps) {
@@ -440,19 +426,20 @@ static bool jogStart(const char* which, int dir, uint32_t pulses, uint32_t pps) 
   g_jogTargets[0] = a; g_jogTargets[1] = b;
   g_jogDir = dir;
   g_jogMovesCarousel = (a && b) || (a && cfg.single);
-  for (int m = 0; m < 2; m++) if (g_jogTargets[m]) pulseDetach(pulPin(m));
-  g_jogSentPulses = 0;
-  g_jogPhaseHigh = false;
-  g_jogRemainingHalf = pulses * 2;
+  g_jogPulses = pulses;
+  g_jogPps = pps;
   g_jogDoneFlag = false;
   g_jogActive = true;
-  esp_timer_start_periodic(g_jogTimer, 500000ULL / pps);
+  setTrainFreq(pps);
+  g_jogStartUs = micros();
+  pulseDuty(PIN_PUL_A, LEDC_CH_A, a ? LEDC_DUTY_ON : 0);
+  pulseDuty(PIN_PUL_B, LEDC_CH_B, b ? LEDC_DUTY_ON : 0);
+  esp_timer_start_once(g_jogTimer, (uint64_t)pulses * 1000000ULL / pps);
   return true;
 }
 
 static void jogAbort() {
   if (!g_jogActive) return;
-  g_jogRemainingHalf = 0;
   jogFinish();
 }
 
