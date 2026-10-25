@@ -358,6 +358,7 @@ static void trainRun(int dir, uint32_t hz) {
   if (hz > ABS_MAX_PPS) hz = ABS_MAX_PPS;
   if (hz < MIN_PPS) hz = MIN_PPS;
 
+  if (g_running && dir == g_dir && hz == g_hz) return;
   if (!g_running || dir != g_dir) {
     // Never flip DIR under a running train: stop, set it, let it settle.
     trainOff();

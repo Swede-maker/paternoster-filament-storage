@@ -1744,6 +1744,10 @@ class Esp32ServoHardware(ServoHardware):
     def _handle_line(self, line: str) -> None:
         if not line:
             return
+        # Any complete line proves the board is alive. Only ST used to count,
+        # so a few garbled status lines in a row dropped a link that was fine.
+        with self._state_lock:
+            self._last_status = time.monotonic()
         head, _, rest = line.partition(" ")
         if head == "E":
             parts = rest.split()
@@ -1854,9 +1858,14 @@ class Esp32ServoHardware(ServoHardware):
         self.engage()
         with self._motor_lock:
             hz = self._hz_for(speed)
+            # Homing re-asserts the speed every 20 ms; resending an unchanged
+            # RUN only floods the link and re-programs the pulse timer.
+            if self._pulsing and self._forward == forward and getattr(self, "_run_hz", None) == hz:
+                return
             if not self._pulsing or self._forward != forward:
                 self._odo_segment(0, 0)
             self._send(f"RUN {1 if forward else -1} {hz}")
+            self._run_hz = hz
             self._odo_segment(hz, 1 if forward else -1)
             self._pulsing = True
             self._forward = forward
@@ -3168,9 +3177,12 @@ class Carousel:
             self.hw.stop()
             self.status = "idle"
             self.emit(self.snapshot())
-            snap = self.servo_snapshot()
-            if snap:
-                self.emit(snap)
+            # The app merges servo frames, so the jogging=True frame above sticks
+            # until a frame says otherwise; without this the next jog or homing
+            # showed the previous arrow as still pressed.
+            snap = self.servo_snapshot() or {"type": "servo", "mode": mode}
+            snap["jogging"] = False
+            self.emit(snap)
 
     def _timeout_scale(self) -> float:
         """Stuck-detection allowance for the drive in use: servo gets 2x, DC 1x."""
