@@ -54,6 +54,7 @@ import select
 import socket
 import threading
 import time
+import traceback
 import weakref
 from typing import Callable, Optional
 
@@ -2031,6 +2032,12 @@ class Esp32ServoHardware(ServoHardware):
 
     def stop(self) -> None:
         with self._motor_lock:
+            if self._pulsing:
+                # Diagnostic: name the code path that ends a running move, so a
+                # STOP the user did not ask for can be traced from the journal.
+                frames = traceback.extract_stack(limit=6)[:-1]
+                path = " <- ".join(f"{f.name}:{f.lineno}" for f in reversed(frames))
+                print(f"[agent] STOP sent to ESP32 while moving, from {path}", flush=True)
             self._odo_segment(0, 0)
             self._jog_abort = True
             self._armed = None
@@ -4988,6 +4995,7 @@ async def serve(args) -> None:
                     continue
                 t = msg.get("type")
                 if t == "stop":
+                    print(f"[agent] stop requested by app client {getattr(ws, 'remote_address', '?')}", flush=True)
                     # Twin: a stop without a side is the emergency stop and
                     # halts BOTH carousels.
                     targets = [unit_for(msg)] if (rt["twin"] and msg.get("side") in TWIN_SIDES) else list(units.values())
