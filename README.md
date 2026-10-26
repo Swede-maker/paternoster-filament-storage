@@ -437,6 +437,23 @@ pm2 save
 pm2 startup        # follow the printed instruction to auto-start on boot
 ```
 
+> **PM2 is for the web app only. Never run the Pi agent under PM2.**
+> The agent (`pi-agent/paternoster_agent.py`) is started by systemd
+> (`paternoster-agent.service`). If PM2 also starts it, two agents run at once:
+> they fight over port 8765 (`[Errno 98] address already in use`) and both open
+> the ESP32 serial link, which causes "ESP32 not answering", random STOPs mid-move,
+> and failed homing.
+>
+> Check with `pm2 list`: only the web app (`pax`, running `pnpm start`) should be
+> there. If anything runs `paternoster_agent.py`, remove it:
+>
+> ```bash
+> pm2 delete <name-or-id>
+> pm2 save           # so it doesn't come back after a reboot
+> ```
+>
+> Restart the agent only with `sudo systemctl restart paternoster-agent`.
+
 ---
 
 ## 6. Configuration (optional)
