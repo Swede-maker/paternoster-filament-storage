@@ -85,7 +85,7 @@
 #include "paxnet.h"
 
 #ifndef PAX_FW_VERSION
-#define PAX_FW_VERSION "1.6"
+#define PAX_FW_VERSION "1.7"
 #endif
 #ifndef PAX_LINK_BAUD
 #define PAX_LINK_BAUD 460800
@@ -283,20 +283,24 @@ static void pulseDuty(int pin, int ch, uint32_t duty) {
   ledcWrite(ch, duty);
 #endif
 }
-static void pulseFreq(int pin, int ch, uint32_t hz) {
+static bool pulseFreq(int pin, int ch, uint32_t hz) {
 #if ESP_ARDUINO_VERSION_MAJOR >= 3
   (void)ch;
-  ledcChangeFrequency(pin, hz, LEDC_RES_BITS);
+  return ledcChangeFrequency(pin, hz, LEDC_RES_BITS) != 0;
 #else
   (void)pin;
-  ledcChangeFrequency(ch, hz, LEDC_RES_BITS);
+  return ledcChangeFrequency(ch, hz, LEDC_RES_BITS) != 0;
 #endif
 }
 // Both PUL outputs stay attached to LEDC for the whole uptime and always get
 // the same frequency, so the two chains can never run at different speeds.
 static void setTrainFreq(uint32_t hz) {
-  pulseFreq(PIN_PUL_A, LEDC_CH_A, hz);
-  pulseFreq(PIN_PUL_B, LEDC_CH_B, hz);
+  bool okA = pulseFreq(PIN_PUL_A, LEDC_CH_A, hz);
+  bool okB = pulseFreq(PIN_PUL_B, LEDC_CH_B, hz);
+  if (!okA || !okB) {
+    g_freqFails++;
+    outf("EV LEDC frequency change to %u Hz failed (A=%d B=%d)", (unsigned)hz, okA ? 1 : 0, okB ? 1 : 0);
+  }
 }
 
 static inline int pulPin(int m) { return m == 0 ? PIN_PUL_A : PIN_PUL_B; }
@@ -337,7 +341,13 @@ static void applyEnable(bool engaged) {
 // ---------------------------------------------------------------------------
 // Continuous pulse train
 // ---------------------------------------------------------------------------
-static void trainOff() {
+// Why the train last stopped, reported as why= in every ST line so the Pi can
+// tell its own STOP apart from a watchdog, trip, OTA or failed LEDC change.
+static const char* g_stopWhy = "none";
+static uint32_t g_freqFails = 0;
+
+static void trainOff(const char* why = nullptr) {
+  if (why && g_running) g_stopWhy = why;
   odoIntegrate();
   pulseDuty(PIN_PUL_A, LEDC_CH_A, 0);
   pulseDuty(PIN_PUL_B, LEDC_CH_B, 0);
@@ -346,7 +356,7 @@ static void trainOff() {
 }
 
 static void trainRun(int dir, uint32_t hz) {
-  if (hz == 0) { trainOff(); return; }
+  if (hz == 0) { trainOff("run0"); return; }
   if (hz > cfg.maxPps) hz = cfg.maxPps;
   if (hz > cfg.ceilingPps) hz = cfg.ceilingPps;
   if (hz > ABS_MAX_PPS) hz = ABS_MAX_PPS;
@@ -355,7 +365,7 @@ static void trainRun(int dir, uint32_t hz) {
   if (g_running && dir == g_dir && hz == g_hz) return;
   if (!g_running || dir != g_dir) {
     // Never flip DIR under a running train: stop, set it, let it settle.
-    trainOff();
+    trainOff("dir");
     applyDir(dir);
     delayMicroseconds(cfg.dirSetupUs);
   } else {
@@ -565,12 +575,13 @@ static void pollAlarms() {
 // ---------------------------------------------------------------------------
 static void sendStatus() {
   odoIntegrate();
-  outf("ST run=%d hz=%u dir=%d ena=%d s=%u h=%u aa=%d ab=%d pos=%.1f jog=%d arm=%d hold=%d%d up=%lu%s",
+  outf("ST run=%d hz=%u dir=%d ena=%d s=%u h=%u aa=%d ab=%d pos=%.1f jog=%d arm=%d hold=%d%d up=%lu why=%s ff=%lu%s",
        g_running ? 1 : 0, (unsigned)g_hz, g_dir, g_engaged ? 1 : 0,
        (unsigned)g_level[0], (unsigned)g_level[1],
        g_alm[0] ? 1 : 0, (cfg.single ? 0 : (g_alm[1] ? 1 : 0)),
        g_pos, g_jogActive ? 1 : 0, g_armSensor >= 0 ? 1 : 0,
-       g_held[0] ? 1 : 0, g_held[1] ? 1 : 0, (unsigned long)millis(), paxnet::statusSuffix());
+       g_held[0] ? 1 : 0, g_held[1] ? 1 : 0, (unsigned long)millis(),
+       g_stopWhy, (unsigned long)g_freqFails, paxnet::statusSuffix());
 }
 
 // ---------------------------------------------------------------------------
@@ -671,7 +682,7 @@ static void handleLine(char* line) {
   if (!strcmp(cmd, "STOP")) {
     jogAbort();
     g_armSensor = -1;
-    trainOff();
+    trainOff("stop");
     out("OK STOP");
     return;
   }
@@ -691,7 +702,7 @@ static void handleLine(char* line) {
     char* v = strtok_r(nullptr, " ", &save);
     bool on;
     if (!v || !parseBool(v, on)) { out("ERR ENA needs 0|1"); return; }
-    if (!on) { jogAbort(); trainOff(); }
+    if (!on) { jogAbort(); trainOff("ena0"); }
     applyEnable(on);
     outf("OK ENA %d", on ? 1 : 0);
     return;
@@ -816,7 +827,7 @@ void setup() {
 void loop() {
   // 1. Hardware stop requested by an ARMed sensor edge: do it before anything else.
   if (g_tripFlag) {
-    trainOff();
+    trainOff("trip");
     int8_t s = g_tripSensor;
     uint32_t us = g_tripUs;
     g_tripFlag = false;
@@ -833,7 +844,7 @@ void loop() {
   if (paxnet::updating() && (g_running || g_jogActive)) {
     // Flashing firmware with the chains moving is the one thing we never do.
     jogAbort();
-    trainOff();
+    trainOff("ota");
     g_armSensor = -1;
     out("EV OTA in progress, motors stopped");
   }
@@ -860,7 +871,7 @@ void loop() {
   if (g_linkUp && now - g_lastRxMs > cfg.watchdogMs) {
     if (g_running || g_jogActive) {
       jogAbort();
-      trainOff();
+      trainOff("watchdog");
       g_armSensor = -1;
       out("EV WATCHDOG link lost, motors stopped");
     }

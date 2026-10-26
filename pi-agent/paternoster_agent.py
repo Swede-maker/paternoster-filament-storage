@@ -1890,6 +1890,13 @@ class Esp32ServoHardware(ServoHardware):
                     pass
                 if fields.get("arm") == "0":
                     self._armed = None
+            # The Pi's position is speed x time, so a train the ESP32 stopped on
+            # its own would keep "moving" in the web app. ST says run=0 while we
+            # still think it runs: freeze the odometer and flag the move.
+            last_run = getattr(self, "_last_run_at", 0.0)
+            if (fields.get("run") == "0" and self._pulsing
+                    and time.monotonic() - last_run > 0.5):
+                self._motion_lost(f"why={fields.get('why', '?')} ff={fields.get('ff', '?')}")
             # Levels are also in the status: a lost edge line re-syncs here.
             if "s" in fields:
                 self._apply_level(0, fields["s"] == "1")
@@ -1912,6 +1919,7 @@ class Esp32ServoHardware(ServoHardware):
                 self._net.update(fields)
                 self._net["at"] = time.time()
         elif head == "TRIP":
+            print(f"[agent] ESP32 TRIP (stopped on sensor edge): {rest}", flush=True)
             parts = rest.split()
             self._pulsing = False
             self._odo_segment(0, 0)
@@ -1929,6 +1937,12 @@ class Esp32ServoHardware(ServoHardware):
         elif head == "BOOT":
             # The board restarted under us (brown-out, reset button): its config
             # and enable state are gone, so push them again.
+            print("[agent] ESP32 restarted (BOOT) - config resent", flush=True)
+            if self._pulsing:
+                self._motion_lost("ESP32 restarted (BOOT)")
+            if self._jog_active_flag():
+                self._jog_sent = 0
+                self._jog_done.set()
             if self._connected:
                 self._pulsing = False
                 self._odo_segment(0, 0)
@@ -1937,6 +1951,8 @@ class Esp32ServoHardware(ServoHardware):
         elif head == "EV":
             print(f"[agent] ESP32: {rest}", flush=True)
             if "WATCHDOG" in rest:
+                if self._pulsing:
+                    self._motion_lost("ESP32 watchdog")
                 self._pulsing = False
                 self._odo_segment(0, 0)
         elif head == "OK" and rest.startswith("PING"):
@@ -1973,10 +1989,33 @@ class Esp32ServoHardware(ServoHardware):
             self._send("ENA 0")
             self._held = False
 
+    def _jog_active_flag(self) -> bool:
+        ev = getattr(self, "_jog_done", None)
+        return ev is not None and not ev.is_set()
+
+    def _motion_lost(self, reason: str) -> None:
+        """The ESP32 stopped pulsing without being told to. Freeze the position
+        where it stopped and keep the rest of this move from restarting it."""
+        self._odo_segment(0, 0)
+        self._pulsing = False
+        self._motion_fault = reason
+        print(f"[agent] ESP32 stopped the motor by itself during a move ({reason}); "
+              "position frozen, move will not resume", flush=True)
+
     def _run_pulses(self, forward: bool, speed: float) -> None:
+        if getattr(self, "_motion_fault", None):
+            # Leave it stopped: the move times out and reports an error instead
+            # of the web app showing a shelf the carousel never reached.
+            return
         self.engage()
         with self._motor_lock:
             hz = self._hz_for(speed)
+            # The move loop ramps every 1 ms, so an exact hz meant ~1000 RUN
+            # lines a second, each one reprogramming the LEDC timer and
+            # flooding the link. 64 speed steps across the range keep the ramp
+            # smooth with a few dozen RUNs per ramp.
+            step = max(1, int(self.max_pps) // 64)
+            hz = max(SERVO_MIN_PPS, int(round(hz / step)) * step)
             # Homing re-asserts the speed every 20 ms; resending an unchanged
             # RUN only floods the link and re-programs the pulse timer.
             if self._pulsing and self._forward == forward and getattr(self, "_run_hz", None) == hz:
@@ -1984,6 +2023,7 @@ class Esp32ServoHardware(ServoHardware):
             if not self._pulsing or self._forward != forward:
                 self._odo_segment(0, 0)
             self._send(f"RUN {1 if forward else -1} {hz}")
+            self._last_run_at = time.monotonic()
             self._run_hz = hz
             self._odo_segment(hz, 1 if forward else -1)
             self._pulsing = True
@@ -1996,6 +2036,9 @@ class Esp32ServoHardware(ServoHardware):
             self._armed = None
             self._send("STOP")
             self._pulsing = False
+            if getattr(self, "_motion_fault", None):
+                self._last_motion_fault = self._motion_fault
+                self._motion_fault = None
 
     def _pps_ceiling(self) -> int:
         # The LEDC timer is hardware: the drive's own rating is the only limit.
@@ -2073,6 +2116,8 @@ class Esp32ServoHardware(ServoHardware):
                 "baud": self.baud,
                 "esp32Firmware": self._firmware,
                 "linkError": None if self._connected else self._link_error,
+                "motionFault": getattr(self, "_motion_fault", None)
+                    or getattr(self, "_last_motion_fault", None),
             })
             if self.wifi:
                 snap["esp32Host"] = self._net.get("host")
