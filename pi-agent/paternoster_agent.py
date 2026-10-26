@@ -4636,6 +4636,55 @@ class Carousel:
 # ==========================================================================
 # WebSocket server
 # ==========================================================================
+BIND_RETRY_SECONDS = 30.0
+
+
+def _port_holder(port: int) -> str:
+    """Best-effort description of whoever is listening on `port`, for the log."""
+    try:
+        import subprocess
+        out = subprocess.run(
+            ["ss", "-ltnpH", f"sport = :{port}"],
+            capture_output=True, text=True, timeout=3,
+        ).stdout.strip()
+        return out or "unknown (run: sudo ss -ltnp | grep %d)" % port
+    except Exception:
+        return "unknown (run: sudo ss -ltnp | grep %d)" % port
+
+
+async def _bind_websocket_server(handler, port: int):
+    """
+    Bind the WebSocket server, retrying while the port is busy.
+
+    SO_REUSEADDR (reuse_address=True) lets us bind straight over sockets left
+    in TIME_WAIT by a previous run. It cannot take a port from a process that
+    is still LISTENING on it, so for that case we retry for a while (covers a
+    previous copy that is still shutting down) and then name the holder in the
+    log before giving up, instead of a bare traceback.
+    """
+    import errno
+    deadline = time.monotonic() + BIND_RETRY_SECONDS
+    warned = False
+    while True:
+        try:
+            return await websockets.serve(
+                handler, "0.0.0.0", port, reuse_address=True,
+            )
+        except OSError as e:
+            if e.errno != errno.EADDRINUSE:
+                raise
+            if not warned:
+                print(f"[agent] port {port} is busy, held by: {_port_holder(port)}; "
+                      f"retrying for up to {BIND_RETRY_SECONDS:.0f} s", flush=True)
+                warned = True
+            if time.monotonic() >= deadline:
+                print(f"[agent] port {port} still busy after {BIND_RETRY_SECONDS:.0f} s, "
+                      f"held by: {_port_holder(port)}. Another copy of the agent is "
+                      f"still running; stop it (sudo fuser -k {port}/tcp).", flush=True)
+                raise
+            await asyncio.sleep(1.0)
+
+
 async def serve(args) -> None:
     import websockets
     # Base class of ConnectionClosedOK/ConnectionClosedError, so catching it
@@ -5150,8 +5199,9 @@ async def serve(args) -> None:
             clients.discard(ws)
             net.forget_socket(ws)
 
+    server = await _bind_websocket_server(handler, args.port)
     print(f"[agent] '{args.name}' listening on ws://0.0.0.0:{args.port}/", flush=True)
-    async with websockets.serve(handler, "0.0.0.0", args.port):
+    async with server:
         try:
             await asyncio.Future()  # run forever
         finally:

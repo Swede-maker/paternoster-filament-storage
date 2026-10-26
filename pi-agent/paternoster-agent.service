@@ -26,6 +26,10 @@ Description=PAX paternoster GPIO agent
 # point of the fallback watchdog is to start even when there is no network.
 After=NetworkManager.service network.target
 Wants=NetworkManager.service
+# Allow up to 10 failed starts in 5 minutes before systemd gives up, so a slow
+# port release can never leave the service permanently "failed".
+StartLimitIntervalSec=300
+StartLimitBurst=10
 
 [Service]
 Type=simple
@@ -36,11 +40,22 @@ WorkingDirectory=__DIR__
 # makes `journalctl` show only systemd's own "Started ..." lines and none of the
 # agent's, which reads as a dead agent even when it is running perfectly.
 Environment=PYTHONUNBUFFERED=1
+# Before starting, stop any stray copy of the agent still listening on our port
+# (e.g. one started by hand with `python3 paternoster_agent.py`). Without this,
+# that copy keeps the port AND the ESP32 serial link, and every restart crashes
+# with "[Errno 98] address already in use". `+` runs it as root so it can stop a
+# copy owned by any user; `-` means "no such process" is not an error.
+ExecStartPre=+-/bin/sh -c 'fuser -k -TERM __PORT__/tcp && sleep 2; exit 0'
 ExecStart=/usr/bin/python3 __DIR__/paternoster_agent.py --name "__NAME__" --shelves __SHELVES__ --port __PORT__ __EXTRA_ARGS__
 # Set by install.sh when needed (a Pi 5 requires the lgpio pin factory).
 __ENVIRONMENT__
 Restart=on-failure
-RestartSec=3
+RestartSec=5
+# On stop, send SIGTERM to the agent and give it time to close the socket and
+# the serial port; anything still alive after 10 s is killed, children included.
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=10
 
 [Install]
 WantedBy=multi-user.target
