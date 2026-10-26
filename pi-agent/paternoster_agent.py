@@ -1569,6 +1569,10 @@ class Esp32ServoHardware(ServoHardware):
     # ---- construction hooks (no GPIO) --------------------------------------
     def _init_motor(self) -> None:
         self._held = True
+        # What the ESP32 itself says about the enable line (ST ena= / OK ENA).
+        # None = not reported yet, so the first move always enables and waits.
+        self._esp_ena: Optional[bool] = None
+        self._ena_ack = threading.Event()
         self._motor_lock = threading.Lock()
         self._pulsing = False
         self._forward: Optional[bool] = None
@@ -1891,6 +1895,8 @@ class Esp32ServoHardware(ServoHardware):
                     pass
                 if fields.get("arm") == "0":
                     self._armed = None
+                if fields.get("ena") in ("0", "1"):
+                    self._esp_ena = fields["ena"] == "1"
             # The Pi's position is speed x time, so a train the ESP32 stopped on
             # its own would keep "moving" in the web app. ST says run=0 while we
             # still think it runs: freeze the odometer and flag the move.
@@ -1958,6 +1964,9 @@ class Esp32ServoHardware(ServoHardware):
                 self._odo_segment(0, 0)
         elif head == "OK" and rest.startswith("PING"):
             self._last_pong = time.monotonic()
+        elif head == "OK" and rest.startswith("ENA"):
+            self._esp_ena = rest.split()[-1] == "1"
+            self._ena_ack.set()
         elif head == "ERR":
             print(f"[agent] ESP32 rejected a command: {rest}", flush=True)
 
@@ -1976,10 +1985,26 @@ class Esp32ServoHardware(ServoHardware):
         return self._connected
 
     def engage(self) -> None:
+        """Make sure the drives are enabled before any pulse goes out.
+
+        The Pi's own `_held` flag is not enough: after a restart, a BOOT, or an
+        idle release the ESP32 can have the drives off while the Pi still thinks
+        they hold. The firmware's RUN would then enable and pulse in the same
+        instant, and a closed-loop drive that is still waking up ignores those
+        pulses while the Pi counts them as travel. So unless the ESP32 itself
+        has confirmed ena=1, send ENA 1, wait for its OK, then give the drives
+        their settle time before the move starts."""
         with self._motor_lock:
-            if self._held:
+            if self._held and self._esp_ena is True:
                 return
+            self._ena_ack.clear()
             self._send("ENA 1")
+            if self._ena_ack.wait(1.0):
+                print(f"[agent] drives were idle; ESP32 enabled them, waiting "
+                      f"{SERVO_ENABLE_SETTLE_S:.1f} s before moving", flush=True)
+            else:
+                print("[agent] ESP32 did not confirm ENA 1 within 1 s; "
+                      "waiting the settle time anyway", flush=True)
             time.sleep(SERVO_ENABLE_SETTLE_S)
             self._held = True
 
@@ -1989,6 +2014,7 @@ class Esp32ServoHardware(ServoHardware):
             self._pulsing = False
             self._send("ENA 0")
             self._held = False
+            self._esp_ena = False
 
     def _jog_active_flag(self) -> bool:
         ev = getattr(self, "_jog_done", None)
