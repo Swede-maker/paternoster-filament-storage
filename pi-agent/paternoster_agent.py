@@ -3224,6 +3224,7 @@ class Carousel:
         edge callbacks elsewhere in this file.
         """
         servo_last: Optional[tuple] = None
+        servo_sent_at = 0.0
         while self._alive:
             # Home-sensor-only builds have nothing on the shelf input; a floating
             # pin must neither light the lamp nor un-home a released carousel.
@@ -3268,8 +3269,20 @@ class Carousel:
             # not asked to keep following a command it has already dropped.
             snap = self.servo_snapshot()
             key = (snap.get("alarmA"), snap.get("alarmB"), snap.get("linkOk")) if snap else None
+            # Other code paths (drive switch, settings sync) also broadcast servo
+            # frames, sometimes while the ESP32 is still reconnecting. If the
+            # link comes back before this loop sees it drop, the key never
+            # changes and the app keeps the stale linkOk=False. Resend the
+            # snapshot every few seconds so the app always converges.
+            if snap and key == servo_last and time.monotonic() - servo_sent_at >= 5.0:
+                servo_sent_at = time.monotonic()
+                try:
+                    self.emit(snap)
+                except Exception:
+                    pass
             if key != servo_last:
                 servo_last = key
+                servo_sent_at = time.monotonic()
                 if snap:
                     try:
                         self.emit(snap)
@@ -4663,6 +4676,7 @@ async def _bind_websocket_server(handler, port: int):
     log before giving up, instead of a bare traceback.
     """
     import errno
+    import websockets
     deadline = time.monotonic() + BIND_RETRY_SECONDS
     warned = False
     while True:
