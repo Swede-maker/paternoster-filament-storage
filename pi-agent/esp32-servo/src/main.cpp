@@ -85,7 +85,7 @@
 #include "paxnet.h"
 
 #ifndef PAX_FW_VERSION
-#define PAX_FW_VERSION "1.4"
+#define PAX_FW_VERSION "1.6"
 #endif
 #ifndef PAX_LINK_BAUD
 #define PAX_LINK_BAUD 460800
@@ -660,9 +660,10 @@ static void handleLine(char* line) {
   if (!strcmp(cmd, "PING")) { out("OK PING"); return; }
   if (!strcmp(cmd, "HELLO")) {
     outf("HELLO pax-esp32 fw=%s baud=%u profile=%s profiles=ac-servo,integrated-servo,closed-loop-stepper "
-         "pul=%d/%d dir=%d/%d ena=%d/%d alm=%d/%d shelf=%d home=%d uart_rx=%d uart_tx=%d host=%s wifi=1",
+         "pul=%d/%d dir=%d/%d ena=%d/%d alm=%d/%d shelf=%d home=%d uart_rx=%d uart_tx=%d host=%s wifi=%d",
          PAX_FW_VERSION, (unsigned)PAX_LINK_BAUD, PROFILES[cfg.profile].name, PIN_PUL_A, PIN_PUL_B, PIN_DIR_A, PIN_DIR_B,
-         PIN_ENA_A, PIN_ENA_B, PIN_ALM_A, PIN_ALM_B, PIN_SHELF, PIN_HOME, PIN_LINK_RX, PIN_LINK_TX, paxnet::hostname());
+         PIN_ENA_A, PIN_ENA_B, PIN_ALM_A, PIN_ALM_B, PIN_SHELF, PIN_HOME, PIN_LINK_RX, PIN_LINK_TX, paxnet::hostname(),
+         paxnet::radioEnabled() ? 1 : 0);
     sendStatus();
     return;
   }
@@ -825,6 +826,7 @@ void loop() {
   // 2. Input from any port: USB, GPIO UART, or the Wi-Fi client.
   pump(Serial, g_lineUsb, g_lenUsb);
   pump(LinkUart, g_lineUart, g_lenUart);
+  paxnet::setMotion(g_running || g_jogActive);
   paxnet::loop();
   if (Stream* tcp = paxnet::client()) pump(*tcp, g_lineTcp, g_lenTcp);
   else g_lenTcp = 0;
@@ -845,7 +847,16 @@ void loop() {
   pollAlarms();
 
   // 5. Watchdog: a Pi that stopped talking must not leave the motors running.
+  // Drain the ports first: anything above (Wi-Fi, HTTP, a long edge burst)
+  // may have held loop() while PINGs waited in the buffer, and judging the
+  // link on a stale timestamp stopped healthy moves after ~1.5 s.
   uint32_t now = millis();
+  if (g_linkUp && now - g_lastRxMs > cfg.watchdogMs) {
+    pump(Serial, g_lineUsb, g_lenUsb);
+    pump(LinkUart, g_lineUart, g_lenUart);
+    if (Stream* tcp = paxnet::client()) pump(*tcp, g_lineTcp, g_lenTcp);
+    now = millis();
+  }
   if (g_linkUp && now - g_lastRxMs > cfg.watchdogMs) {
     if (g_running || g_jogActive) {
       jogAbort();

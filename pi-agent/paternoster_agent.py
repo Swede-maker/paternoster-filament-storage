@@ -1554,6 +1554,8 @@ class Esp32ServoHardware(ServoHardware):
         self._link_error: Optional[str] = None
         self._last_status = 0.0
         self._last_ping = 0.0
+        self._last_pong = time.monotonic()
+        self._pong_warned = False
         self._hello_seen = threading.Event()
         self._jog_done = threading.Event()
         self._jog_sent = 0
@@ -1698,6 +1700,19 @@ class Esp32ServoHardware(ServoHardware):
         if self.wifi:
             self._send("NET")
             self._net_requested = time.monotonic()
+        elif self._firmware_at_least(1, 6):
+            # A Pi master on USB/UART: the ESP32's Wi-Fi only steals loop time
+            # from the link. Persisted on the board; WIFIOFF 0 turns it back on.
+            self._send("WIFIOFF 1")
+
+    def _firmware_at_least(self, major: int, minor: int) -> bool:
+        try:
+            parts = [int(p) for p in str(self._firmware).split(".")[:2]]
+        except ValueError:
+            return False
+        while len(parts) < 2:
+            parts.append(0)
+        return tuple(parts) >= (major, minor)
         with self._state_lock:
             self._connected = True
             self._last_status = time.monotonic()
@@ -1807,6 +1822,20 @@ class Esp32ServoHardware(ServoHardware):
             if now - self._last_ping >= ESP32_PING_S:
                 self._last_ping = now
                 self._send("PING")
+            # The ESP32 still talking while ignoring our PINGs means the
+            # Pi -> ESP32 direction is garbled (mini-UART baud drift, noise on
+            # the TX wire): its watchdog will keep stopping moves after 1.5 s.
+            if self._connected and now - self._last_pong > 1.2:
+                if not self._pong_warned:
+                    self._pong_warned = True
+                    print(
+                        f"[agent] ESP32 is not answering PING ({now - self._last_pong:.1f} s) - "
+                        "it is not hearing the Pi; check the TX wire and that /dev/serial0 is the PL011 UART",
+                        flush=True,
+                    )
+            elif self._pong_warned:
+                self._pong_warned = False
+                print("[agent] ESP32 answering PING again", flush=True)
             if self._connected and now - self._last_status > self._status_timeout_s():
                 self._drop_link("no status from the ESP32")
             if self.wifi and self._connected and now - self._net_requested > 30:
@@ -1910,6 +1939,8 @@ class Esp32ServoHardware(ServoHardware):
             if "WATCHDOG" in rest:
                 self._pulsing = False
                 self._odo_segment(0, 0)
+        elif head == "OK" and rest.startswith("PING"):
+            self._last_pong = time.monotonic()
         elif head == "ERR":
             print(f"[agent] ESP32 rejected a command: {rest}", flush=True)
 

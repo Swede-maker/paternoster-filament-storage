@@ -41,6 +41,7 @@ static uint32_t g_attemptMs = 0;       // when the current join attempt started
 static uint32_t g_lastRouterTryMs = 0; // last time we tried the router while on the AP
 static bool g_servicesUp = false;
 static bool g_updating = false;
+static bool g_radioOff = false; // persisted: a Pi master over USB/UART needs no Wi-Fi
 static char g_statusBuf[64] = "";
 
 static WiFiServer g_server(PAX_LINK_PORT);
@@ -91,6 +92,7 @@ static void load() {
   g_apPsk = g_prefs.getString("apsk", "");
   g_hostname = g_prefs.getString("host", "");
   g_otaPass = g_prefs.getString("ota", PAX_OTA_PASSWORD_DEFAULT);
+  g_radioOff = g_prefs.getBool("off", false);
   if (!validHostname(g_hostname)) g_hostname = defaultHostname();
 }
 
@@ -159,8 +161,11 @@ static void pickTarget() {
   else { g_state = State::Offline; g_target = Target::None; g_attemptMs = millis(); }
 }
 
+static bool g_motion = false;
+
 static void stationLoop() {
   if (g_state == State::Disabled) return;
+  if (g_motion) return;
   uint32_t now = millis();
   bool up = WiFi.status() == WL_CONNECTED;
 
@@ -302,10 +307,37 @@ static void httpUpdateDone() {
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
+static void radioOff() {
+  stopServices();
+  WiFi.disconnect(true, false);
+  WiFi.mode(WIFI_OFF);
+  g_state = State::Disabled;
+  g_target = Target::None;
+}
+
+static void radioOn() {
+  WiFi.persistent(false);
+  WiFi.mode(WIFI_STA);
+  WiFi.setHostname(g_hostname.c_str());
+  WiFi.setAutoReconnect(false);
+  WiFi.setSleep(false);
+  if (!g_routerSsid.length() && !g_apSsid.length()) {
+    g_state = State::Offline;
+    g_attemptMs = millis();
+    return;
+  }
+  pickTarget();
+}
+
 void begin(const char* fwVersion, LineSink sink) {
   g_fw = fwVersion;
   g_sink = sink;
   load();
+  if (g_radioOff) {
+    radioOff();
+    notice("EV NET Wi-Fi off (WIFIOFF 0 turns it back on)");
+    return;
+  }
   WiFi.persistent(false);
   WiFi.mode(WIFI_STA);
   WiFi.setHostname(g_hostname.c_str());
@@ -328,6 +360,8 @@ void loop() {
     ArduinoOTA.handle();
   }
 }
+
+void setMotion(bool moving) { g_motion = moving; }
 
 Stream* client() { return (g_client && g_client.connected()) ? &g_client : nullptr; }
 bool clientConnected() { return g_client && g_client.connected(); }
@@ -372,7 +406,22 @@ static bool setCreds(const char* which, char* save, LineSink reply, String& ssid
   return true;
 }
 
+bool radioEnabled() { return !g_radioOff; }
+
 bool handleCommand(const char* cmd, char* save, LineSink reply) {
+  if (!strcmp(cmd, "WIFIOFF")) {
+    char* v = strtok_r(nullptr, " ", &save);
+    if (!v || (strcmp(v, "0") && strcmp(v, "1"))) { reply("ERR WIFIOFF needs 1 (off) or 0 (on)"); return true; }
+    bool off = v[0] == '1';
+    if (off != g_radioOff) {
+      g_radioOff = off;
+      g_prefs.putBool("off", off);
+      if (off) radioOff(); else radioOn();
+      notice(off ? "EV NET Wi-Fi off" : "EV NET Wi-Fi on");
+    }
+    reply(off ? "OK WIFIOFF 1" : "OK WIFIOFF 0");
+    return true;
+  }
   if (!strcmp(cmd, "WIFI")) return setCreds("WIFI", save, reply, g_routerSsid, g_routerPsk, "rssid", "rpsk");
   if (!strcmp(cmd, "WIFIAP")) return setCreds("WIFIAP", save, reply, g_apSsid, g_apPsk, "assid", "apsk");
   if (!strcmp(cmd, "HOSTNAME")) {

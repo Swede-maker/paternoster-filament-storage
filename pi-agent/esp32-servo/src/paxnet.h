@@ -71,4 +71,12 @@ const char* hostname();
 // True while an OTA upload is in progress: callers should keep motors off.
 bool updating();
 
+// Tell the Wi-Fi manager the motors are moving. While set, it defers joins,
+// reconnects and service restarts: WiFi.begin / MDNS.begin can block loop()
+// long enough to starve the UART reader and trip the link watchdog mid-move.
+void setMotion(bool moving);
+
+// False after WIFIOFF 1 (persisted): the radio stays off until WIFIOFF 0.
+bool radioEnabled();
+
 } // namespace paxnet
