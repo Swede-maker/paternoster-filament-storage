@@ -292,6 +292,11 @@ static bool pulseFreq(int pin, int ch, uint32_t hz) {
   return ledcChangeFrequency(ch, hz, LEDC_RES_BITS) != 0;
 #endif
 }
+// Why the train last stopped, reported as why= in every ST line so the Pi can
+// tell its own STOP apart from a watchdog, trip, OTA or failed LEDC change.
+static const char* g_stopWhy = "none";
+static uint32_t g_freqFails = 0;
+
 // Both PUL outputs stay attached to LEDC for the whole uptime and always get
 // the same frequency, so the two chains can never run at different speeds.
 static void setTrainFreq(uint32_t hz) {
@@ -341,11 +346,6 @@ static void applyEnable(bool engaged) {
 // ---------------------------------------------------------------------------
 // Continuous pulse train
 // ---------------------------------------------------------------------------
-// Why the train last stopped, reported as why= in every ST line so the Pi can
-// tell its own STOP apart from a watchdog, trip, OTA or failed LEDC change.
-static const char* g_stopWhy = "none";
-static uint32_t g_freqFails = 0;
-
 static void trainOff(const char* why = nullptr) {
   if (why && g_running) g_stopWhy = why;
   odoIntegrate();
