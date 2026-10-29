@@ -9,9 +9,18 @@ import {
   useState,
   type ReactNode,
 } from "react"
+import {
+  addSpoolToDryer,
+  dryerOccupancy,
+  getDryers,
+  reconcileDryers,
+  stripSpoolsFromDryers,
+  withDryers,
+} from "./dryers"
 import type {
   ActiveJob,
   AppState,
+  Dryer,
   ConsumptionBucket,
   FilamentOrder,
   FilamentProfile,
@@ -568,6 +577,7 @@ function mergeCatalog(local: PersistedState, remote: PersistedState, baseline: P
       containers: mergeByKey(ls.containers, rs.containers, bs?.containers, (c) => c.id),
       customMaterials: mergeByKey(ls.customMaterials, rs.customMaterials, bs?.customMaterials, (m) => m),
       customBrands: mergeByKey(ls.customBrands, rs.customBrands, bs?.customBrands, (b) => b),
+      materialDefaults: { ...rs.materialDefaults, ...ls.materialDefaults },
       orders: mergeByKey(ls.orders, rs.orders, bs?.orders, (o) => o.id),
       stores: mergeByKey(ls.stores, rs.stores, bs?.stores, (s) => s.id),
       customColors: mergeByKey(ls.customColors, rs.customColors, bs?.customColors, (c) => c.hex.toLowerCase()),
@@ -797,6 +807,13 @@ export type Action =
   | { type: "UPDATE_SETTINGS"; settings: Partial<Settings> }
   | { type: "ADD_PRESET"; kind: "material" | "brand"; value: string }
   | { type: "REMOVE_PRESET"; kind: "material" | "brand"; value: string }
+  | { type: "ADD_DRYER"; dryer: Dryer }
+  | { type: "UPDATE_DRYER"; dryer: Dryer }
+  | { type: "REMOVE_DRYER"; id: string }
+  | { type: "DRYER_CONFIRM_LOADED"; dryerId: string }
+  | { type: "DRYER_ADD_SPOOL"; dryerId: string; chamberId: string; spoolId: string }
+  | { type: "SET_DRYER_TIMER"; dryerId: string; chamberId: string; durationMin: number | null }
+  | { type: "SET_MATERIAL_DEFAULT"; material: string; nozzleTemp?: number; density?: number }
   // Nodes
   | {
       type: "ADD_NODE"
@@ -1121,7 +1138,7 @@ function removeSpoolEverywhere(state: AppState, id: string): AppState {
     ...p,
     loaded: p.loaded.map((s) => (s === id ? null : s)),
   }))
-  return { ...state, nodes, printers }
+  return withDryers({ ...state, nodes, printers }, stripSpoolsFromDryers(getDryers(state), new Set([id])))
 }
 
 // ---------------------------------------------------------------------------
@@ -1480,10 +1497,97 @@ function coreReducer(state: AppState, action: Action): AppState {
     case "REMOVE_PRESET": {
       const key = action.kind === "material" ? "customMaterials" : "customBrands"
       const current = state.settings[key] ?? []
-      return {
-        ...state,
-        settings: { ...state.settings, [key]: current.filter((v) => v !== action.value) },
+      const next = { ...state.settings, [key]: current.filter((v) => v !== action.value) }
+      if (action.kind === "material" && next.materialDefaults) {
+        const defaults = { ...next.materialDefaults }
+        for (const k of Object.keys(defaults)) {
+          if (k.toLowerCase() === action.value.toLowerCase()) delete defaults[k]
+        }
+        next.materialDefaults = defaults
       }
+      return { ...state, settings: next }
+    }
+
+    case "ADD_DRYER": {
+      const dryers = getDryers(state)
+      if (dryers.some((d) => d.id === action.dryer.id)) return state
+      return withDryers(state, [...dryers, action.dryer])
+    }
+
+    case "UPDATE_DRYER":
+      return withDryers(
+        state,
+        getDryers(state).map((d) => (d.id === action.dryer.id ? action.dryer : d)),
+      )
+
+    case "REMOVE_DRYER": {
+      const dryer = getDryers(state).find((d) => d.id === action.id)
+      // A dryer with spools inside can't be removed, or those spools would lose their location.
+      if (!dryer || dryerOccupancy(dryer) > 0) return state
+      return withDryers(state, getDryers(state).filter((d) => d.id !== action.id))
+    }
+
+    case "DRYER_CONFIRM_LOADED":
+      return withDryers(
+        state,
+        getDryers(state).map((d) => (d.id === action.dryerId ? { ...d, awaitingLoad: [] } : d)),
+      )
+
+    case "DRYER_ADD_SPOOL":
+      return withDryers(
+        state,
+        getDryers(state).map((d) =>
+          d.id !== action.dryerId
+            ? d
+            : {
+                ...d,
+                chambers: d.chambers.map((c) =>
+                  c.id !== action.chamberId || c.spoolIds.includes(action.spoolId) || c.spoolIds.length >= c.capacity
+                    ? c
+                    : { ...c, spoolIds: [...c.spoolIds, action.spoolId] },
+                ),
+              },
+        ),
+      )
+
+    case "SET_DRYER_TIMER":
+      return withDryers(
+        state,
+        getDryers(state).map((d) =>
+          d.id !== action.dryerId
+            ? d
+            : {
+                ...d,
+                chambers: d.chambers.map((c) =>
+                  c.id !== action.chamberId
+                    ? c
+                    : {
+                        ...c,
+                        timer:
+                          action.durationMin && action.durationMin > 0
+                            ? { startedAt: Date.now(), durationMin: action.durationMin }
+                            : undefined,
+                      },
+                ),
+              },
+        ),
+      )
+
+    case "SET_MATERIAL_DEFAULT": {
+      const material = action.material.trim()
+      if (!material) return state
+      const defaults = { ...(state.settings.materialDefaults ?? {}) }
+      const existingKey =
+        Object.keys(defaults).find((k) => k.toLowerCase() === material.toLowerCase()) ?? material
+      const entry = { ...defaults[existingKey] }
+      if (action.nozzleTemp != null) entry.nozzleTemp = action.nozzleTemp
+      if (action.density != null) entry.density = action.density
+      defaults[existingKey] = entry
+      const customs = state.settings.customMaterials ?? []
+      const customMaterials = customs.some((m) => m.toLowerCase() === material.toLowerCase())
+        ? customs
+        : [...customs, material]
+      return { ...state, settings: { ...state.settings, materialDefaults: defaults, customMaterials } }
     }
 
     // ----- nodes -----
@@ -2767,6 +2871,12 @@ function coreReducer(state: AppState, action: Action): AppState {
             slot: item.printerSlot,
             spoolId: item.spoolId,
           })
+        } else if (item.dryerId) {
+          next = withDryers(next, addSpoolToDryer(getDryers(next), item.dryerId, item.dryerChamberId, item.spoolId))
+        } else if (item.deleteAfter) {
+          next = machineReducer(next, { type: "DELETE_SPOOL", id: item.spoolId })
+        } else {
+          next = machineReducer(next, { type: "UPDATE_SPOOL", id: item.spoolId, changes: { inHandSince: Date.now() } })
         }
       } else if (item.occupantKind === "part") {
         // Hardware place (new box) or store-more (existing box). The operator may
@@ -3215,9 +3325,11 @@ function historyFor(prev: AppState, next: AppState, action: Action): HistoryEven
  * filament-history events it produced (newest first, capped at HISTORY_CAP).
  */
 function machineReducer(state: AppState, action: Action): AppState {
-  const next = coreReducer(state, action)
+  const core = coreReducer(state, action)
+  if (core === state) return core
+  const next = reconcileDryers(core)
   // HYDRATE/RESET replace the whole state (history included); never log around them.
-  if (next === state || action.type === "HYDRATE" || action.type === "RESET_ALL") return next
+  if (action.type === "HYDRATE" || action.type === "RESET_ALL") return next
   const events = historyFor(state, next, action)
   if (events.length === 0) return next
   const history = [...events, ...(next.history ?? [])].slice(0, HISTORY_CAP)

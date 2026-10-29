@@ -69,8 +69,24 @@ const NOZZLE_TEMP_PRESETS: Record<string, number> = {
   "PETG-CF": 250,
 }
 
+/** User-saved per-material defaults, keyed by material name. */
+export type MaterialDefaults = Record<string, { nozzleTemp?: number; density?: number }>
+
+function overrideFor(material: string, overrides?: MaterialDefaults) {
+  if (!material || !overrides) return undefined
+  const hit = Object.keys(overrides).find((k) => k.toLowerCase() === material.toLowerCase())
+  return hit ? overrides[hit] : undefined
+}
+
+/** True for materials that ship with the app (not user-added). */
+export function isBuiltInMaterial(material: string): boolean {
+  return MATERIALS.some((m) => m.toLowerCase() === material.trim().toLowerCase())
+}
+
 /** Suggested nozzle temperature for a material name (case-insensitive). */
-export function nozzleTempFor(material: string): number {
+export function nozzleTempFor(material: string, overrides?: MaterialDefaults): number {
+  const saved = overrideFor(material, overrides)?.nozzleTemp
+  if (saved != null) return saved
   if (!material) return 210
   const hit = Object.keys(NOZZLE_TEMP_PRESETS).find((k) => k.toLowerCase() === material.toLowerCase())
   return hit ? NOZZLE_TEMP_PRESETS[hit] : 210
@@ -101,7 +117,9 @@ export const DEFAULT_DENSITY = 1.24
 export const DEFAULT_DIAMETER = 1.75
 
 /** Density (g/cm³) for a material name (case-insensitive), with fallback. */
-export function densityFor(material: string): number {
+export function densityFor(material: string, overrides?: MaterialDefaults): number {
+  const saved = overrideFor(material, overrides)?.density
+  if (saved != null) return saved
   if (!material) return DEFAULT_DENSITY
   const hit = Object.keys(MATERIAL_DENSITY).find((k) => k.toLowerCase() === material.toLowerCase())
   return hit ? MATERIAL_DENSITY[hit] : DEFAULT_DENSITY

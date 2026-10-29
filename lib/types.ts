@@ -82,6 +82,12 @@ export interface Spool {
    */
   tagId?: string
   /**
+   * Epoch ms when this spool was taken out of storage into the user's hand
+   * (no printer/dryer target). It only counts as "in hand" while the spool has
+   * no other location, so a stale value after re-placing is harmless.
+   */
+  inHandSince?: number
+  /**
    * Optional "dry this filament" reminder. When set, an alert surfaces once
    * `setAt + days` has passed. The user can reset it (restart the countdown from
    * now) or clear it entirely. Absent = no reminder.
@@ -509,6 +515,11 @@ export interface QueueItem {
   /** Printer destination/source (pick & store). */
   printerId?: string
   printerSlot?: number
+  /** Pick stops headed for a filament dryer: the spool goes into this dryer chamber once picked. */
+  dryerId?: string
+  dryerChamberId?: string
+  /** Take-out stop where the user chose "take out and delete": the spool record is removed once it's out. */
+  deleteAfter?: boolean
   /**
    * Hardware pick stops started from a picking list: the row this stop fulfils,
    * so the confirmed take count is recorded back onto the list.
@@ -595,6 +606,11 @@ export interface Settings {
   /** User-saved brand names (in addition to the built-in list). */
   customBrands: string[]
   /**
+   * Per-material nozzle temp / density the user saved with "Set as default".
+   * Only user-added materials get entries; built-ins keep their presets.
+   */
+  materialDefaults?: Record<string, { nozzleTemp?: number; density?: number }>
+  /**
    * Storage containers / dry boxes the user has set up. A spool can reference
    * one by id (`Spool.containerId`); its weight is added to the spool's weight
    * during balance calculations. Optional for backwards-compat with old saves.
@@ -607,6 +623,8 @@ export interface Settings {
   defaultDiameter?: number
   /** Saved filament profiles the user can quickly apply. */
   filamentProfiles?: FilamentProfile[]
+  /** Filament dryers spools can be sent to (Filament Drying tab). */
+  dryers?: Dryer[]
   /** Scanned-barcode → saved-profile mappings, so a scan can prefill a spool. */
   barcodes?: { code: string; profileId: string }[]
   /**
@@ -1247,4 +1265,36 @@ export interface PersistedState {
   consumptionLog: ConsumptionBucket[]
   /** Daily storage snapshots for statistics (shared + synced). */
   storageSnapshots: StorageSnapshot[]
+}
+
+/**
+ * Filament dryer layouts:
+ * - `single`: holds one spool.
+ * - `shared`: one chamber holding several spools in no particular spot.
+ * - `chambers`: separate chambers, each with its own capacity.
+ */
+export type DryerKind = "single" | "shared" | "chambers"
+
+/** A drying timer. Active while `startedAt + durationMin` is in the future. */
+export interface DryerTimer {
+  startedAt: number
+  durationMin: number
+}
+
+export interface DryerChamber {
+  id: string
+  capacity: number
+  spoolIds: string[]
+  timer?: DryerTimer
+}
+
+export interface Dryer {
+  id: string
+  name: string
+  kind: DryerKind
+  /** `single` and `shared` dryers always have exactly one chamber. */
+  chambers: DryerChamber[]
+  /** Spools picked for this dryer that the operator hasn't put inside yet. */
+  awaitingLoad?: string[]
+  createdAt: number
 }

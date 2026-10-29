@@ -20,6 +20,7 @@ import { HomingRequiredDialog } from "@/components/homing-required-dialog"
 import { EmergencyStopBar } from "@/components/emergency-stop-bar"
 import { BottomNav, type NavTab } from "@/components/bottom-nav"
 import { AreaSwitcher } from "@/components/area-switcher"
+import { InHandTab } from "@/components/in-hand-tab"
 import { HardwareHomeView } from "@/components/hardware/hardware-home-view"
 import { HardwareInventoryView } from "@/components/hardware/hardware-inventory-view"
 import { HardwareLockedView } from "@/components/hardware/hardware-locked-view"
@@ -159,8 +160,23 @@ function AppShell() {
     // <main> scrolls.
     <div className="fixed inset-0 flex flex-col overflow-hidden overscroll-none bg-background text-foreground">
       {/* Top-level area switcher — the only place the two worlds meet. */}
-      <header className="flex shrink-0 items-center justify-center border-b border-border bg-panel px-3 py-2">
+      <header className="grid shrink-0 grid-cols-[1fr_auto_1fr] items-center gap-3 border-b border-border bg-panel px-3 py-2">
+        <div className="flex min-w-0 justify-start">
+          {area !== "hardware" && (
+            <InHandTab
+              onQueued={() => {
+                changeArea("filament")
+                setTab("home")
+              }}
+              onContinueDryer={() => {
+                changeArea("filament")
+                setTab("drying")
+              }}
+            />
+          )}
+        </div>
         <AreaSwitcher area={area} onChange={changeArea} />
+        <div aria-hidden />
       </header>
       {/* Home is a fixed dashboard that fills the viewport (no page scroll on
           desktop). Every other view is document-flow and can exceed the

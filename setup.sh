@@ -10,12 +10,20 @@
 #
 # It asks what this Pi should be, then does everything:
 #
-#   1  FILAMENT ONLY   web app only — spools, shelves, printers. No motors, no GPIO.
-#   2  MASTER          web app + drives ONE carousel from this Pi + hotspot fallback
-#                      + provisions slaves. This Pi is the host for the whole system.
-#   3  SLAVE           drives one carousel and follows the master (Pi Zero 2 W)
+#   1  MASTER          the host for the whole system: web app, database, slave
+#                      sign-in and Wi-Fi provisioning. There is only ever ONE.
+#                      It then asks which kind:
+#        a  SERVER       no carousel wired (a Linux PC is ideal). No GPIO, no
+#                        hotspot; this computer's own network is left alone.
+#                        Every carousel is installed as a SLAVE.
+#        b  + CAROUSEL   this Pi also drives one carousel and opens the
+#                        PAX-Setup hotspot if the router disappears.
+#   2  SLAVE           drives one carousel and follows the master (Pi Zero 2 W)
 #
-# For 2 and 3 it also asks which motors are wired up (integrated servos,
+# (Older "filament only" installs keep working and can be upgraded to a
+# SERVER master in place; --role app still installs one for scripting.)
+#
+# For carousels it also asks which motors are wired up (integrated servos,
 # closed-loop steppers, AC servos or DC motors) and how many shelves the
 # carousel has. Closed-loop steppers and AC servos are pulsed by an ESP32
 # (pi-agent/esp32-servo), so for those it also asks how the ESP32 is connected.
@@ -33,7 +41,7 @@
 # every update (the five newest are kept).
 #
 # Non-interactive use (for scripting / re-imaging):
-#   sudo ./setup.sh --role app
+#   sudo ./setup.sh --role server
 #   sudo ./setup.sh --role master --motor servo --shelves 9
 #   sudo ./setup.sh --role master --pulse-drive closed-loop-stepper --esp32-link usb --shelves 9
 #   sudo ./setup.sh --role slave  --motor dc --number 1 --shelves 9 --master pax-master.local --ap-psk <pw>
@@ -95,7 +103,7 @@ while [[ $# -gt 0 ]]; do
     --reconfigure) RECONFIGURE=1; shift ;;
     -y|--yes) ASSUME_YES=1; shift ;;
     --update) UPDATE_ONLY=1; ASSUME_YES=1; shift ;;
-    -h|--help) sed -n '2,50p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,58p' "$0"; exit 0 ;;
     *) echo "unknown option: $1" >&2; exit 2 ;;
   esac
 done
@@ -146,7 +154,8 @@ ask_secret() {
 role_label() {
   case "$1" in
     app) printf 'FILAMENT ONLY (web app, no motors)' ;;
-    master) printf 'MASTER (web app + this carousel + hotspot fallback)' ;;
+    server) printf 'MASTER – SERVER (web app + slave sign-in, no carousel)' ;;
+    master) printf 'MASTER + CAROUSEL (web app + this carousel + hotspot fallback)' ;;
     slave) printf 'SLAVE (carousel only, follows the master)' ;;
     *) printf '%s' "$1" ;;
   esac
@@ -169,7 +178,7 @@ motor_label() {
 }
 
 [[ $EUID -eq 0 ]] || die "run with sudo:  curl -fsSL .../setup.sh | sudo bash"
-command -v apt-get >/dev/null || die "this installer targets Raspberry Pi OS (Debian)"
+command -v apt-get >/dev/null || die "this installer needs a Debian-based system (Raspberry Pi OS, Debian, Ubuntu, Mint)"
 
 # The human behind sudo owns the checkout and runs the services.
 RUN_USER="${SUDO_USER:-}"
@@ -242,14 +251,17 @@ if [[ $UPDATE_ONLY -eq 1 ]]; then
 elif [[ -n "$OLD_ROLE" && $RECONFIGURE -eq 0 && -z "$ROLE" ]]; then
   tty_say "${GREEN}PAX is already installed on this Pi.${RESET}"
   tty_say "    setup   : $(role_label "$OLD_ROLE")"
-  [[ "$OLD_ROLE" != "app" ]] && tty_say "    motors  : $(motor_label "$OLD_MOTOR" "$OLD_PULSE_DRIVE" "$OLD_SERVO_DRIVER" "$OLD_ESP32_LINK")${OLD_SHELVES:+, $OLD_SHELVES shelves}"
+  [[ "$OLD_ROLE" == "master" || "$OLD_ROLE" == "slave" ]] && tty_say "    motors  : $(motor_label "$OLD_MOTOR" "$OLD_PULSE_DRIVE" "$OLD_SERVO_DRIVER" "$OLD_ESP32_LINK")${OLD_SHELVES:+, $OLD_SHELVES shelves}"
   [[ -f "$DATA_DIR/paternoster.db" ]] && tty_say "    data    : $DATA_DIR/paternoster.db ($(du -h "$DATA_DIR/paternoster.db" | cut -f1)) — will be kept"
   tty_say ""
   tty_say "What do you want to do?"
   tty_say "  ${BOLD}1${RESET}) Update to the latest version, keep this setup"
   case "$OLD_ROLE" in
     app)
-      tty_say "  ${BOLD}2${RESET}) Add carousel control: make this Pi the MASTER that drives a paternoster"
+      tty_say "  ${BOLD}2${RESET}) Make this the MASTER (as a SERVER, or with a carousel wired to it)"
+      ;;
+    server)
+      tty_say "  ${BOLD}2${RESET}) Wire a carousel to this computer too (becomes MASTER + CAROUSEL)"
       ;;
     master|slave)
       tty_say "  ${BOLD}2${RESET}) Change the motor type (currently $(motor_label "$OLD_MOTOR" "$OLD_PULSE_DRIVE" "$OLD_SERVO_DRIVER" "$OLD_ESP32_LINK"))"
@@ -258,7 +270,11 @@ elif [[ -n "$OLD_ROLE" && $RECONFIGURE -eq 0 && -z "$ROLE" ]]; then
   tty_say "  ${BOLD}3${RESET}) Reconfigure from the start (asks every question again; data is still kept)"
   case "$(ask "Choose" "1")" in
     1) ACTION="update" ;;
-    2) if [[ "$OLD_ROLE" == "app" ]]; then ACTION="add-hardware"; else ACTION="change-motor"; fi ;;
+    2) case "$OLD_ROLE" in
+         app) ACTION="make-master" ;;
+         server) ACTION="add-hardware" ;;
+         *) ACTION="change-motor" ;;
+       esac ;;
     3) ACTION="reconfigure" ;;
     *) die "answer 1, 2 or 3" ;;
   esac
@@ -284,6 +300,9 @@ case "$ACTION" in
   add-hardware)
     ROLE="master"
     ;;
+  make-master)
+    ROLE="master-ask"
+    ;;
   change-motor)
     ROLE="$OLD_ROLE"; SHELVES="${SHELVES:-$OLD_SHELVES}"; NUMBER="${NUMBER:-$OLD_NUMBER}"; MASTER_HOST="${MASTER_HOST:-$OLD_MASTER}"
     MOTOR=""; PULSE_DRIVE=""; SERVO_DRIVER=""; ESP32_LINK=""; ESP32_HOST=""   # force the questions
@@ -297,29 +316,50 @@ esac
 # Question 1: what is this Pi?
 # --------------------------------------------------------------------------
 if [[ -z "$ROLE" ]]; then
-  tty_say "What should this Raspberry Pi do?"
-  tty_say "  ${BOLD}1${RESET}) FILAMENT ONLY – the web app for spools, shelves and printers. No motors, no wiring."
-  tty_say "  ${BOLD}2${RESET}) MASTER        – the web app ${BOLD}and${RESET} it drives one paternoster carousel itself. This Pi"
-  tty_say "                     is the host for the whole system (hotspot fallback, provisions slaves)."
-  tty_say "  ${BOLD}3${RESET}) SLAVE         – drives one carousel and follows the master (Pi Zero 2 W is enough)."
+  tty_say "What should this device be?"
+  tty_say "  ${BOLD}1${RESET}) MASTER – the host for the whole system: the web app, the database, and every"
+  tty_say "               slave signs in here. You need exactly ${BOLD}one${RESET}."
+  tty_say "  ${BOLD}2${RESET}) SLAVE  – drives one carousel and follows the master (a Pi Zero 2 W is enough)."
   DEFAULT_CHOICE=1
-  case "$OLD_ROLE" in master) DEFAULT_CHOICE=2 ;; slave) DEFAULT_CHOICE=3 ;; esac
+  [[ "$OLD_ROLE" == "slave" ]] && DEFAULT_CHOICE=2
   case "$(ask "Choose" "$DEFAULT_CHOICE")" in
-    1|a|app|f|filament) ROLE=app ;;
-    2|m|master|M)       ROLE=master ;;
-    3|s|slave|S)        ROLE=slave ;;
-    *) die "answer 1, 2 or 3" ;;
+    1|m|master|M) ROLE=master-ask ;;
+    2|s|slave|S)  ROLE=slave ;;
+    *) die "answer 1 or 2" ;;
   esac
 fi
-[[ "$ROLE" == "app" || "$ROLE" == "master" || "$ROLE" == "slave" ]] || die "--role must be app, master or slave"
+
+if [[ "$ROLE" == "master-ask" ]]; then
+  tty_say ""
+  tty_say "Is a carousel wired to this device?"
+  tty_say "  ${BOLD}1${RESET}) No – SERVER only. Best on a Linux PC that is always on. No wiring, no GPIO,"
+  tty_say "          and this computer's own network is never changed. Install every carousel"
+  tty_say "          as a SLAVE pointing at this server."
+  tty_say "  ${BOLD}2${RESET}) Yes – this Pi also drives one carousel and opens the PAX-Setup hotspot if the"
+  tty_say "          router disappears."
+  DEFAULT_KIND=1
+  [[ "$OLD_ROLE" == "master" ]] && DEFAULT_KIND=2
+  case "$(ask "Choose" "$DEFAULT_KIND")" in
+    1|n|no|server) ROLE=server ;;
+    2|y|yes|carousel) ROLE=master ;;
+    *) die "answer 1 or 2" ;;
+  esac
+fi
+[[ "$ROLE" == "app" || "$ROLE" == "server" || "$ROLE" == "master" || "$ROLE" == "slave" ]] \
+  || die "--role must be server, master or slave"
 
 if [[ "$ROLE" != "slave" && "$MODEL" == *"Zero"* ]]; then
-  warn "a Pi Zero cannot build or comfortably serve the web app; the web app belongs on a Pi 4/5"
+  warn "a Pi Zero cannot build or comfortably serve the web app; the web app belongs on a Pi 4/5 or a PC"
 fi
 
-HAS_APP=0; HAS_AGENT=0
-[[ "$ROLE" == "app" || "$ROLE" == "master" ]] && HAS_APP=1
-[[ "$ROLE" == "master" || "$ROLE" == "slave" ]] && HAS_AGENT=1
+# HAS_AGENT: runs the agent (slave sign-in / networking). HAS_CAROUSEL: has motors.
+HAS_APP=0; HAS_AGENT=0; HAS_CAROUSEL=0
+[[ "$ROLE" == "app" || "$ROLE" == "server" || "$ROLE" == "master" ]] && HAS_APP=1
+[[ "$ROLE" == "server" || "$ROLE" == "master" || "$ROLE" == "slave" ]] && HAS_AGENT=1
+[[ "$ROLE" == "master" || "$ROLE" == "slave" ]] && HAS_CAROUSEL=1
+if [[ "$ROLE" == "server" || "$ROLE" == "app" ]]; then
+  MOTOR=""; PULSE_DRIVE=""; SERVO_DRIVER=""; ESP32_LINK=""; ESP32_HOST=""; SHELVES=""
+fi
 
 # --------------------------------------------------------------------------
 # Question 2: motors (carousel roles only)
@@ -329,7 +369,7 @@ if [[ -n "$PULSE_DRIVE" ]]; then
   [[ "$MOTOR" == "dc" ]] && die "--pulse-drive needs --motor servo"
   MOTOR=servo
 fi
-if [[ $HAS_AGENT -eq 1 && -z "$MOTOR" ]]; then
+if [[ $HAS_CAROUSEL -eq 1 && -z "$MOTOR" ]]; then
   tty_say ""
   tty_say "Which motors turn this carousel?"
   tty_say "  ${BOLD}1${RESET}) Integrated servos    – iSV57T or similar, drive built into the motor, pulsed from this Pi"
@@ -349,14 +389,14 @@ if [[ $HAS_AGENT -eq 1 && -z "$MOTOR" ]]; then
     *) die "answer 1, 2, 3 or 4" ;;
   esac
 fi
-if [[ $HAS_AGENT -eq 1 ]]; then
+if [[ $HAS_CAROUSEL -eq 1 ]]; then
   [[ "$MOTOR" == "servo" || "$MOTOR" == "dc" ]] || die "--motor must be servo or dc"
 fi
 
 # Who makes the step pulses. Separate drives (closed-loop stepper, AC servo)
 # need an ESP32 running pi-agent/esp32-servo; integrated servos are pulsed
 # from the Pi header unless told otherwise.
-if [[ $HAS_AGENT -eq 1 && "$MOTOR" == "servo" && "${DRIVE_ASKED:-0}" -eq 0 ]]; then
+if [[ $HAS_CAROUSEL -eq 1 && "$MOTOR" == "servo" && "${DRIVE_ASKED:-0}" -eq 0 ]]; then
   if [[ -z "$SERVO_DRIVER" ]]; then
     if [[ -n "$ESP32_LINK" || ( -n "$PULSE_DRIVE" && "$PULSE_DRIVE" != "integrated-servo" ) ]]; then
       SERVO_DRIVER=esp32
@@ -391,13 +431,24 @@ fi
 # --------------------------------------------------------------------------
 # Question 3: shelves, and for a slave its number + master hotspot password
 # --------------------------------------------------------------------------
-if [[ $HAS_AGENT -eq 1 ]]; then
+if [[ $HAS_CAROUSEL -eq 1 ]]; then
   SHELVES="${SHELVES:-$(ask "How many shelves does this carousel have?" "${OLD_SHELVES:-9}")}"
   [[ "$SHELVES" =~ ^[0-9]+$ && "$SHELVES" -ge 2 ]] || die "shelves must be a number (2 or more)"
 fi
 
 CUR_HOST="$(hostname 2>/dev/null || cat /etc/hostname 2>/dev/null || echo raspberrypi)"
-if [[ "$ROLE" == "app" ]]; then
+if [[ "$ROLE" == "server" ]]; then
+  # Slaves default to looking for pax-master.local, so offer that name. A PC
+  # being renamed is a real change, hence the question; updates keep it.
+  if [[ "$ACTION" == "update" && -n "$OLD_HOSTNAME" ]]; then
+    HOSTNAME_NEW="$OLD_HOSTNAME"
+  else
+    HOSTNAME_NEW="$(ask "Hostname for this server (slaves find it as <name>.local)" "${OLD_HOSTNAME:-pax-master}")"
+  fi
+  [[ "$HOSTNAME_NEW" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]] \
+    || die "hostname must be lowercase letters, digits and dashes (e.g. pax-master)"
+  UNIT_NAME=""
+elif [[ "$ROLE" == "app" ]]; then
   HOSTNAME_NEW="${OLD_HOSTNAME:-pax}"
   [[ "$CUR_HOST" != "raspberrypi" && -n "$CUR_HOST" ]] && HOSTNAME_NEW="$CUR_HOST"
   UNIT_NAME=""
@@ -418,8 +469,9 @@ else
   UNIT_NAME="Paternoster $((NUMBER + 1))"
   MASTER_HOST="${MASTER_HOST:-$(ask "Master hostname" "${OLD_MASTER:-pax-master.local}")}"
   if [[ -z "$AP_PSK" && $ASSUME_YES -eq 0 && "$ACTION" != "update" && "$ACTION" != "change-motor" ]]; then
-    tty_say "${DIM}The master printed a hotspot password when it was installed. Enter it so this slave"
-    tty_say "can always find the master, or press Enter to skip if both Pis are on the same Wi-Fi now.${RESET}"
+    tty_say "${DIM}A MASTER + CAROUSEL printed a hotspot password when it was installed. Enter it so this"
+    tty_say "slave can always find the master. Press Enter to skip if the master is a SERVER (it has"
+    tty_say "no hotspot) or if both are on the same Wi-Fi now.${RESET}"
     AP_PSK="$(ask_secret "Master hotspot password (optional)")"
   fi
   if [[ -n "$AP_PSK" && -z "$AP_SSID" ]]; then
@@ -430,7 +482,7 @@ fi
 printf '\n'
 SUMMARY="$(role_label "$ROLE")"
 MOTOR_TEXT="$(motor_label "$MOTOR" "$PULSE_DRIVE" "$SERVO_DRIVER" "$ESP32_LINK")"
-[[ $HAS_AGENT -eq 1 ]] && SUMMARY="$SUMMARY — $MOTOR_TEXT, $SHELVES shelves"
+[[ $HAS_CAROUSEL -eq 1 ]] && SUMMARY="$SUMMARY — $MOTOR_TEXT, $SHELVES shelves"
 say "Installing: ${BOLD}$SUMMARY${RESET}"
 note "hostname $HOSTNAME_NEW.local"
 [[ "$ACTION" == "add-hardware" ]] && note "your existing filament data stays exactly as it is"
@@ -675,7 +727,12 @@ fi
 # --------------------------------------------------------------------------
 # Carousel agent + networking (master and slave; delegates to pi-agent/install.sh)
 # --------------------------------------------------------------------------
-if [[ $HAS_AGENT -eq 1 ]]; then
+if [[ "$ROLE" == "server" ]]; then
+  say "Installing the master service (slave sign-in + Wi-Fi provisioning, no carousel)"
+  chmod +x "$APP_DIR/pi-agent/install.sh"
+  SUDO_USER="$RUN_USER" "$APP_DIR/pi-agent/install.sh" --server --hostname "$HOSTNAME_NEW" --name "PAX server" --port "$AGENT_PORT" \
+    | grep -vE '^\[install\] (installing|detected|added|wrote|service is running|verify GPIO|           journalctl)' || die "master service installation failed"
+elif [[ $HAS_AGENT -eq 1 ]]; then
   say "Installing the carousel agent ($MOTOR_TEXT) and network manager"
   AGENT_ARGS=(--role "$ROLE" --hostname "$HOSTNAME_NEW" --name "$UNIT_NAME" --shelves "$SHELVES" --port "$AGENT_PORT" --motor "$MOTOR")
   [[ -n "$PULSE_DRIVE" ]] && AGENT_ARGS+=(--pulse-drive "$PULSE_DRIVE")
@@ -726,18 +783,24 @@ if [[ $HAS_APP -eq 1 ]]; then
     printf '%s\n' "${GREEN}${BOLD}Done.${RESET} Open the app from any device on the same Wi-Fi:"
     printf '\n    %s\n' "${BOLD}$URL${RESET}"
     [[ -n "$IP" ]] && printf '    %s\n' "${DIM}or http://$IP${APP_PORT/#80/}${RESET}"
-    if [[ "$ROLE" == "master" ]]; then
+    if [[ "$ROLE" == "server" ]]; then
+      printf '\n%s\n' "This is the MASTER (server). No carousel is driven from here and its network is untouched."
+      printf '%s\n' "Install each carousel as a SLAVE: run this same command on it, answer 2, and give"
+      printf '%s\n' "${BOLD}$HOSTNAME_NEW.local${RESET} as the master hostname. Then link it in the app as"
+      printf '%s\n' "${BOLD}pax-slave-1.local${RESET} (port $AGENT_PORT), …"
+      printf '%s\n' "${DIM}Slaves appear under Settings → Network → Slave units; Wi-Fi changes are pushed to them.${RESET}"
+    elif [[ "$ROLE" == "master" ]]; then
       printf '\n%s\n' "In the app, under Settings → Storage units, set the master paternoster's address to"
       printf '%s\n' "${BOLD}127.0.0.1${RESET} (this Pi drives its own carousel) and pick ${BOLD}$MOTOR_TEXT${RESET}"
       printf '%s\n' "under Motor drive. Link slaves as ${BOLD}pax-slave-1.local${RESET}, …"
       printf '%s\n' "${DIM}A slave can also be an ESP32 with no Pi at all: see esp32-agent/README.md.${RESET}"
       printf '\n%s\n' "Write down the hotspot password printed above. If the Wi-Fi ever disappears, this Pi"
       printf '%s\n' "opens that hotspot and the app is at ${BOLD}http://10.42.0.1${RESET}."
-      printf '\n%s\n' "${DIM}Install a slave: run this same command on it and answer 3.${RESET}"
+      printf '\n%s\n' "${DIM}Install a slave: run this same command on it and answer 2.${RESET}"
     else
       printf '\n%s\n' "This Pi only runs the filament manager — no motors are driven from here."
       printf '%s\n' "${DIM}Want it to control a paternoster later? Run this same command again and choose"
-      printf '%s\n' "\"Add carousel control\". Everything you have entered is kept.${RESET}"
+      printf '%s\n' "\"Make this the MASTER\". Everything you have entered is kept.${RESET}"
     fi
   else
     warn "the web app did not start. Log:"
@@ -750,7 +813,7 @@ else
   printf '%s\n' "Link it in the app as ${BOLD}$HOSTNAME_NEW.local${RESET} (port $AGENT_PORT) and pick"
   printf '%s\n' "${BOLD}$MOTOR_TEXT${RESET} under Motor drive for that unit."
 fi
-if [[ $HAS_AGENT -eq 1 && "$SERVO_DRIVER" == "esp32" ]]; then
+if [[ $HAS_CAROUSEL -eq 1 && "$SERVO_DRIVER" == "esp32" ]]; then
   printf '\n%s\n' "${BOLD}ESP32 motor controller:${RESET} flash pi-agent/esp32-servo onto the ESP32 if you have not yet,"
   printf '%s\n' "and wire the drives and both sensors to the ESP32, not to this Pi (pi-agent/esp32-servo/README.md)."
   [[ "$ESP32_LINK" == "uart" ]] && printf '%s\n' "${YELLOW}Reboot this Pi once${RESET} so the UART on GPIO14/15 is free for the ESP32:  sudo reboot"
