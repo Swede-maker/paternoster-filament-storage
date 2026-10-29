@@ -10,6 +10,7 @@ import { nfcSupported, scanNfcOnce } from "@/lib/nfc"
 import { parseScan } from "@/lib/tags"
 import { useStore } from "@/lib/store"
 import { useReaders } from "@/lib/use-reader"
+import { PhotoScanButton } from "./photo-scan-button"
 
 function cameraSupported(): boolean {
   if (typeof window === "undefined" || typeof navigator === "undefined") return false
@@ -27,15 +28,20 @@ export function TagScanner({
   open,
   title = "Scan a tag",
   description = "Tap an RFID tag, or point the camera at a QR code.",
+  mode = "any",
   onScan,
   onClose,
 }: {
   open: boolean
   title?: string
   description?: string
+  /** "qr" = camera only, "nfc" = phone NFC + wireless readers only, "any" = all. */
+  mode?: "qr" | "nfc" | "any"
   onScan: (id: string) => void
   onClose: () => void
 }) {
+  const useCamera = mode !== "nfc"
+  const useNfc = mode !== "qr"
   const videoRef = useRef<HTMLVideoElement>(null)
   const manualRef = useRef<HTMLInputElement>(null)
   const [manual, setManual] = useState("")
@@ -64,12 +70,21 @@ export function TagScanner({
   // We subscribe only while the dialog is open.
   const { state } = useStore()
   const readerTokens = (state.settings.readers ?? []).map((r) => r.token)
-  const { anyOnline: readerOnline } = useReaders(readerTokens, (uid) => fire(uid), open)
+  const { anyOnline: readerOnline } = useReaders(readerTokens, (uid) => fire(uid), open && useNfc)
+
+  useEffect(() => {
+    if (!open) return
+    firedRef.current = false
+    setManual("")
+  }, [open, mode])
 
   // --- NFC path ---
   useEffect(() => {
-    if (!open) return
-    if (!nfcSupported()) return
+    if (!open || !useNfc) return
+    if (!nfcSupported()) {
+      setTimeout(() => manualRef.current?.focus(), 50)
+      return
+    }
     const controller = new AbortController()
     setNfcOn(true)
     setNfcError(null)
@@ -81,26 +96,27 @@ export function TagScanner({
         setNfcError(
           name === "NotAllowedError"
             ? "NFC permission denied. Allow it, then reopen the scanner."
-            : "Couldn't start NFC. Use the QR camera or type the id below.",
+            : "Couldn't start NFC. Use a wireless reader or type the id below.",
         )
         setNfcOn(false)
       })
-    return () => controller.abort()
+    return () => {
+      controller.abort()
+      setNfcOn(false)
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open])
+  }, [open, useNfc])
 
   // --- Camera QR path ---
   useEffect(() => {
-    if (!open) return
-    firedRef.current = false
-    setManual("")
+    if (!open || !useCamera) return
     const ok = cameraSupported()
     setCamAvailable(ok)
     if (!ok) {
       setCamStarting(false)
       setCamError(
         typeof window !== "undefined" && !window.isSecureContext
-          ? "The camera needs a secure (https://) connection. Type the id below instead."
+          ? "Live camera preview needs https://, so take a photo of the QR code instead, or type the id below."
           : "No camera on this device. Type the id below instead.",
       )
       setTimeout(() => manualRef.current?.focus(), 50)
@@ -144,7 +160,10 @@ export function TagScanner({
       }
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open])
+  }, [open, useCamera])
+
+  const phoneNfc = nfcSupported()
+  const noNfcPath = mode === "nfc" && !phoneNfc && readerTokens.length === 0
 
   function submitManual() {
     const code = manual.trim()
@@ -153,12 +172,16 @@ export function TagScanner({
 
   return (
     <Dialog open={open} onClose={onClose}>
-      <DialogHeader icon={<QrCodeIcon className="h-5 w-5" />} title={title} description={description} />
+      <DialogHeader
+        icon={mode === "nfc" ? <Nfc className="h-5 w-5" /> : <QrCodeIcon className="h-5 w-5" />}
+        title={title}
+        description={description}
+      />
       <DialogBody>
         {/* Wireless reader banner — shown whenever a reader is paired. This is
             the path that lets iPhones scan RFID: the hardware reader sends the
             tag here and the app fires on it. */}
-        {readerTokens.length > 0 && (
+        {useNfc && readerTokens.length > 0 && (
           <div
             className={`mb-3 flex items-center gap-2 rounded-xl border px-3 py-2.5 text-sm ${
               readerOnline
@@ -180,7 +203,17 @@ export function TagScanner({
         )}
 
         {/* NFC status banner — only where Web NFC exists. */}
-        {nfcSupported() && (
+        {noNfcPath && (
+          <div className="mb-3 flex items-start gap-2 rounded-xl border border-border bg-secondary/50 px-3 py-2.5 text-sm text-muted-foreground">
+            <Nfc className="mt-0.5 h-4 w-4 shrink-0" />
+            <span className="text-pretty">
+              This device can&apos;t read NFC in the browser (only Android Chrome can), and no wireless reader is
+              paired. Pair one under Settings → RFID / QR tags, or type the tag id below.
+            </span>
+          </div>
+        )}
+
+        {useNfc && phoneNfc && (
           <div className="mb-3 flex items-center gap-2 rounded-xl border border-primary/40 bg-primary/10 px-3 py-2.5 text-sm text-foreground">
             {nfcOn ? <Radio className="h-4 w-4 shrink-0 animate-pulse text-primary" /> : <Nfc className="h-4 w-4 shrink-0 text-primary" />}
             <span className="text-pretty">
@@ -189,7 +222,7 @@ export function TagScanner({
           </div>
         )}
 
-        {camAvailable && (
+        {useCamera && camAvailable && (
           <div className="relative aspect-square w-full overflow-hidden rounded-xl border border-border bg-black">
             {/* eslint-disable-next-line jsx-a11y/media-has-caption */}
             <video ref={videoRef} className="h-full w-full object-cover" playsInline muted autoPlay />
@@ -203,7 +236,12 @@ export function TagScanner({
             )}
           </div>
         )}
-        {camError && <p className="mt-3 text-sm text-muted-foreground text-pretty">{camError}</p>}
+        {useCamera && camError && <p className="mt-3 text-sm text-muted-foreground text-pretty">{camError}</p>}
+        {useCamera && (!camAvailable || camError) && (
+          <div className="mt-3">
+            <PhotoScanButton onDetected={fire} label="Take a photo of the QR code" />
+          </div>
+        )}
 
         <div className="mt-4 space-y-2">
           <label className="flex items-center gap-1.5 text-xs font-medium text-muted-foreground">

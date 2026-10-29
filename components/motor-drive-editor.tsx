@@ -68,6 +68,7 @@ const HOLD_PRESETS: { value: number; label: string }[] = [
 export function MotorDriveEditor({ node }: { node: StorageNode }) {
   const { dispatch } = useStore()
   const mode = node.motorMode ?? "dc"
+  const homeIndexOnly = mode === "servo" && node.positionMode === "index"
   const busy = node.machine.status === "homing" || node.machine.status === "moving"
   const ppr = servoPulsesPerRevFor(node)
   const maxPps = servoMaxPpsFor(node)
@@ -289,6 +290,8 @@ export function MotorDriveEditor({ node }: { node: StorageNode }) {
         </div>
       )}
 
+      {!homeIndexOnly && (
+      <>
       <div className="mt-3">
         <Field label="Safe move time" htmlFor={`arm-${node.id}`}>
           <div className="flex items-start gap-2">
@@ -375,6 +378,8 @@ export function MotorDriveEditor({ node }: { node: StorageNode }) {
           </p>
         </Field>
       </div>
+      </>
+      )}
 
       <div className="mt-3">
         <Field label="Homing time" htmlFor={`home-timeout-${node.id}`}>

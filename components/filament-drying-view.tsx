@@ -1,10 +1,15 @@
 "use client"
 
-import { useMemo } from "react"
-import { Droplets, AlertTriangle, RotateCcw, X, CalendarClock } from "lucide-react"
+import { useEffect, useMemo, useState } from "react"
+import { Droplets, AlertTriangle, RotateCcw, X, CalendarClock, Plus, Flame } from "lucide-react"
 import { useStore } from "@/lib/store"
 import { reminderDueAt, isReminderDue } from "@/lib/selectors"
-import type { Spool } from "@/lib/types"
+import { getDryers } from "@/lib/dryers"
+import type { Dryer, Spool } from "@/lib/types"
+import { useFlow } from "./flow-controller"
+import { DryerCard } from "./dryer-card"
+import { DryerEditorDialog } from "./dryer-editor-dialog"
+import { SendToDryerDialog } from "./send-to-dryer-dialog"
 import { SpoolDisc, discColor2 } from "./spool"
 import { spoolFill } from "@/lib/filament"
 import { Button } from "./ui/button"
@@ -20,6 +25,7 @@ const DAY_MS = 86_400_000
  */
 export function FilamentDryingView() {
   const { state, dispatch } = useStore()
+  const clock = useClock(30_000)
   const now = Date.now()
   const spools = state.spools
 
@@ -52,6 +58,12 @@ export function FilamentDryingView() {
           countdown once you&apos;ve dried it.
         </p>
       </header>
+
+      <DryersSection now={clock} />
+
+      <div className="mb-3 flex items-center gap-2">
+        <h2 className="text-lg font-semibold text-foreground">Dry reminders</h2>
+      </div>
 
       {total === 0 ? (
         <div className="flex flex-col items-center justify-center gap-3 rounded-2xl border border-dashed border-border py-16 text-center">
@@ -95,6 +107,76 @@ export function FilamentDryingView() {
         </>
       )}
     </div>
+  )
+}
+
+function useClock(intervalMs: number) {
+  const [now, setNow] = useState(() => Date.now())
+  useEffect(() => {
+    const id = setInterval(() => setNow(Date.now()), intervalMs)
+    return () => clearInterval(id)
+  }, [intervalMs])
+  return now
+}
+
+/** Your filament dryers: capacity, what's inside, and each chamber's timer light. */
+function DryersSection({ now }: { now: number }) {
+  const { state } = useStore()
+  const { outItems } = useFlow()
+  const dryers = getDryers(state)
+  const [editing, setEditing] = useState<Dryer | "new" | null>(null)
+  const [sending, setSending] = useState(false)
+  const queuedForDryers = outItems.filter((i) => i.dryerId).length
+
+  return (
+    <section aria-label="Dryers" className="mb-8">
+      <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+        <h2 className="text-lg font-semibold text-foreground">Dryers</h2>
+        <div className="flex gap-2">
+          <Button size="sm" variant="outline" onClick={() => setEditing("new")} className="gap-1.5">
+            <Plus className="h-4 w-4" />
+            Add dryer
+          </Button>
+          {dryers.length > 0 && (
+            <Button size="sm" onClick={() => setSending(true)} className="gap-1.5">
+              <Flame className="h-4 w-4" />
+              Send spools to dryer
+            </Button>
+          )}
+        </div>
+      </div>
+
+      {queuedForDryers > 0 && (
+        <p className="mb-3 rounded-lg border border-info/40 bg-info/10 px-3 py-2 text-sm text-foreground">
+          {queuedForDryers} spool{queuedForDryers === 1 ? "" : "s"} queued for drying. Go to the{" "}
+          <span className="font-semibold">Home</span> tab and press Start — PAX picks them all out first, then tells
+          you which dryer each one goes in.
+        </p>
+      )}
+
+      {dryers.length === 0 ? (
+        <div className="flex flex-col items-center gap-2 rounded-2xl border border-dashed border-border py-10 text-center">
+          <Flame className="h-7 w-7 text-muted-foreground" />
+          <p className="text-sm font-medium text-foreground">No dryers added</p>
+          <p className="max-w-xs text-pretty text-xs text-muted-foreground">
+            Add your filament dryers to queue spools straight from storage into them.
+          </p>
+        </div>
+      ) : (
+        <div className="grid gap-3 md:grid-cols-2">
+          {dryers.map((d) => (
+            <DryerCard key={d.id} dryer={d} now={now} onEdit={() => setEditing(d)} />
+          ))}
+        </div>
+      )}
+
+      <DryerEditorDialog
+        open={editing !== null}
+        onClose={() => setEditing(null)}
+        dryer={editing && editing !== "new" ? editing : undefined}
+      />
+      <SendToDryerDialog open={sending} onClose={() => setSending(false)} />
+    </section>
   )
 }
 

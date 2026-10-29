@@ -10,6 +10,7 @@ import {
   activeNode,
   nodesForSystem,
   getHardwareStats,
+  getNodeStats,
   isPartLow,
   shelfLabel,
   storedParts,
@@ -70,6 +71,7 @@ export function HardwareHomeView() {
   }
 
   const stats = getHardwareStats(state)
+  const unitStats = getNodeStats(state, node)
   const type = node.type ?? "paternoster"
   const isManual = type === "shelf" || type === "library"
 
@@ -194,8 +196,20 @@ export function HardwareHomeView() {
           )}
         </div>
         <div className="grid grid-cols-3 gap-2 lg:flex lg:gap-3">
-          <StatTile label="Empty Slots" value={String(stats.emptySlots)} total={String(stats.totalSlots)} accent="text-success" />
-          <StatTile label="Used Slots" value={String(stats.usedSlots)} total={String(stats.totalSlots)} accent="text-primary" />
+          <StatTile
+            label={`Empty · ${node.name}`}
+            value={String(unitStats.emptySlots)}
+            total={String(unitStats.totalSlots)}
+            accent="text-success"
+            footnote={`All ${stats.emptySlots}/${stats.totalSlots}`}
+          />
+          <StatTile
+            label={`Used · ${node.name}`}
+            value={String(unitStats.usedSlots)}
+            total={String(unitStats.totalSlots)}
+            accent="text-primary"
+            footnote={`All ${stats.usedSlots}/${stats.totalSlots}`}
+          />
           <StatTile
             label="Total Weight"
             value={formatGrams(stats.totalGrams)}
@@ -384,21 +398,26 @@ function StatTile({
   total,
   accent,
   icon,
+  footnote,
 }: {
   label: string
   value: string
   total?: string
   accent: string
   icon?: React.ReactNode
+  footnote?: string
 }) {
   return (
     <div className="flex min-w-0 flex-col justify-center rounded-xl border border-border bg-card px-3 py-2.5 lg:min-w-[7rem] lg:px-4">
-      <span className="truncate text-[11px] uppercase tracking-wider text-muted-foreground">{label}</span>
+      <span className="line-clamp-2 break-words text-[11px] uppercase leading-tight tracking-wider text-muted-foreground">{label}</span>
       <span className="mt-0.5 flex items-baseline gap-1 font-mono">
         {icon}
         <span className={`text-xl font-bold lg:text-2xl ${accent}`}>{value}</span>
         {total && <span className="text-sm text-muted-foreground">/ {total}</span>}
       </span>
+      {footnote && (
+        <span className="mt-0.5 truncate font-mono text-[11px] text-muted-foreground">{footnote}</span>
+      )}
     </div>
   )
 }

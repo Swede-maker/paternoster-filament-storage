@@ -559,9 +559,9 @@ export function HomeView() {
           setSlotTarget(null)
           beginLoad(spool, loc)
         }}
-        onTakeOut={(spool, loc) => {
+        onTakeOut={(spool, loc, deleteAfter) => {
           setSlotTarget(null)
-          flow.startRetrieve(spool, loc)
+          flow.startRetrieve(spool, loc, { deleteAfter })
         }}
         onMove={(spool, loc, destNodeId) => {
           setSlotTarget(null)

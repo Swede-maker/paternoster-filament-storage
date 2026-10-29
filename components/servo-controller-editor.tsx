@@ -83,12 +83,17 @@ export function ServoControllerEditor({ node, disabled = false }: { node: Storag
               }${typeof live.esp32Rssi === "number" && live.esp32Rssi !== 0 ? ` ${live.esp32Rssi} dBm` : ""}`
             : (live.port ?? "serial")
         pill = { tone: "ok", text: `ESP32 linked · ${where}${live.esp32Firmware ? ` · fw ${live.esp32Firmware}` : ""}${drive}` }
-      } else pill = { tone: "warn", text: link === "wifi" ? "ESP32 not reachable over Wi-Fi" : "ESP32 not answering" }
+      } else {
+        const via = link === "wifi" ? "Wi-Fi" : link === "uart" ? "UART" : "USB"
+        pill = { tone: "muted", text: `ESP32 · ${via} · ${profile.short}` }
+      }
     } else if (agentDriver === "esp32") {
       pill = { tone: "warn", text: "agent: switching to Pi GPIO…" }
     } else {
       pill = { tone: "muted", text: "Pi GPIO" }
     }
+  } else if (node.driver === "hardware" && driver === "esp32") {
+    pill = { tone: "warn", text: "ESP32 not answering · no connection to Pi agent" }
   }
 
   return (

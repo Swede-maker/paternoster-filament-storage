@@ -23,10 +23,12 @@ import {
   formatGrams,
   nozzleTempFor,
   densityFor,
+  isBuiltInMaterial,
   newId,
   DEFAULT_DIAMETER,
+  type MaterialDefaults,
 } from "@/lib/filament"
-import type { FilamentMaterial } from "@/lib/types"
+import type { FilamentMaterial, Spool } from "@/lib/types"
 
 export interface SpoolDraft {
   material: FilamentMaterial
@@ -73,6 +75,25 @@ export function draftToSpoolFields(draft: SpoolDraft, index = 0): Omit<SpoolDraf
   const { quantity: _q, tagIds, ...rest } = draft
   const tagId = tagIds?.[index]
   return tagId ? { ...rest, tagId } : rest
+}
+
+/** Prefill a form draft from an existing spool (edit flows). */
+export function spoolToDraft(spool: Spool): SpoolDraft {
+  return {
+    material: spool.material,
+    brand: spool.brand,
+    color: spool.color,
+    color2: spool.color2,
+    dualColor: spool.dualColor,
+    colorName: spool.colorName,
+    grams: Math.round(spool.grams),
+    capacity: Math.round(spool.capacity ?? spool.grams),
+    nozzleTemp: spool.nozzleTemp,
+    containerId: spool.containerId,
+    density: spool.density,
+    diameter: spool.diameter,
+    barcode: spool.barcode,
+  }
 }
 
 export function emptyDraft(defaultGrams = 1000, defaultDiameter = DEFAULT_DIAMETER): SpoolDraft {
@@ -173,14 +194,33 @@ export function NumField({
  * hasn't hand-tuned it (current temp still matches the old material's preset,
  * or is empty). This keeps a manual override sticky across material edits.
  */
-function withMaterial(value: SpoolDraft, material: FilamentMaterial): Partial<SpoolDraft> {
-  const tempUntouched = value.nozzleTemp == null || value.nozzleTemp === nozzleTempFor(value.material)
+function withMaterial(
+  value: SpoolDraft,
+  material: FilamentMaterial,
+  overrides?: MaterialDefaults,
+): Partial<SpoolDraft> {
+  const tempUntouched =
+    value.nozzleTemp == null || value.nozzleTemp === nozzleTempFor(value.material, overrides)
   // Re-suggest density unless the user hand-tuned it away from the old default.
-  const densityUntouched = value.density == null || value.density === densityFor(value.material)
+  const densityUntouched = value.density == null || value.density === densityFor(value.material, overrides)
   const patch: Partial<SpoolDraft> = { material }
-  if (tempUntouched) patch.nozzleTemp = nozzleTempFor(material)
-  if (densityUntouched) patch.density = densityFor(material)
+  if (tempUntouched) patch.nozzleTemp = nozzleTempFor(material, overrides)
+  if (densityUntouched) patch.density = densityFor(material, overrides)
   return patch
+}
+
+/** Small inline action that saves the field's value as this material's default. */
+function SetDefaultButton({ material, onClick }: { material: string; onClick: () => void }) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className="mt-1.5 inline-flex items-center gap-1.5 rounded-md border border-primary/40 bg-primary/10 px-2 py-1 text-xs font-medium text-primary transition-colors hover:bg-primary/20 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+    >
+      <Save className="size-3.5" aria-hidden="true" />
+      Set as default for {material}
+    </button>
+  )
 }
 
 /**
@@ -319,6 +359,13 @@ export function SpoolForm({
   const barcodes = state.settings.barcodes ?? []
   const customColors = state.settings.customColors ?? []
   const defaultDiameter = state.settings.defaultDiameter ?? DEFAULT_DIAMETER
+  const materialDefaults = state.settings.materialDefaults
+  const materialName = (value.material ?? "").trim()
+  const isCustomMaterial = materialName !== "" && !isBuiltInMaterial(materialName)
+  const tempDefault = nozzleTempFor(materialName, materialDefaults)
+  const densityDefault = densityFor(materialName, materialDefaults)
+  const canSetTempDefault = isCustomMaterial && value.nozzleTemp != null && value.nozzleTemp !== tempDefault
+  const canSetDensityDefault = isCustomMaterial && value.density != null && value.density !== densityDefault
 
   const [scannerOpen, setScannerOpen] = useState(false)
   const [scanNote, setScanNote] = useState<string | null>(null)
@@ -340,7 +387,7 @@ export function SpoolForm({
       capacity: p.capacity,
       grams: p.capacity,
       nozzleTemp: p.nozzleTemp,
-      density: p.density ?? densityFor(p.material),
+      density: p.density ?? densityFor(p.material, materialDefaults),
       diameter: p.diameter ?? defaultDiameter,
       containerId: p.containerId,
     })
@@ -483,11 +530,11 @@ export function SpoolForm({
         <Field label="Material / type">
           <PresetCombobox
             value={value.material}
-            onChange={(v) => set(withMaterial(value, v))}
+            onChange={(v) => set(withMaterial(value, v, materialDefaults))}
             options={materials}
             onSaveNew={(v) => {
               dispatch({ type: "ADD_PRESET", kind: "material", value: v })
-              set(withMaterial(value, v))
+              set(withMaterial(value, v, materialDefaults))
             }}
             placeholder="e.g. PLA or your own"
             ariaLabel="Material or type"
@@ -708,7 +755,7 @@ export function SpoolForm({
             min={0}
             max={350}
             ariaLabel="Nozzle temperature"
-            placeholder={`e.g. ${nozzleTempFor(value.material)}`}
+            placeholder={`e.g. ${tempDefault}`}
             onValue={(n) => set({ nozzleTemp: n == null ? undefined : n })}
           />
           <span className="text-sm text-muted-foreground">°C</span>
@@ -716,6 +763,14 @@ export function SpoolForm({
         <p className="mt-1 text-xs text-muted-foreground">
           Used to auto-preheat a Marlin/Klipper toolchanger when this spool is loaded.
         </p>
+        {canSetTempDefault && (
+          <SetDefaultButton
+            material={materialName}
+            onClick={() =>
+              dispatch({ type: "SET_MATERIAL_DEFAULT", material: materialName, nozzleTemp: value.nozzleTemp })
+            }
+          />
+        )}
       </Field>
 
       <Field label="Storage container / dry box (optional)">
@@ -758,10 +813,18 @@ export function SpoolForm({
             max={3}
             integer={false}
             ariaLabel="Density"
-            placeholder={`e.g. ${densityFor(value.material)}`}
+            placeholder={`e.g. ${densityDefault}`}
             onValue={(n) => set({ density: n == null ? undefined : n })}
           />
           <p className="mt-1 text-xs text-muted-foreground">Defaults from the material.</p>
+          {canSetDensityDefault && (
+            <SetDefaultButton
+              material={materialName}
+              onClick={() =>
+                dispatch({ type: "SET_MATERIAL_DEFAULT", material: materialName, density: value.density })
+              }
+            />
+          )}
         </Field>
       </div>
 

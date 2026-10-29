@@ -349,7 +349,7 @@ function useAmsRfidIngest(printer: Printer, bambu: BambuStatus | undefined) {
         colorName: tray.colorName || `${material} ${tray.color ?? ""}`.trim(),
         grams: Math.round((remain / 100) * capacity),
         capacity,
-        density: densityFor(material),
+        density: densityFor(material, state.settings.materialDefaults),
         rfidUid: tray.rfid,
         createdAt: Date.now(),
       }

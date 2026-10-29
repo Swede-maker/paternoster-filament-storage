@@ -6,6 +6,7 @@ import { Camera, X, Loader2, Keyboard, CornerDownLeft } from "lucide-react"
 import { Dialog, DialogHeader, DialogBody } from "./ui/dialog"
 import { Button } from "./ui/button"
 import { Input } from "./ui/field"
+import { PhotoScanButton } from "./photo-scan-button"
 
 /** True only where the browser will actually hand us a camera stream. */
 function cameraSupported(): boolean {
@@ -58,7 +59,7 @@ export function BarcodeScanner({
       setStarting(false)
       setError(
         typeof window !== "undefined" && !window.isSecureContext
-          ? "Your phone's camera only works over a secure (https://) connection. This app is open over http://, so the camera can't start — reach it via https, or just type the barcode below."
+          ? "Live camera preview needs https://, so take a photo of the barcode instead, or type it below."
           : "No camera available on this device. Type the code below instead.",
       )
       // Nothing to scan with — put the cursor straight in the manual field.
@@ -140,6 +141,11 @@ export function BarcodeScanner({
           </div>
         )}
         {error && <p className="mt-3 text-sm text-muted-foreground">{error}</p>}
+        {(!supported || error) && (
+          <div className="mt-3">
+            <PhotoScanButton onDetected={(text) => onDetectedRef.current(text)} label="Take a photo of the barcode" />
+          </div>
+        )}
 
         {/* Manual entry — always available so scanning works even without a
             usable camera (e.g. on an insecure http:// LAN address). */}

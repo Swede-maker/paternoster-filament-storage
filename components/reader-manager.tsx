@@ -48,7 +48,7 @@ export function ReaderManager() {
       </h3>
       <p className="mt-1.5 text-xs text-muted-foreground text-pretty">
         Pair an ESP32 or Raspberry Pi reader so any device — including iPhones — can scan tags. The reader sends each
-        scan to the app; press &quot;Wireless reader&quot; on the Scan tab and it appears instantly.
+        scan to the app. Press &quot;Scan a tag&quot; on the Scan tab: while that window is open, any scan from an online reader is used straight away.
       </p>
 
       {readers.length > 0 && (

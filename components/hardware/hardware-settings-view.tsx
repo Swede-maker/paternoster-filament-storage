@@ -25,6 +25,7 @@ import {
   Check,
   RotateCcw,
   Wifi,
+  ChevronDown,
 } from "lucide-react"
 import { Dialog } from "../ui/dialog"
 import { useStore } from "@/lib/store"
@@ -934,18 +935,22 @@ function Section({
   children: React.ReactNode
 }) {
   return (
-    <section
+    <details
       className={cn(
-        "space-y-3 rounded-2xl border p-4",
+        "group rounded-2xl border",
         danger ? "border-destructive/40 bg-destructive/5" : "border-border bg-panel",
       )}
     >
-      <h2 className="flex items-center gap-2 text-sm font-semibold text-foreground">
+      <summary className="flex cursor-pointer list-none items-center gap-2 rounded-2xl p-4 transition-colors hover:bg-muted/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring [&::-webkit-details-marker]:hidden">
         {icon}
-        {title}
-      </h2>
-      {children}
-    </section>
+        <h2 className="flex-1 text-sm font-semibold text-foreground">{title}</h2>
+        <ChevronDown
+          className="h-5 w-5 text-muted-foreground transition-transform group-open:rotate-180"
+          aria-hidden="true"
+        />
+      </summary>
+      <div className="flex flex-col gap-3 px-4 pb-4">{children}</div>
+    </details>
   )
 }
 

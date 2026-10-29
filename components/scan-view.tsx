@@ -69,6 +69,7 @@ export function ScanView() {
   const { state, dispatch } = useStore()
   const [view, setView] = useState<View>({ v: "home" })
   const [scan, setScan] = useState<ScanPurpose | null>(null)
+  const [scanMode, setScanMode] = useState<"qr" | "nfc">("qr")
   const [draft, setDraft] = useState<SpoolDraft>(emptyDraft())
 
   const via: TagBindingVia = nfcSupported() ? "nfc" : "qr"
@@ -151,7 +152,14 @@ export function ScanView() {
     <div className="mx-auto flex w-full max-w-2xl flex-1 flex-col px-4 py-6 sm:py-8">
       <Header />
 
-      {view.v === "home" && <HomeCard onScan={() => setScan({ kind: "primary" })} />}
+      {view.v === "home" && (
+        <HomeCard
+          onScan={(mode) => {
+            setScanMode(mode)
+            setScan({ kind: "primary" })
+          }}
+        />
+      )}
 
       {view.v === "unbound" && (
         <UnboundCard
@@ -512,11 +520,22 @@ export function ScanView() {
 
       <TagScanner
         open={scan !== null}
-        title={scan?.kind === "location-for-spool" ? "Scan a storage place" : "Scan a tag"}
+        mode={scanMode}
+        title={
+          scan?.kind === "location-for-spool"
+            ? "Scan a storage place"
+            : scanMode === "nfc"
+              ? "Scan an NFC tag"
+              : "Scan a QR code"
+        }
         description={
           scan?.kind === "location-for-spool"
-            ? "Scan the tag bound to the shelf or unit where this spool goes."
-            : "Tap an RFID tag or point the camera at a QR code."
+            ? scanMode === "nfc"
+              ? "Scan the NFC tag bound to the shelf or unit where this spool goes."
+              : "Point the camera at the QR code of the shelf or unit where this spool goes."
+            : scanMode === "nfc"
+              ? "Hold the tag against your phone or a paired wireless reader."
+              : "Point the camera at a QR code."
         }
         onScan={onScan}
         onClose={() => setScan(null)}
@@ -556,34 +575,65 @@ function Header() {
   )
 }
 
-function HomeCard({ onScan }: { onScan: () => void }) {
-  const nfc = nfcSupported()
+function HomeCard({ onScan }: { onScan: (mode: "qr" | "nfc") => void }) {
+  const { state } = useStore()
+  const phoneNfc = nfcSupported()
+  const readerCount = (state.settings.readers ?? []).length
+  const nfcHint = phoneNfc
+    ? readerCount > 0
+      ? "Phone NFC or wireless reader"
+      : "Hold the tag to your phone"
+    : readerCount > 0
+      ? "Uses your wireless reader"
+      : "Pair a wireless reader in Settings"
+
   return (
-    <div className="flex flex-1 flex-col items-center justify-center gap-6 rounded-2xl border border-border bg-card px-6 py-12 text-center">
-      <button
-        type="button"
-        onClick={onScan}
-        className="group flex h-40 w-40 flex-col items-center justify-center gap-2 rounded-full border-2 border-primary/40 bg-primary/10 text-primary transition-colors hover:bg-primary/20"
-        aria-label="Scan a tag"
-      >
-        <ScanLine className="h-14 w-14 transition-transform group-hover:scale-105" />
-        <span className="text-sm font-semibold">Scan a tag</span>
-      </button>
-      <div className="max-w-sm space-y-2 text-sm text-muted-foreground text-pretty">
-        <p>Scan an RFID tag or QR code to set up a new spool, bind a storage place, or move a spool you already tagged.</p>
-        <p className="flex items-center justify-center gap-2 text-xs">
-          {nfc ? (
-            <>
-              <Nfc className="h-3.5 w-3.5 text-primary" /> NFC + QR available on this device
-            </>
-          ) : (
-            <>
-              <QrCodeIcon className="h-3.5 w-3.5 text-primary" /> QR + manual entry available (NFC needs Android Chrome)
-            </>
-          )}
+    <div className="flex flex-1 flex-col items-center justify-center gap-8 rounded-2xl border border-border bg-card px-6 py-12 text-center">
+      <div className="flex flex-col gap-1">
+        <h2 className="text-base font-semibold text-foreground">What do you want to scan?</h2>
+        <p className="max-w-sm text-sm leading-relaxed text-muted-foreground text-pretty">
+          Set up a new spool, bind a storage place, or move a spool you already tagged.
         </p>
       </div>
+      <div className="grid w-full max-w-md grid-cols-2 gap-4">
+        <ScanChoice
+          icon={<QrCodeIcon className="h-12 w-12 transition-transform group-hover:scale-105" />}
+          label="QR code"
+          hint="Opens the camera"
+          onClick={() => onScan("qr")}
+        />
+        <ScanChoice
+          icon={<Nfc className="h-12 w-12 transition-transform group-hover:scale-105" />}
+          label="NFC tag"
+          hint={nfcHint}
+          onClick={() => onScan("nfc")}
+        />
+      </div>
     </div>
+  )
+}
+
+function ScanChoice({
+  icon,
+  label,
+  hint,
+  onClick,
+}: {
+  icon: React.ReactNode
+  label: string
+  hint: string
+  onClick: () => void
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className="group flex aspect-square flex-col items-center justify-center gap-3 rounded-2xl border-2 border-primary/40 bg-primary/10 p-4 text-primary transition-colors hover:bg-primary/20 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+    >
+      {icon}
+      <span className="text-base font-semibold">{label}</span>
+      <span className="text-xs leading-snug text-muted-foreground text-pretty">{hint}</span>
+    </button>
   )
 }
 

@@ -6,6 +6,7 @@ import {
   ArrowLeftRight,
   Boxes,
   Droplets,
+  Flame,
   HandMetal,
   ListChecks,
   MapPin,
@@ -23,8 +24,10 @@ import { spoolFill } from "@/lib/filament"
 import { Dialog, DialogHeader, DialogBody, DialogFooter } from "./ui/dialog"
 import { Button } from "./ui/button"
 import { SpoolDisc, discColor2 } from "./spool"
-import { SpoolForm, type SpoolDraft } from "./spool-form"
-import type { NodeLocation } from "./flow-controller"
+import { SpoolForm, spoolToDraft, type SpoolDraft } from "./spool-form"
+import { useFlow, type NodeLocation } from "./flow-controller"
+import { SendToDryerDialog } from "./send-to-dryer-dialog"
+import { getDryers } from "@/lib/dryers"
 import type { Spool } from "@/lib/types"
 
 export interface BulkEntry {
@@ -32,25 +35,7 @@ export interface BulkEntry {
   loc: NodeLocation
 }
 
-type View = "actions" | "move" | "dry" | "edit"
-
-function spoolToDraft(spool: Spool): SpoolDraft {
-  return {
-    material: spool.material,
-    brand: spool.brand,
-    color: spool.color,
-    color2: spool.color2,
-    dualColor: spool.dualColor,
-    colorName: spool.colorName,
-    grams: Math.round(spool.grams),
-    capacity: Math.round(spool.capacity ?? spool.grams),
-    nozzleTemp: spool.nozzleTemp,
-    containerId: spool.containerId,
-    density: spool.density,
-    diameter: spool.diameter,
-    barcode: spool.barcode,
-  }
-}
+type View = "actions" | "move" | "dry" | "edit" | "dryer"
 
 /** Fields the bulk editor may copy onto every marked spool. Identity fields
  *  (barcode, tags) stay per spool. */
@@ -87,6 +72,7 @@ export function BulkActionDialog({
   onClose: () => void
 }) {
   const { state, dispatch } = useStore()
+  const { outItems } = useFlow()
   const [view, setView] = useState<View>("actions")
   const [dryDays, setDryDays] = useState(30)
   const [initialDraft, setInitialDraft] = useState<SpoolDraft | null>(null)
@@ -122,6 +108,22 @@ export function BulkActionDialog({
   const anyReminder = entries.some((e) => e.spool.dryReminder)
   const editMismatch = editMismatchReasons(entries)
   const canEditAll = editMismatch.length === 0
+  const hasDryers = getDryers(state).length > 0
+  const queuedIds = new Set(outItems.map((i) => i.spool.id))
+  const dryable = entries.filter((e) => !queuedIds.has(e.spool.id)).map((e) => e.spool.id)
+
+  if (view === "dryer") {
+    return (
+      <SendToDryerDialog
+        open
+        preselected={dryable}
+        onClose={() => {
+          setView("actions")
+          onClose()
+        }}
+      />
+    )
+  }
 
   function setReminders() {
     for (const e of entries!) dispatch({ type: "SET_DRY_REMINDER", spoolId: e.spool.id, days: dryDays })
@@ -303,6 +305,27 @@ export function BulkActionDialog({
           <Button size="lg" variant="secondary" className="w-full justify-start" onClick={() => onTakeOut(entries)}>
             <HandMetal className="h-5 w-5" /> Take all out of storage
           </Button>
+          {hasDryers && (
+            <>
+              <Button
+                size="lg"
+                variant="secondary"
+                className="w-full justify-start"
+                disabled={dryable.length === 0}
+                onClick={() => setView("dryer")}
+              >
+                <Flame className="h-5 w-5" />
+                <span className="flex-1 text-left">Send all to dryers</span>
+              </Button>
+              {dryable.length < count && (
+                <p className="-mt-1 px-1 text-xs text-muted-foreground">
+                  {dryable.length === 0
+                    ? "All these spools are already in the queue."
+                    : `${count - dryable.length} already in the queue — only ${dryable.length} will be sent.`}
+                </p>
+              )}
+            </>
+          )}
           <Button size="lg" variant="secondary" className="w-full justify-start" onClick={() => setView("move")}>
             <ArrowLeftRight className="h-5 w-5" /> Move all to another unit
           </Button>

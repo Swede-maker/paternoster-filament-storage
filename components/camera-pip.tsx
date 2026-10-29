@@ -11,7 +11,8 @@ import { cn } from "@/lib/utils"
 const LINGER_MS = 4000
 
 /**
- * Small live webcam window pinned to the bottom-left of Home. Opens when the
+ * Small live webcam window pinned to the top-left of Home, clear of the
+ * queue tray along the bottom. Opens when the
  * user taps the Camera button, or by itself while a carousel moves (if the
  * setting is on). Closing it removes the <img>, which ends the stream and
  * lets the Pi switch the webcam off.
@@ -78,7 +79,7 @@ export function CameraPip({ node, nodes }: { node: StorageNode; nodes: StorageNo
   return (
     <section
       aria-label="Live webcam"
-      className="fixed bottom-17 left-3 z-40 flex w-72 flex-col overflow-hidden rounded-2xl border border-border bg-panel shadow-2xl sm:w-80"
+      className="fixed left-3 top-16 z-40 flex w-72 flex-col overflow-hidden rounded-2xl border border-border bg-panel shadow-2xl sm:w-80"
     >
       <header className="flex items-center gap-2 px-3 py-2">
         <span

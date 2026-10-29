@@ -1,7 +1,9 @@
 "use client"
 
 import { useState } from "react"
-import { Play, X, Plus, ChevronDown, ChevronUp, ArrowDownToLine, ArrowUpFromLine } from "lucide-react"
+import { Play, X, Plus, ChevronDown, ChevronUp, ArrowDownToLine, ArrowUpFromLine, Pencil, Trash2 } from "lucide-react"
+import { QueueEditDialog } from "./queue-edit-dialog"
+import type { Spool } from "@/lib/types"
 import { useFlow, type QueueView, type PendingItem } from "./flow-controller"
 import { useStore } from "@/lib/store"
 import { Button } from "./ui/button"
@@ -18,7 +20,9 @@ import { cn } from "@/lib/utils"
  * place-in.
  */
 export function QueueTray({ onAddMore }: { onAddMore: (view: QueueView) => void }) {
-  const { flow, inItems, outItems, view, setView, cancel, run, reassignItemNode } = useFlow()
+  const { flow, inItems, outItems, view, setView, cancel, run, reassignItemNode, updateItemSpool, removeItem } =
+    useFlow()
+  const [editing, setEditing] = useState<Spool | null>(null)
   const { state } = useStore()
   // A spool can only be redirected into a FILAMENT unit. Hardware racks share the
   // same node list but must never be offered here — a spool queued into one would
@@ -110,6 +114,8 @@ export function QueueTray({ onAddMore }: { onAddMore: (view: QueueView) => void 
                     destinationNodes={filamentNodes}
                     printers={state.printers}
                     getWhere={(item) => describeLocation(state, item)}
+                    onEdit={() => setEditing(state.spools[it.spool.id] ?? it.spool)}
+                    onRemove={() => removeItem(it.spool.id, view)}
                   />
                 ))}
               </ul>
@@ -133,6 +139,7 @@ export function QueueTray({ onAddMore }: { onAddMore: (view: QueueView) => void 
           </>
         )}
       </div>
+      <QueueEditDialog spool={editing} onClose={() => setEditing(null)} onSave={updateItemSpool} />
     </div>
   )
 }
@@ -191,7 +198,11 @@ function QueueCard({
   destinationNodes,
   printers,
   getWhere,
+  onEdit,
+  onRemove,
 }: {
+  onEdit: () => void
+  onRemove: () => void
   it: PendingItem
   index: number
   view: QueueView
@@ -220,7 +231,25 @@ function QueueCard({
         : `→ ${where}`
 
   return (
-    <li className="flex shrink-0 flex-col items-center gap-1 rounded-xl border border-border bg-background/50 p-2">
+    <li className="relative flex shrink-0 flex-col items-center gap-1 rounded-xl border border-border bg-background/50 p-2">
+      <button
+        type="button"
+        onClick={onRemove}
+        aria-label={`Remove ${it.spool.material} ${it.spool.colorName} from queue`}
+        title="Remove from queue (keeps the spool)"
+        className="absolute left-1 top-1 rounded-md p-1 text-muted-foreground transition-colors hover:bg-muted hover:text-destructive"
+      >
+        <Trash2 className="h-3.5 w-3.5" />
+      </button>
+      <button
+        type="button"
+        onClick={onEdit}
+        aria-label={`Edit ${it.spool.material} ${it.spool.colorName}`}
+        title="Edit"
+        className="absolute right-1 top-1 rounded-md p-1 text-muted-foreground transition-colors hover:bg-muted hover:text-primary"
+      >
+        <Pencil className="h-3.5 w-3.5" />
+      </button>
       <span className="font-mono text-[10px] text-muted-foreground">#{index + 1}</span>
       <SpoolDisc color={it.spool.color} color2={discColor2(it.spool)} size={44} fill={spoolFill(it.spool)} />
       <span

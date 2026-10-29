@@ -15,12 +15,16 @@ import { SpoolForm, emptyDraft, type SpoolDraft } from "./spool-form"
 export function NewSpoolDialog({
   open,
   targetLabel,
+  confirmLabel = "Load onto printer",
+  fallbackDescription = "Describe the spool. It loads straight onto the printer.",
   onClose,
   onConfirm,
 }: {
   open: boolean
   /** e.g. "Voron2.4 · Slot 1-2" — where the new spool will load. */
   targetLabel?: string
+  confirmLabel?: string
+  fallbackDescription?: string
   onClose: () => void
   onConfirm: (draft: SpoolDraft) => void
 }) {
@@ -47,7 +51,7 @@ export function NewSpoolDialog({
         description={
           targetLabel
             ? `Describe the spool. It loads straight into ${targetLabel}.`
-            : "Describe the spool. It loads straight onto the printer."
+            : fallbackDescription
         }
       />
       <DialogBody>
@@ -58,7 +62,7 @@ export function NewSpoolDialog({
           Cancel
         </Button>
         <Button onClick={submit}>
-          <PackagePlus className="h-4 w-4" /> Load onto printer
+          <PackagePlus className="h-4 w-4" /> {confirmLabel}
         </Button>
       </DialogFooter>
     </Dialog>

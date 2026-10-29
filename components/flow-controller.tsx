@@ -30,6 +30,11 @@ export interface PendingItem {
   /** printer target (pick) or source (store) */
   printerId?: string
   printerSlot?: number
+  /** dryer target (pick headed for a filament dryer) */
+  dryerId?: string
+  dryerChamberId?: string
+  /** take-out only: delete the spool record once it has been taken out */
+  deleteAfter?: boolean
   /** source storage slot to clear on confirm (set only for a move) */
   from?: NodeLocation
   /** grams override supplied while storing */
@@ -68,17 +73,29 @@ interface FlowContextValue {
   queuedStorage: (nodeId: string) => { shelf: number; slot: number }[]
   startPick: (spool: Spool, from: NodeLocation, printer: Printer, printerSlot: number) => void
   /** Retrieve a spool out of storage into the user's hand (no printer target). */
-  startRetrieve: (spool: Spool, from: NodeLocation) => void
+  startRetrieve: (spool: Spool, from: NodeLocation, opts?: { deleteAfter?: boolean }) => void
   startStore: (spool: Spool, printer: Printer, printerSlot: number, grams?: number, nodeId?: string) => void
   /** Relocate a stored spool from its slot into another storage unit. */
   startMove: (spool: Spool, from: NodeLocation, destNodeId: string) => void
   startPlace: (draft: SpoolDraft, preferredNodeId?: string) => void
+  /** Queue stored spools to be picked out and sent to a dryer chamber. */
+  startDryerPick: (entries: { spool: Spool; from: NodeLocation; dryerId: string; chamberId: string }[]) => void
+  /** Queue spools sitting in a dryer to be put back into storage. */
+  startStoreFromDryer: (spools: Spool[], nodeId?: string) => void
+  /** Spools already queued for each dryer chamber (keyed by chamber id). */
+  queuedForChamber: (chamberId: string) => number
+  /**
+   * Drop one spool from a queue without deleting it. Removing a dryer-bound
+   * pick frees its reserved dryer slot (dryer counts derive from the queue). */
+  removeItem: (spoolId: string, view: QueueView) => void
   /**
    * Redirect a queued store/place item into a different storage unit. Recomputes
    * a slot in the chosen unit (balanced for a paternoster, linear for a shelf,
    * appended for a library) while reserving the other queued placements so they
    * don't collide. Only affects in-items (out-items have no storage destination). */
   reassignItemNode: (spoolId: string, nodeId: string) => void
+  /** Edit a queued spool's details (color, material, weight…) without leaving the queue. */
+  updateItemSpool: (spoolId: string, changes: Partial<Spool>) => void
   /**
    * Manual shelf placement: immediately commit ONE queued in-item into an
    * explicit slot the user tapped — no motion, no "Start" press — and drop it
@@ -226,14 +243,23 @@ export function FlowProvider({ children }: { children: ReactNode }) {
         })
       },
 
-      startRetrieve(spool, from) {
+      startRetrieve(spool, from, opts) {
         setDraft((prev) => {
           if (prev.outItems.some((i) => i.spool.id === spool.id)) return prev
           // No printerId/printerSlot → the spool comes out to the user's hand.
           return {
             ...prev,
             view: "out",
-            outItems: [...prev.outItems, { spool, nodeId: from.nodeId, shelf: from.shelf, slot: from.slot }],
+            outItems: [
+              ...prev.outItems,
+              {
+                spool,
+                nodeId: from.nodeId,
+                shelf: from.shelf,
+                slot: from.slot,
+                ...(opts?.deleteAfter ? { deleteAfter: true } : {}),
+              },
+            ],
           }
         })
       },
@@ -300,6 +326,64 @@ export function FlowProvider({ children }: { children: ReactNode }) {
         })
       },
 
+      startDryerPick(entries) {
+        setDraft((prev) => {
+          const queued = new Set(prev.outItems.map((i) => i.spool.id))
+          const added: PendingItem[] = entries
+            .filter((e) => !queued.has(e.spool.id))
+            .map((e) => ({
+              spool: e.spool,
+              nodeId: e.from.nodeId,
+              shelf: e.from.shelf,
+              slot: e.from.slot,
+              dryerId: e.dryerId,
+              dryerChamberId: e.chamberId,
+            }))
+          if (added.length === 0) return prev
+          return { ...prev, view: "out", outItems: [...prev.outItems, ...added] }
+        })
+      },
+
+      startStoreFromDryer(spools, nodeId) {
+        setDraft((prev) => {
+          const created: PendingItem[] = []
+          for (const spool of spools) {
+            if (prev.inItems.some((i) => i.spool.id === spool.id)) continue
+            const reserved = [...prev.inItems, ...created].map((i) => ({ nodeId: i.nodeId, shelf: i.shelf, slot: i.slot }))
+            const dest = pickDestination(state, spool.grams, reserved, nodeId, spool.containerId)
+            if (!dest) break
+            // Stored from the hand; the store commit removes it from its dryer.
+            created.push({ spool, nodeId: dest.nodeId, shelf: dest.shelf, slot: dest.slot })
+          }
+          if (created.length === 0) return prev
+          return { ...prev, view: "in", inItems: [...prev.inItems, ...created] }
+        })
+      },
+
+      queuedForChamber: (chamberId: string) => outItems.filter((i) => i.dryerChamberId === chamberId).length,
+
+      removeItem(spoolId, from) {
+        const item = (from === "in" ? inItems : outItems).find((i) => i.spool.id === spoolId)
+        if (!item) return
+        // A brand-new spool that was only drafted here was never stored anywhere,
+        // so roll it back like Cancel does. Every existing spool stays untouched.
+        if (item.isNew) {
+          const placed = state.nodes.some((n) => n.slots.some((row) => row.includes(spoolId)))
+          if (!placed) dispatch({ type: "DELETE_SPOOL", id: spoolId })
+        }
+        setDraft((prev) => {
+          const next =
+            from === "in"
+              ? { ...prev, inItems: prev.inItems.filter((i) => i.spool.id !== spoolId) }
+              : { ...prev, outItems: prev.outItems.filter((i) => i.spool.id !== spoolId) }
+          if (next.inItems.length === 0 && next.outItems.length === 0) return EMPTY
+          // Jump to the other queue if this one just became empty.
+          if (from === "in" && next.inItems.length === 0) next.view = "out"
+          if (from === "out" && next.outItems.length === 0) next.view = "in"
+          return next
+        })
+      },
+
       reassignItemNode(spoolId, nodeId) {
         setDraft((prev) => {
           const item = prev.inItems.find((i) => i.spool.id === spoolId)
@@ -318,6 +402,23 @@ export function FlowProvider({ children }: { children: ReactNode }) {
             ),
           }
         })
+      },
+
+      updateItemSpool(spoolId, changes) {
+        dispatch({ type: "UPDATE_SPOOL", id: spoolId, changes })
+        // Queued items carry their own spool snapshot (and a weight override for
+        // place/store), so patch those too or the tray and Start keep stale data.
+        const patch = (list: PendingItem[]) =>
+          list.map((i) =>
+            i.spool.id === spoolId
+              ? {
+                  ...i,
+                  spool: { ...i.spool, ...changes },
+                  grams: typeof i.grams === "number" && typeof changes.grams === "number" ? changes.grams : i.grams,
+                }
+              : i,
+          )
+        setDraft((prev) => ({ ...prev, inItems: patch(prev.inItems), outItems: patch(prev.outItems) }))
       },
 
       assignItemToSlot(spoolId, nodeId, shelf, slot) {
@@ -376,6 +477,9 @@ export function FlowProvider({ children }: { children: ReactNode }) {
             slot: i.slot,
             printerId: i.printerId,
             printerSlot: i.printerSlot,
+            dryerId: i.dryerId,
+            dryerChamberId: i.dryerChamberId,
+            deleteAfter: i.deleteAfter,
             from: i.from,
             grams: i.grams,
             done: false,

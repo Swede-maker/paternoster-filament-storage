@@ -15,8 +15,14 @@ import {
 } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { useStore } from "@/lib/store"
+import { useFlow } from "./flow-controller"
 import { dueReminders, lowStockParts } from "@/lib/selectors"
 import type { TopArea } from "@/lib/types"
+import { getDryers, timerStatus } from "@/lib/dryers"
+import { useEffect, useState } from "react"
+
+type NavBadge = { count: number; tone: "warning" | "info" | "primary" }
+type NavItem = { id: NavTab; label: string; icon: typeof Home; badges?: NavBadge[] }
 
 export type NavTab =
   | "home"
@@ -56,12 +62,38 @@ export function BottomNav({
     l.lines.some((ln) => ln.picked < ln.requested),
   ).length
 
-  const filamentItems: { id: NavTab; label: string; icon: typeof Home; badge?: number; alert?: boolean }[] = [
-    { id: "home", label: "Home", icon: Home },
+  // A queue assembled from another tab only runs from Home, so flag it there.
+  const { inItems, outItems } = useFlow()
+  const queuedCount = inItems.length + outItems.length
+  // Spools picked out for a dryer wait for "They're in" on the Drying tab.
+  const dryers = getDryers(state)
+  const awaitingLoadCount = dryers.reduce((n, d) => n + (d.awaitingLoad?.length ?? 0), 0)
+  const dryingAlertCount = dueCount + awaitingLoadCount
+  // Re-check timers every 30 s so the badge appears when one finishes.
+  const [now, setNow] = useState(() => Date.now())
+  useEffect(() => {
+    const id = setInterval(() => setNow(Date.now()), 30_000)
+    return () => clearInterval(id)
+  }, [])
+  const timersDoneCount = dryers.reduce(
+    (n, d) => n + d.chambers.filter((c) => c.spoolIds.length > 0 && timerStatus(c.timer, now) === "done").length,
+    0,
+  )
+
+  const filamentItems: NavItem[] = [
+    { id: "home", label: "Home", icon: Home, badges: [{ count: queuedCount, tone: "warning" }] },
     { id: "scan", label: "Scan", icon: ScanLine },
-    { id: "orders", label: "Orders", icon: ShoppingCart, badge: orderCount || undefined },
+    { id: "orders", label: "Orders", icon: ShoppingCart, badges: [{ count: orderCount, tone: "primary" }] },
     { id: "history", label: "History", icon: History },
-    { id: "drying", label: "Filament Drying", icon: Droplets, badge: dueCount || undefined, alert: dueCount > 0 },
+    {
+      id: "drying",
+      label: "Filament Drying",
+      icon: Droplets,
+      badges: [
+        { count: dryingAlertCount, tone: "warning" },
+        { count: timersDoneCount, tone: "info" },
+      ],
+    },
     { id: "inventory", label: "All Filament In Storage", icon: Boxes },
     { id: "statistics", label: "Statistik", icon: BarChart3 },
     { id: "settings", label: "Settings", icon: Settings },
@@ -71,10 +103,10 @@ export function BottomNav({
   // becomes "All Hardware", and low-stock parts get an alert badge on it.
   const hardwareItems: typeof filamentItems = [
     { id: "home", label: "Home", icon: Home },
-    { id: "inventory", label: "All Hardware In Storage", icon: Boxes, badge: lowCount || undefined, alert: lowCount > 0 },
-    { id: "orders", label: "Orders", icon: ShoppingCart, badge: hwOrderCount || undefined },
-    { id: "locked", label: "Locked slots", icon: Lock, badge: lockedCount || undefined },
-    { id: "picking", label: "Picking lists", icon: ClipboardList, badge: openListCount || undefined },
+    { id: "inventory", label: "All Hardware In Storage", icon: Boxes, badges: [{ count: lowCount, tone: "warning" }] },
+    { id: "orders", label: "Orders", icon: ShoppingCart, badges: [{ count: hwOrderCount, tone: "primary" }] },
+    { id: "locked", label: "Locked slots", icon: Lock, badges: [{ count: lockedCount, tone: "primary" }] },
+    { id: "picking", label: "Picking lists", icon: ClipboardList, badges: [{ count: openListCount, tone: "primary" }] },
     { id: "settings", label: "Settings", icon: Settings },
   ]
 
@@ -105,8 +137,9 @@ export function BottomNav({
         className="flex flex-1 items-center justify-start gap-1 overflow-x-auto [-ms-overflow-style:none] [scrollbar-width:none] sm:justify-center [&::-webkit-scrollbar]:hidden"
         aria-label="Primary"
       >
-        {items.map(({ id, label, icon: Icon, badge, alert }) => {
+        {items.map(({ id, label, icon: Icon, badges }) => {
           const active = tab === id
+          const shown = (badges ?? []).filter((b) => b.count > 0)
           return (
             <button
               key={id}
@@ -120,14 +153,21 @@ export function BottomNav({
             >
               <span className="relative">
                 <Icon className="h-4 w-4" />
-                {badge ? (
-                  <span
-                    className={cn(
-                      "absolute -right-2 -top-2 flex h-4 min-w-4 items-center justify-center rounded-full px-1 text-[10px] font-semibold leading-none",
-                      alert ? "bg-warning text-background" : "bg-primary text-primary-foreground",
-                    )}
-                  >
-                    {badge}
+                {shown.length > 0 ? (
+                  <span className="absolute -top-2 left-2 flex items-center gap-0.5">
+                    {shown.map((b) => (
+                      <span
+                        key={b.tone}
+                        className={cn(
+                          "flex h-4 min-w-4 items-center justify-center rounded-full px-1 text-[10px] font-semibold leading-none",
+                          b.tone === "warning" && "bg-warning text-background",
+                          b.tone === "info" && "bg-info text-background",
+                          b.tone === "primary" && "bg-primary text-primary-foreground",
+                        )}
+                      >
+                        {b.count}
+                      </span>
+                    ))}
                   </span>
                 ) : null}
               </span>

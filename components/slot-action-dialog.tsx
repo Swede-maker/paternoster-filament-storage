@@ -20,7 +20,11 @@ import {
   Droplets,
   RotateCcw,
   AlertTriangle,
+  Flame,
 } from "lucide-react"
+import { getDryers } from "@/lib/dryers"
+import { useFlow } from "./flow-controller"
+import { SendToDryerDialog } from "./send-to-dryer-dialog"
 import { useStore } from "@/lib/store"
 import { activeNode, nodeSystem, shelfLabel, reminderDueAt, isReminderDue } from "@/lib/selectors"
 import { nodeFreeSlots } from "@/lib/balance"
@@ -61,22 +65,25 @@ export function SlotActionDialog({
    * spool straight off a printer. */
   fillPrinters?: Printer[]
   onLoad: (spool: Spool, loc: NodeLocation) => void
-  onTakeOut: (spool: Spool, loc: NodeLocation) => void
+  /** `deleteAfter` → the spool record is deleted once it's out, instead of landing "in hand". */
+  onTakeOut: (spool: Spool, loc: NodeLocation, deleteAfter: boolean) => void
   onMove: (spool: Spool, loc: NodeLocation, destNodeId: string) => void
   /** User picked a printer tab while filling an empty slot. */
   onPickFillPrinter?: (printer: Printer) => void
   onClose: () => void
 }) {
   const { state, dispatch } = useStore()
+  const { outItems } = useFlow()
   const node = activeNode(state)
   const open = target !== null
+  const [dryerOpen, setDryerOpen] = useState(false)
 
   const existingId = target ? node.slots[target.shelf]?.[target.slot] : null
   const existing: Spool | null = existingId ? state.spools[existingId] ?? null : null
 
   // "actions" hub, inline "edit" form, "move" destination picker, or the
   // "dry" reminder editor.
-  const [view, setView] = useState<"actions" | "edit" | "move" | "dry">("actions")
+  const [view, setView] = useState<"actions" | "edit" | "move" | "dry" | "takeout">("actions")
   // Draft day-count for a new dry reminder (defaults to 30 days).
   const [dryDays, setDryDays] = useState(30)
   const [draft, setDraft] = useState<SpoolDraft>(
@@ -158,6 +165,22 @@ export function SlotActionDialog({
       ? node.name
       : `${shelfLabel(node, target.shelf)} · Slot ${target.slot + 1}`
 
+  if (existing && dryerOpen) {
+    return (
+      <SendToDryerDialog
+        open
+        preselected={[existing.id]}
+        onClose={() => {
+          setDryerOpen(false)
+          onClose()
+        }}
+      />
+    )
+  }
+
+  const hasDryers = getDryers(state).length > 0
+  const alreadyQueued = existing ? outItems.some((i) => i.spool.id === existing.id) : false
+
   // ---- Occupied slot: action hub ----
   if (existing && view === "actions") {
     return (
@@ -178,10 +201,27 @@ export function SlotActionDialog({
               size="lg"
               variant="secondary"
               className="w-full justify-start"
-              onClick={() => onTakeOut(existing, loc)}
+              onClick={() => setView("takeout")}
             >
               <HandMetal className="h-5 w-5" /> Take out of storage
             </Button>
+            {hasDryers && (
+              <Button
+                size="lg"
+                variant="secondary"
+                className="w-full justify-start"
+                disabled={alreadyQueued}
+                onClick={() => setDryerOpen(true)}
+              >
+                <Flame className="h-5 w-5" />
+                <span className="flex-1 text-left">Send to a dryer</span>
+                {alreadyQueued && (
+                  <span className="rounded-full bg-secondary px-2 py-0.5 text-[11px] font-medium text-muted-foreground">
+                    In queue
+                  </span>
+                )}
+              </Button>
+            )}
             {moveTargets.length > 0 && (
               <Button
                 size="lg"
@@ -223,6 +263,55 @@ export function SlotActionDialog({
             </div>
           </div>
         </DialogBody>
+      </Dialog>
+    )
+  }
+
+  // ---- Take out: keep it in hand, or take out and delete ----
+  if (existing && view === "takeout") {
+    return (
+      <Dialog open={open} onClose={onClose}>
+        <DialogHeader icon={<HandMetal className="h-5 w-5" />} title="Take out of storage" description={slotLabel} />
+        <DialogBody className="space-y-5">
+          <SpoolSummary spool={existing} />
+          <div className="flex flex-col gap-2">
+            <button
+              type="button"
+              onClick={() => onTakeOut(existing, loc, false)}
+              className="flex items-start gap-3 rounded-xl border border-border bg-background/50 p-3 text-left transition-colors hover:border-primary/60"
+            >
+              <HandMetal className="mt-0.5 h-5 w-5 shrink-0 text-primary" aria-hidden />
+              <span className="min-w-0">
+                <span className="block text-sm font-medium">Take out and keep in hand</span>
+                <span className="block text-xs leading-relaxed text-muted-foreground">
+                  {'Shows up under "Spools without storage location" as pending until you place it somewhere.'}
+                </span>
+              </span>
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                if (confirm(`Take out ${existing.material} ${existing.colorName} and delete it? This cannot be undone.`)) {
+                  onTakeOut(existing, loc, true)
+                }
+              }}
+              className="flex items-start gap-3 rounded-xl border border-border bg-background/50 p-3 text-left transition-colors hover:border-destructive/60"
+            >
+              <Trash2 className="mt-0.5 h-5 w-5 shrink-0 text-destructive" aria-hidden />
+              <span className="min-w-0">
+                <span className="block text-sm font-medium">Take out and delete</span>
+                <span className="block text-xs leading-relaxed text-muted-foreground">
+                  For empty or discarded spools. It&apos;s removed from the system once it&apos;s out.
+                </span>
+              </span>
+            </button>
+          </div>
+        </DialogBody>
+        <DialogFooter>
+          <Button variant="ghost" onClick={() => setView("actions")}>
+            <ArrowLeft className="h-4 w-4" /> Back
+          </Button>
+        </DialogFooter>
       </Dialog>
     )
   }
