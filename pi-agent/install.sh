@@ -445,7 +445,7 @@ elif [[ $NET -eq 1 ]]; then
   fi
 
   # Wi-Fi interface + a stable hotspot SSID derived from its MAC.
-  IFACE="$(nmcli -t -f DEVICE,TYPE dev status 2>/dev/null | awk -F: '$2=="wifi"{print $1; exit}')"
+  IFACE="$( (nmcli -t -f DEVICE,TYPE dev status 2>/dev/null || true) | awk -F: '$2=="wifi"{print $1; exit}')"
   IFACE="${IFACE:-wlan0}"
   MAC="$(tr -d ':' < "/sys/class/net/$IFACE/address" 2>/dev/null | tr 'a-f' 'A-F' || true)"
   DEFAULT_AP_SSID="PAX-Setup-${MAC: -4}"
@@ -468,7 +468,9 @@ elif [[ $NET -eq 1 ]]; then
     fi
     if [[ -z "$AP_PSK" ]]; then
       # 12 chars from a-z0-9: easy to type on a phone, ~62 bits.
-      AP_PSK="$(tr -dc 'a-z0-9' < /dev/urandom | head -c 12)"
+      # `|| true`: head closing the pipe kills tr with SIGPIPE, which pipefail
+      # would otherwise turn into a silent exit of the whole installer.
+      AP_PSK="$( (tr -dc 'a-z0-9' < /dev/urandom || true) | head -c 12)"
       echo "[install] generated hotspot password"
     fi
   else
@@ -543,7 +545,7 @@ EOF
   # Adopt whatever Wi-Fi the imager/user already configured as `pax-router`,
   # so the fallback logic has a router to fall back FROM on the very first boot.
   if ! nmcli -t -f NAME con show | grep -qx "pax-router"; then
-    CURRENT="$(nmcli -t -f NAME,TYPE,DEVICE con show --active | awk -F: -v i="$IFACE" '$2=="802-11-wireless" && $3==i {print $1; exit}')"
+    CURRENT="$( (nmcli -t -f NAME,TYPE,DEVICE con show --active || true) | awk -F: -v i="$IFACE" '$2=="802-11-wireless" && $3==i {print $1; exit}')"
     if [[ -n "$CURRENT" && "$CURRENT" != "pax-ap" && "$CURRENT" != "pax-master-ap" ]]; then
       nmcli con modify "$CURRENT" connection.id pax-router connection.autoconnect yes \
         connection.autoconnect-priority 100 connection.autoconnect-retries 0 >/dev/null
