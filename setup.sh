@@ -119,7 +119,12 @@ say()  { printf '%s\n' "${BOLD}==>${RESET} $*"; }
 note() { printf '%s\n' "    ${DIM}$*${RESET}"; }
 warn() { printf '%s\n' "${YELLOW}warning:${RESET} $*" >&2; }
 die()  { printf '%s\n' "${RED}error:${RESET} $*" >&2; exit 1; }
-tty_say() { printf '%s\n' "$*" > /dev/tty; }
+# The in-app updater runs under systemd with no terminal at all; opening
+# /dev/tty there fails with "No such device or address".
+has_tty() { { : > /dev/tty; } 2>/dev/null; }
+tty_say() {
+  if has_tty; then printf '%s\n' "$*" > /dev/tty; else printf '%s\n' "$*" >&2; fi
+}
 
 # Any unexpected failure under `set -e` used to drop straight back to the
 # prompt with no message. Say where it stopped instead.
@@ -137,6 +142,7 @@ trap 'on_error "$LINENO" "$BASH_COMMAND"' ERR
 ask() {
   local prompt="$1" default="${2:-}" reply
   if [[ $ASSUME_YES -eq 1 ]]; then printf '%s' "$default"; return; fi
+  has_tty || die "no terminal to ask \"$prompt\" on. Re-run with --update (keep the saved setup) or pass the answers as flags."
   if [[ -n "$default" ]]; then
     printf '%s [%s]: ' "$prompt" "$default" > /dev/tty
   else
@@ -148,6 +154,7 @@ ask() {
 ask_secret() {
   local prompt="$1" reply
   if [[ $ASSUME_YES -eq 1 ]]; then printf ''; return; fi
+  has_tty || die "no terminal to ask \"$prompt\" on. Pass it as a flag instead."
   printf '%s: ' "$prompt" > /dev/tty
   IFS= read -rs reply < /dev/tty || reply=""
   printf '\n' > /dev/tty
@@ -245,6 +252,10 @@ fi
 
 # What the user is doing this run. "update" = same setup, no questions.
 ACTION="install"
+# -y on an existing install means "keep the saved setup" — never show the menu.
+if [[ $ASSUME_YES -eq 1 && -n "$OLD_ROLE" && $RECONFIGURE -eq 0 && -z "$ROLE" ]]; then
+  UPDATE_ONLY=1
+fi
 if [[ $UPDATE_ONLY -eq 1 ]]; then
   # An update must never turn into a silent fresh install with default answers.
   [[ -n "$OLD_ROLE" ]] || die "PAX is not installed on this Pi yet. Run the install command first (without --update)."
@@ -705,7 +716,7 @@ sudo -u "\$RUN_USER" git -C "\$APP_DIR" fetch -q origin "\$BRANCH" || { finish 1
 sudo -u "\$RUN_USER" git -C "\$APP_DIR" reset -q --hard "origin/\$BRANCH" || { finish 11; exit 0; }
 echo "    now at \$(sudo -u "\$RUN_USER" git -C "\$APP_DIR" log -1 --format='%h %s')"
 # Run the freshly pulled installer with the saved answers (no questions).
-PAX_BRANCH="\$BRANCH" bash "\$APP_DIR/setup.sh" -y
+PAX_BRANCH="\$BRANCH" bash "\$APP_DIR/setup.sh" --update < /dev/null
 finish \$?
 EOF
   chmod 755 /usr/local/sbin/pax-update
