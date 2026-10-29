@@ -79,7 +79,7 @@ Three wires, all 3.3 V — no level shifter needed:
 | GND (pin 6) | — | GND |
 
 Power the ESP32 from the Pi's 5 V (pin 2/4) to **VIN**, or from its own USB
-supply. Run `sudo ./install.sh --esp32-link uart` once or `cd /pax/pi-agent`  `sudo bash install.sh --esp32-link uart`: it frees the UART
+supply. Run `sudo ./install.sh --esp32-link uart` once: it frees the UART
 from the login console, enables it (`/dev/serial0`) and, on Pi 3/4/Zero W,
 moves the full UART back to GPIO14/15. **Reboot afterwards.**
 
@@ -134,7 +134,10 @@ the cable again:
   --upload-protocol espota` with `--upload-flags --auth=pax-esp32`.
 
 Other console commands: `HOSTNAME <name>` (mDNS name, after `REBOOT`),
-`WIFI 0` / `WIFIAP 0` to forget, `OTAPASS <pw>`, `REBOOT`. The on-board LED
+`WIFI 0` / `WIFIAP 0` to forget, `OTAPASS <pw>`, `REBOOT`,
+`WIFIOFF 1` / `WIFIOFF 0` (fw 1.6+, saved on the board: radio fully off / back
+on; the Pi agent sends `WIFIOFF 1` itself when it is the master over USB or
+UART, so flash over USB from then on). The on-board LED
 is steady once a master is connected and blinks while it waits for one.
 Over Wi-Fi the silence watchdog is 3 s instead of 1.5 s (`CFG wd_ms=`),
 which the agent sets automatically.
@@ -173,7 +176,7 @@ The A6-RS has an internal 24 V supply on CN1 for its inputs:
 
 | | A6-RS CN1 | note |
 | --- | --- | --- |
-| jumper | **17** (24 V) → **11** (COM+) | powers the input commons, do this on each drive |
+| jumper | **17** (24 V) ��� **11** (COM+) | powers the input commons, do this on each drive |
 | 24 V return | **14** (COM−) | this is the emitter / COM of the ULN2003 for that drive |
 
 | signal | ESP32 (A) | ESP32 (B) | via | A6-RS CN1 |

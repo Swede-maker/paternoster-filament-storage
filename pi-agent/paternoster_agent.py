@@ -2510,6 +2510,12 @@ class Carousel:
         # the travel direction that edge was taken in. None until homed.
         self._home_origin: Optional[float] = None
         self._home_edge_direction: Optional[str] = None
+        # Un-homed stand-in for `_home_origin`: the odometer reading where the
+        # remembered shelf grid starts, fixed at the first pulse move. Without
+        # it an un-homed move was "N whole pitches from wherever we are", so a
+        # stop between two shelves turned that in-between spot into the new
+        # shelf position and every later shelf landed offset by the same amount.
+        self._grid_origin: Optional[float] = None
         # Shelf pitch in pulses learned from the shelf sensor during ordinary
         # sensor-mode moves (servo only, when not calibrated) so the distance
         # bounce filter has a yardstick before the first calibration.
@@ -2687,6 +2693,8 @@ class Carousel:
             return
         try:
             self.hw.release()
+            # Free to turn by hand: an un-homed grid can no longer be trusted.
+            self._grid_origin = None
             print("[agent] servos released (free to turn by hand)", flush=True)
         except Exception as exc:
             self.emit({"type": "fault", "message": f"Could not release the servos: {exc}"})
@@ -3516,6 +3524,7 @@ class Carousel:
                     self.emit({"type": "fault", "message": "Homing: could not reach the middle of the home flag"})
                 return
             self._home_origin = centre
+            self._grid_origin = None
             self._home_edge_direction = home_direction
             self.current_shelf = 0
             self.homed = True
@@ -3891,6 +3900,7 @@ class Carousel:
         # The datum is the computed middle of the flag, not wherever the
         # reverse crawl happened to stop a pulse or two later.
         self._home_origin = centre
+        self._grid_origin = None
         self._home_edge_direction = direction
         self.current_shelf = 0
         self.homed = True
@@ -3944,20 +3954,24 @@ class Carousel:
         self.hw.reset_pulses()
         start = self._odometer()
         absolute = self.homed and self._home_origin is not None
+        if not absolute and self._grid_origin is None:
+            # Un-homed: assume the carousel sits on `current_shelf` right now
+            # and keep that grid for every later move, so a stop between two
+            # shelves is remembered as "part way", not as a new shelf.
+            self._grid_origin = start - start_shelf * pitch
+
+        def origin() -> float:
+            return self._home_origin if absolute else self._grid_origin
 
         def grid_remaining(pos: float) -> float:
-            """Pulses still to go to the target on the home-referenced grid."""
-            pos_abs = pos - self._home_origin
+            """Pulses still to go to the target on the shelf grid."""
+            pos_abs = pos - origin()
             left = ((target * pitch - pos_abs) * sign) % rev
             # Parked a hair PAST the target (drift, or a previous stop that ran
             # a few pulses long) must not send the carousel the long way round.
             return left - rev if left > rev - 0.25 * pitch else left
 
-        if absolute:
-            distance = grid_remaining(start)
-        else:
-            # Unhomed: a relative move of whole pitches; no datum to re-sync to.
-            distance = steps * pitch
+        distance = grid_remaining(start)
 
         if distance <= 0:
             self.status = "idle"
@@ -3990,10 +4004,7 @@ class Carousel:
 
             if self._abort.is_set():
                 self.hw.stop()
-                if absolute:
-                    self.current_shelf = int(round((pos - self._home_origin) / pitch)) % self.shelves
-                else:
-                    self.current_shelf = (start_shelf + int(round(travelled / pitch)) * step) % self.shelves
+                self.current_shelf = int(round((pos - origin()) / pitch)) % self.shelves
                 self.status = "idle"
                 self.emit(self.snapshot())
                 return
@@ -4048,10 +4059,7 @@ class Carousel:
                     self._energise(direction, duty)
                 last_duty_update = now
 
-            if absolute:
-                cur = int(round((pos - self._home_origin) / pitch)) % self.shelves
-            else:
-                cur = (start_shelf + int(round(travelled / pitch)) * step) % self.shelves
+            cur = int(round((pos - origin()) / pitch)) % self.shelves
             if cur != shown_shelf:
                 shown_shelf = cur
                 self.current_shelf = cur
@@ -4984,9 +4992,32 @@ async def serve(args) -> None:
             "sides": sides_saved,
         })
 
-    build_units()
+    server_only = bool(getattr(args, "no_carousel", False))
+    if server_only:
+        print("[agent] SERVER ONLY: no carousel on this device; motors and GPIO are not touched", flush=True)
+    else:
+        build_units()
 
     def hello_frame() -> dict:
+        if not units:
+            # Reported as "simulated" so the app's existing banner explains why
+            # this node never moves, instead of looking like a dead carousel.
+            return {
+                "type": "hello",
+                "name": args.name,
+                "shelves": 0,
+                "firmware": "pax-agent-1.9",
+                "role": args.role,
+                "carousel": False,
+                "simulated": True,
+                "simReason": "Server only: no carousel is wired to this device. "
+                             "Each carousel is its own slave node.",
+                "motorMode": rt["mode"],
+                "servoDriver": servo_params["driver"],
+                "pulseDrive": servo_params["pulse_drive"],
+                "twin": False,
+                "sides": [],
+            }
         first = next(iter(units.values()))
         return {
             "type": "hello",
@@ -5023,6 +5054,7 @@ async def serve(args) -> None:
         rt["mode"] = mode
         rt["sim_reason"] = None
         for side, c in units.items():
+            old_pos = c._odometer()
             for fn in (c.hw.stop, c.hw.cleanup):
                 try:
                     fn()
@@ -5032,6 +5064,17 @@ async def serve(args) -> None:
             if reason and not rt["sim_reason"]:
                 rt["sim_reason"] = reason
             c.hw = new_hw
+            # The new backend's odometer starts at 0. Shift the datums with it
+            # so the motors (which did not move) keep their known position.
+            new_pos = c._odometer()
+            if old_pos is not None and new_pos is not None:
+                shift = new_pos - old_pos
+                if c._home_origin is not None:
+                    c._home_origin += shift
+                if c._grid_origin is not None:
+                    c._grid_origin += shift
+            else:
+                c._grid_origin = None
         print(f"[agent] motor drive switched to {mode}", flush=True)
         broadcast(hello_frame())
         for side, c in units.items():
@@ -5083,6 +5126,21 @@ async def serve(args) -> None:
                 except Exception:
                     continue
                 t = msg.get("type")
+                if not units:
+                    # Server only: there is no carousel to look up, so route
+                    # here instead of falling through to unit_for().
+                    if t == "hello":
+                        await ws.send(json.dumps(hello_frame()))
+                    elif t == "net.ack":
+                        net.note_ack(msg)
+                    elif isinstance(t, str) and t.startswith("net."):
+                        asyncio.ensure_future(net.handle(ws, msg))
+                    elif t in ("home", "goto", "jog", "calibrate", "release", "hold"):
+                        await ws.send(json.dumps({
+                            "type": "fault",
+                            "message": "This device is a server with no carousel. Send motion to a carousel (slave) node.",
+                        }))
+                    continue
                 if t == "stop":
                     print(f"[agent] stop requested by app client {getattr(ws, 'remote_address', '?')}", flush=True)
                     # Twin: a stop without a side is the emergency stop and
@@ -5301,6 +5359,18 @@ class NetService:
         we only relay credentials to the board and register with the master."""
         return getattr(self.args, "role", None) == "esp32"
 
+    @property
+    def no_hotspot(self) -> bool:
+        """A server (usually a PC) whose own network must never be touched:
+        no fallback hotspot, no Wi-Fi switching. Slave sign-in and pushing
+        router credentials to slaves still work."""
+        return bool(getattr(self.args, "no_hotspot", False))
+
+    def _ap_creds(self) -> tuple:
+        if self.no_hotspot or self.cfg is None:
+            return "", ""
+        return self.cfg.ap_ssid, self.cfg.ap_psk
+
     def start(self) -> None:
         if self.esp32_role:
             self._disabled_reason = None
@@ -5320,6 +5390,11 @@ class NetService:
         except Exception as exc:
             self._disabled_reason = f"paxnet config: {exc!r}"
             print(f"[agent] networking disabled ({self._disabled_reason})", flush=True)
+            return
+        if self.no_hotspot:
+            self.cfg.mode = "router"
+            asyncio.ensure_future(self._push_status())
+            print(f"[agent] networking: role={self.cfg.role} (no hotspot; this device's network is left alone)", flush=True)
             return
         self.watchdog = paxnet.Watchdog(self.cfg, on_change=self._on_status_change)
         self.watchdog.start()
@@ -5360,6 +5435,14 @@ class NetService:
         await self._push_status()
 
     async def _push_status(self) -> None:
+        if self.no_hotspot:
+            # A PC may not even run NetworkManager; report what matters.
+            self._last_status = {
+                "type": "net.status", "role": "master", "mode": "router", "server": True,
+                "hostname": socket.gethostname(), "apSsid": "", "at": int(time.time() * 1000),
+            }
+            self.broadcast(self._last_status)
+            return
         try:
             st = await self._run(paxnet.status, self.cfg)
         except Exception as exc:
@@ -5423,6 +5506,10 @@ class NetService:
                     # longer hear us, so the order is not negotiable.
                     pushed = await self._provision_slaves(ssid, psk)
                     self.broadcast({"type": "net.result", "op": "provision-slaves", "ok": True, **pushed})
+                    if self.no_hotspot:
+                        # A server keeps its own network; only the slaves move.
+                        await self._result(ws, "join", True, ssid=ssid, serverOnly=True)
+                        return
                     # Anyone on the hotspot right now is about to lose us.
                     self.broadcast({"type": "net.result", "op": "join-starting", "ok": True, "ssid": ssid})
                     await asyncio.sleep(0.5)  # let the frames flush
@@ -5453,6 +5540,8 @@ class NetService:
                 mode = str(msg.get("mode", "auto"))
                 if mode not in paxnet.VALID_MODES:
                     raise paxnet.NetError(f"mode must be one of {paxnet.VALID_MODES}")
+                if self.no_hotspot:
+                    raise paxnet.NetError("this server has no hotspot and keeps its own network")
                 if cfg.role != "master" and mode == "ap":
                     raise paxnet.NetError("only the master can run a hotspot")
                 cfg.mode = mode
@@ -5501,8 +5590,8 @@ class NetService:
                     await self._run(paxnet.ensure_master_ap_profile, cfg)
                     await self._send(ws, {"type": "net.ack", "op": "set-ap-psk", "ok": True, "hostname": paxnet.hostname()})
                     return
-                if cfg.role != "master":
-                    raise paxnet.NetError("only the master has a hotspot")
+                if cfg.role != "master" or self.no_hotspot:
+                    raise paxnet.NetError("only a master with a hotspot has a hotspot password")
                 # Slaves first, while they can still hear us on the OLD key.
                 pushed = await self._push_ap_psk(psk)
                 cfg.ap_psk = psk
@@ -5527,8 +5616,9 @@ class NetService:
                     "agentHost": msg.get("agentHost") if isinstance(msg.get("agentHost"), str) else None,
                     "agentPort": msg.get("agentPort") if isinstance(msg.get("agentPort"), int) else None,
                 }
+                ap_ssid, ap_psk = self._ap_creds()
                 await self._send(ws, {"type": "net.registered", "master": paxnet.hostname(),
-                                      "apSsid": cfg.ap_ssid, "apPsk": cfg.ap_psk})
+                                      "apSsid": ap_ssid, "apPsk": ap_psk})
                 self.broadcast(self._slaves_payload())
 
             elif op == "slaves":
@@ -5545,10 +5635,10 @@ class NetService:
     async def _provision_slaves(self, ssid: str, psk: str) -> dict:
         """Push router creds (+ our hotspot creds) to every registered slave and
         wait up to 5 s for each ack. Returns counts for the UI."""
-        cfg = self.cfg
+        ap_ssid, ap_psk = self._ap_creds()
         return await self._push_to_slaves({
             "type": "net.join", "fromMaster": True, "ssid": ssid, "psk": psk,
-            "apSsid": cfg.ap_ssid, "apPsk": cfg.ap_psk,
+            "apSsid": ap_ssid, "apPsk": ap_psk,
         })
 
     async def _push_ap_psk(self, new_psk: str) -> dict:
@@ -5837,6 +5927,18 @@ def main() -> None:
         "--esp32-port",
         default=None,
         help="Serial device of the ESP32 controller, e.g. /dev/ttyUSB0 or /dev/serial0 (default: auto by link type)",
+    )
+    p.add_argument(
+        "--no-carousel",
+        action="store_true",
+        help="Server only: no carousel is wired to this device. Skips all motor/GPIO setup and only does "
+             "the master's network jobs (slave sign-in, pushing Wi-Fi changes). Use with --role master.",
+    )
+    p.add_argument(
+        "--no-hotspot",
+        action="store_true",
+        help="Never run the backup hotspot or change this device's own Wi-Fi (e.g. a PC server). "
+             "Slaves still sign in and still receive new router credentials.",
     )
     p.add_argument("--simulate", action="store_true", help="Run without real GPIO (fake motion)")
     p.add_argument(

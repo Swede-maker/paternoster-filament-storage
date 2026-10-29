@@ -16,6 +16,11 @@
 #       network so it can always be reached and re-provisioned. --ap-ssid/--ap-psk
 #       are optional if the slave is on the same network as the master right
 #       now: it fetches them from the master on first registration.
+#   sudo ./install.sh --server --hostname pax-master
+#       Server master (usually a Linux PC, any Debian/Ubuntu machine): NO
+#       carousel wired, no GPIO, no hotspot, and its own network is never
+#       touched. Slaves sign in with it and still receive new router
+#       credentials. Every carousel is then installed as --role slave.
 #   --no-net            skip all Wi-Fi/hostname setup (wired lab bench)
 #   --motor dc|servo    which drive is wired to this Pi; written to
 #                       /var/lib/pax-agent/motor.json (other tuning kept).
@@ -72,6 +77,7 @@ ESP32_LINK=""
 ESP32_HOST=""
 INSTANCE=""
 PORT_SET=0
+SERVER=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -91,7 +97,8 @@ while [[ $# -gt 0 ]]; do
     --ap-ssid) AP_SSID="$2"; shift 2 ;;
     --ap-psk) AP_PSK="$2"; shift 2 ;;
     --no-net) NET=0; shift ;;
-    -h|--help) sed -n '2,49p' "$0"; exit 0 ;;
+    --server) SERVER=1; ROLE="master"; shift ;;
+    -h|--help) sed -n '2,54p' "$0"; exit 0 ;;
     *) echo "unknown option: $1" >&2; exit 2 ;;
   esac
 done
@@ -99,6 +106,16 @@ done
 if [[ "$ROLE" != "master" && "$ROLE" != "slave" ]]; then
   echo "error: --role must be master or slave" >&2
   exit 2
+fi
+if [[ $SERVER -eq 1 ]]; then
+  if [[ "$ROLE" != "master" ]]; then
+    echo "error: --server is always a master; drop --role $ROLE" >&2
+    exit 2
+  fi
+  if [[ -n "$MOTOR$PULSE_DRIVE$SERVO_DRIVER$ESP32_LINK$ESP32_HOST$INSTANCE" ]]; then
+    echo "error: --server has no carousel; motor/ESP32/--instance options do not apply" >&2
+    exit 2
+  fi
 fi
 if [[ -n "$MOTOR" && "$MOTOR" != "dc" && "$MOTOR" != "servo" ]]; then
   echo "error: --motor must be dc or servo" >&2
@@ -185,7 +202,12 @@ echo "[install] user=$RUN_USER dir=$DIR name='$NAME' shelves=$SHELVES port=$PORT
 # --- dependencies -----------------------------------------------------------
 echo "[install] installing python dependencies"
 apt-get update -qq
-apt-get install -y -qq python3-websockets python3-gpiozero python3-serial >/dev/null
+if [[ $SERVER -eq 1 ]]; then
+  # No motors here, so no GPIO stack; a PC has no use for it.
+  apt-get install -y -qq python3-websockets >/dev/null
+else
+  apt-get install -y -qq python3-websockets python3-gpiozero python3-serial >/dev/null
+fi
 
 # --- ESP32 servo controller link ---------------------------------------------
 # The agent opens /dev/ttyUSB0 (USB) or /dev/serial0 (header UART) itself, so
@@ -230,6 +252,10 @@ fi
 # pinned to lgpio. On a Pi 3/4 a failed install is only a warning, and the
 # factory is left unpinned so an optional pigpio setup keeps working.
 ENVIRONMENT=""
+NEED_REBOOT=0
+if [[ $SERVER -eq 1 ]]; then
+  echo "[install] server: no carousel — skipping GPIO backend, gpio group and boot-config changes"
+else
 MODEL="$(tr -d '\0' < /proc/device-tree/model 2>/dev/null || echo unknown)"
 echo "[install] detected board: $MODEL"
 if [[ "$MODEL" == *"Raspberry Pi 5"* ]]; then
@@ -254,7 +280,6 @@ fi
 # pre-start helper. The agent drives the pins directly through lgpio again, and
 # with the overlay in place those two pins are kernel-owned ("GPIO busy"), so
 # take both out. Removing the overlay only takes effect after a reboot.
-NEED_REBOOT=0
 for conf in /boot/firmware/config.txt /boot/config.txt; do
   [[ -f "$conf" ]] || continue
   if grep -q '^dtoverlay=pwm' "$conf"; then
@@ -264,6 +289,7 @@ for conf in /boot/firmware/config.txt /boot/config.txt; do
   fi
 done
 rm -f /usr/local/sbin/pax-agent-prestart /etc/udev/rules.d/99-pax-pwm.rules
+fi
 
 # --- motor drive ------------------------------------------------------------
 # Seed the agent's persisted drive choice so the right backend comes up on
@@ -310,6 +336,11 @@ PY
 fi
 
 EXTRA_ARGS=""
+if [[ $SERVER -eq 1 ]]; then
+  # No GPIO to be strict about.
+  STRICT=0
+  EXTRA_ARGS="--no-carousel --no-hotspot"
+fi
 if [[ $STRICT -eq 1 ]]; then
   # Fail loudly rather than pretending the motor moved.
   EXTRA_ARGS="--strict-gpio"
@@ -330,7 +361,42 @@ fi
 # and the fallback hotspot; a sudoers rule so the unprivileged agent may drive
 # nmcli. All of it is skipped with --no-net.
 CONF=/etc/paxnet.conf
-if [[ $NET -eq 1 ]]; then
+if [[ $SERVER -eq 1 && $NET -eq 1 ]]; then
+  # The server's own network is the user's business: no nmcli, no hotspot,
+  # no sudoers. Only a .local name so slaves can find it as --master.
+  echo "[install] installing avahi (mDNS) so slaves can reach this server by name"
+  apt-get install -y -qq avahi-daemon >/dev/null || echo "[install] warning: avahi-daemon unavailable — give slaves this server's IP as --master"
+  systemctl enable --now avahi-daemon >/dev/null 2>&1 || true
+  if [[ -n "$HOSTNAME_NEW" ]]; then
+    if [[ ! "$HOSTNAME_NEW" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]]; then
+      echo "error: --hostname must be lowercase letters, digits and dashes (e.g. pax-master)" >&2
+      exit 2
+    fi
+    echo "[install] hostname → $HOSTNAME_NEW ($HOSTNAME_NEW.local)"
+    hostnamectl set-hostname "$HOSTNAME_NEW"
+    if grep -qE '^127\.0\.1\.1\s' /etc/hosts; then
+      sed -i -E "s/^127\.0\.1\.1\s.*/127.0.1.1\t$HOSTNAME_NEW/" /etc/hosts
+    else
+      printf '127.0.1.1\t%s\n' "$HOSTNAME_NEW" >> /etc/hosts
+    fi
+  else
+    echo "[install] keeping hostname $(hostname) — slaves use --master $(hostname).local"
+  fi
+  umask 077
+  cat > "$CONF" <<EOF
+[pax]
+role = master
+mode = router
+ap_ssid =
+ap_psk =
+iface = wlan0
+master_host = localhost
+EOF
+  chmod 600 "$CONF"
+  chown "$RUN_USER" "$CONF"
+  umask 022
+  echo "[install] wrote $CONF (server: no hotspot)"
+elif [[ $NET -eq 1 ]]; then
   if ! command -v nmcli >/dev/null 2>&1; then
     echo "error: nmcli not found. paxnet needs NetworkManager (Raspberry Pi OS Bookworm or newer)." >&2
     echo "       Re-run with --no-net to install the motor agent without Wi-Fi management." >&2
