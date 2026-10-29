@@ -688,9 +688,13 @@ EOF
   # code and re-runs this installer non-interactively. Progress goes to
   # DATA_DIR/update.log, which the app tails for the user.
   say "Installing the in-app updater"
-  cat > /usr/local/sbin/pax-update <<EOF
+  # This file is rewritten by the very update it runs. Write it to a temp file
+  # and rename it over the old one (new inode, so the running copy is never
+  # touched), and wrap the body in { ... } so bash parses it fully up front.
+  cat > /usr/local/sbin/pax-update.new <<EOF
 #!/usr/bin/env bash
 # Started by pax-update.path when the app writes $DATA_DIR/update.request.
+{
 set -uo pipefail
 DATA_DIR="$DATA_DIR"
 APP_DIR="$APP_DIR"
@@ -718,8 +722,11 @@ echo "    now at \$(sudo -u "\$RUN_USER" git -C "\$APP_DIR" log -1 --format='%h 
 # Run the freshly pulled installer with the saved answers (no questions).
 PAX_BRANCH="\$BRANCH" bash "\$APP_DIR/setup.sh" --update < /dev/null
 finish \$?
+exit 0
+}
 EOF
-  chmod 755 /usr/local/sbin/pax-update
+  chmod 755 /usr/local/sbin/pax-update.new
+  mv -f /usr/local/sbin/pax-update.new /usr/local/sbin/pax-update
 
   cat > /etc/systemd/system/pax-update.service <<EOF
 [Unit]
