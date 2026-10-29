@@ -12,12 +12,14 @@
 #
 #   1  MASTER          the host for the whole system: web app, database, slave
 #                      sign-in and Wi-Fi provisioning. There is only ever ONE.
-#                      It then asks which kind:
-#        a  SERVER       no carousel wired (a Linux PC is ideal). No GPIO, no
-#                        hotspot; this computer's own network is left alone.
-#                        Every carousel is installed as a SLAVE.
-#        b  + CAROUSEL   this Pi also drives one carousel and opens the
+#                      It then asks: a PC or a Raspberry Pi?
+#        a  PC           SERVER: no carousel, no GPIO, no hotspot; this
+#                        computer's own network is left alone. Every carousel
+#                        is installed as a SLAVE.
+#        b  Pi           then: is a carousel wired to this Pi?
+#             no         PI SERVER: no carousel, no GPIO, but opens the
 #                        PAX-Setup hotspot if the router disappears.
+#             yes        + CAROUSEL: also drives one carousel, with hotspot.
 #   2  SLAVE           drives one carousel and follows the master (Pi Zero 2 W)
 #
 # (Older "filament only" installs keep working and can be upgraded to a
@@ -42,6 +44,7 @@
 #
 # Non-interactive use (for scripting / re-imaging):
 #   sudo ./setup.sh --role server
+#   sudo ./setup.sh --role pi-server
 #   sudo ./setup.sh --role master --motor servo --shelves 9
 #   sudo ./setup.sh --role master --pulse-drive closed-loop-stepper --esp32-link usb --shelves 9
 #   sudo ./setup.sh --role slave  --motor dc --number 1 --shelves 9 --master pax-master.local --ap-psk <pw>
@@ -155,6 +158,7 @@ role_label() {
   case "$1" in
     app) printf 'FILAMENT ONLY (web app, no motors)' ;;
     server) printf 'MASTER – SERVER (web app + slave sign-in, no carousel)' ;;
+    pi-server) printf 'MASTER – PI SERVER (web app + slave sign-in + hotspot, no carousel)' ;;
     master) printf 'MASTER + CAROUSEL (web app + this carousel + hotspot fallback)' ;;
     slave) printf 'SLAVE (carousel only, follows the master)' ;;
     *) printf '%s' "$1" ;;
@@ -260,7 +264,7 @@ elif [[ -n "$OLD_ROLE" && $RECONFIGURE -eq 0 && -z "$ROLE" ]]; then
     app)
       tty_say "  ${BOLD}2${RESET}) Make this the MASTER (as a SERVER, or with a carousel wired to it)"
       ;;
-    server)
+    server|pi-server)
       tty_say "  ${BOLD}2${RESET}) Wire a carousel to this computer too (becomes MASTER + CAROUSEL)"
       ;;
     master|slave)
@@ -272,7 +276,7 @@ elif [[ -n "$OLD_ROLE" && $RECONFIGURE -eq 0 && -z "$ROLE" ]]; then
     1) ACTION="update" ;;
     2) case "$OLD_ROLE" in
          app) ACTION="make-master" ;;
-         server) ACTION="add-hardware" ;;
+         server|pi-server) ACTION="add-hardware" ;;
          *) ACTION="change-motor" ;;
        esac ;;
     3) ACTION="reconfigure" ;;
@@ -332,22 +336,40 @@ fi
 
 if [[ "$ROLE" == "master-ask" ]]; then
   tty_say ""
-  tty_say "Is a carousel wired to this device?"
-  tty_say "  ${BOLD}1${RESET}) No  – SERVER only. Best on a Linux PC that is always on."
-  tty_say "           No wiring, no GPIO; this computer's network is left alone."
-  tty_say "           Install every carousel as a SLAVE pointing at this server."
+  tty_say "What kind of computer is this master?"
+  tty_say "  ${BOLD}1${RESET}) PC – a Linux PC that is always on. SERVER only."
+  tty_say "         No wiring, no GPIO; this computer's network is left alone."
+  tty_say "         Install every carousel as a SLAVE pointing at this server."
+  tty_say "  ${BOLD}2${RESET}) Raspberry Pi"
+  DEFAULT_DEVICE=1
+  [[ "$MODEL" == *"Raspberry Pi"* ]] && DEFAULT_DEVICE=2
+  [[ "$OLD_ROLE" == "server" ]] && DEFAULT_DEVICE=1
+  [[ "$OLD_ROLE" == "pi-server" || "$OLD_ROLE" == "master" ]] && DEFAULT_DEVICE=2
+  case "$(ask "Choose" "$DEFAULT_DEVICE")" in
+    1|pc|PC) ROLE=server ;;
+    2|pi|Pi) ROLE=pi-ask ;;
+    *) die "answer 1 or 2" ;;
+  esac
+fi
+
+if [[ "$ROLE" == "pi-ask" ]]; then
+  tty_say ""
+  tty_say "Is a carousel wired to this Pi?"
+  tty_say "  ${BOLD}1${RESET}) No  – PI SERVER: web app and slave sign-in only."
+  tty_say "           No motors, no GPIO. Still opens the PAX-Setup hotspot"
+  tty_say "           if the router disappears."
   tty_say "  ${BOLD}2${RESET}) Yes – this Pi also drives one carousel, and opens the"
   tty_say "           PAX-Setup hotspot if the router disappears."
   DEFAULT_KIND=1
   [[ "$OLD_ROLE" == "master" ]] && DEFAULT_KIND=2
   case "$(ask "Choose" "$DEFAULT_KIND")" in
-    1|n|no|server) ROLE=server ;;
+    1|n|no|server) ROLE=pi-server ;;
     2|y|yes|carousel) ROLE=master ;;
     *) die "answer 1 or 2" ;;
   esac
 fi
-[[ "$ROLE" == "app" || "$ROLE" == "server" || "$ROLE" == "master" || "$ROLE" == "slave" ]] \
-  || die "--role must be server, master or slave"
+[[ "$ROLE" == "app" || "$ROLE" == "server" || "$ROLE" == "pi-server" || "$ROLE" == "master" || "$ROLE" == "slave" ]] \
+  || die "--role must be server, pi-server, master or slave"
 
 if [[ "$ROLE" != "slave" && "$MODEL" == *"Zero"* ]]; then
   warn "a Pi Zero cannot build or comfortably serve the web app; the web app belongs on a Pi 4/5 or a PC"
@@ -355,10 +377,10 @@ fi
 
 # HAS_AGENT: runs the agent (slave sign-in / networking). HAS_CAROUSEL: has motors.
 HAS_APP=0; HAS_AGENT=0; HAS_CAROUSEL=0
-[[ "$ROLE" == "app" || "$ROLE" == "server" || "$ROLE" == "master" ]] && HAS_APP=1
-[[ "$ROLE" == "server" || "$ROLE" == "master" || "$ROLE" == "slave" ]] && HAS_AGENT=1
+[[ "$ROLE" == "app" || "$ROLE" == "server" || "$ROLE" == "pi-server" || "$ROLE" == "master" ]] && HAS_APP=1
+[[ "$ROLE" == "server" || "$ROLE" == "pi-server" || "$ROLE" == "master" || "$ROLE" == "slave" ]] && HAS_AGENT=1
 [[ "$ROLE" == "master" || "$ROLE" == "slave" ]] && HAS_CAROUSEL=1
-if [[ "$ROLE" == "server" || "$ROLE" == "app" ]]; then
+if [[ "$ROLE" == "server" || "$ROLE" == "pi-server" || "$ROLE" == "app" ]]; then
   MOTOR=""; PULSE_DRIVE=""; SERVO_DRIVER=""; ESP32_LINK=""; ESP32_HOST=""; SHELVES=""
 fi
 
@@ -457,6 +479,10 @@ elif [[ "$ROLE" == "app" ]]; then
   HOSTNAME_NEW="${OLD_HOSTNAME:-pax}"
   [[ "$CUR_HOST" != "raspberrypi" && -n "$CUR_HOST" ]] && HOSTNAME_NEW="$CUR_HOST"
   UNIT_NAME=""
+elif [[ "$ROLE" == "pi-server" ]]; then
+  HOSTNAME_NEW="pax-master"
+  [[ "$ACTION" == "update" && -n "$OLD_HOSTNAME" ]] && HOSTNAME_NEW="$OLD_HOSTNAME"
+  UNIT_NAME="PAX server"
 elif [[ "$ROLE" == "master" ]]; then
   HOSTNAME_NEW="pax-master"
   # An update keeps whatever address slaves and phones already use.
@@ -474,10 +500,10 @@ else
   UNIT_NAME="Paternoster $((NUMBER + 1))"
   MASTER_HOST="${MASTER_HOST:-$(ask "Master hostname" "${OLD_MASTER:-pax-master.local}")}"
   if [[ -z "$AP_PSK" && $ASSUME_YES -eq 0 && "$ACTION" != "update" && "$ACTION" != "change-motor" ]]; then
-    tty_say "${DIM}A MASTER + CAROUSEL printed a hotspot password when it was installed."
-    tty_say "Enter it so this slave can always find the master. Press Enter to skip"
-    tty_say "if the master is a SERVER (it has no hotspot) or both are on the same"
-    tty_say "Wi-Fi now.${RESET}"
+    tty_say "${DIM}A master on a Raspberry Pi printed a hotspot password when it was"
+    tty_say "installed. Enter it so this slave can always find the master. Press"
+    tty_say "Enter to skip if the master is a PC SERVER (it has no hotspot) or both"
+    tty_say "are on the same Wi-Fi now.${RESET}"
     AP_PSK="$(ask_secret "Master hotspot password (optional)")"
   fi
   if [[ -n "$AP_PSK" && -z "$AP_SSID" ]]; then
@@ -738,6 +764,12 @@ if [[ "$ROLE" == "server" ]]; then
   chmod +x "$APP_DIR/pi-agent/install.sh"
   SUDO_USER="$RUN_USER" "$APP_DIR/pi-agent/install.sh" --server --hostname "$HOSTNAME_NEW" --name "PAX server" --port "$AGENT_PORT" \
     | grep -vE '^\[install\] (installing|detected|added|wrote|service is running|verify GPIO|           journalctl)' || die "master service installation failed"
+elif [[ "$ROLE" == "pi-server" ]]; then
+  say "Installing the master service (slave sign-in + hotspot fallback, no carousel)"
+  chmod +x "$APP_DIR/pi-agent/install.sh"
+  # install.sh prints its own networking summary (including the hotspot password).
+  SUDO_USER="$RUN_USER" "$APP_DIR/pi-agent/install.sh" --no-carousel --role master --hostname "$HOSTNAME_NEW" --name "$UNIT_NAME" --port "$AGENT_PORT" \
+    | grep -vE '^\[install\] (installing|detected|added|wrote|sudoers|hotspot profile|fallback profile|adopted|service is running|verify GPIO|           journalctl)' || die "master service installation failed"
 elif [[ $HAS_AGENT -eq 1 ]]; then
   say "Installing the carousel agent ($MOTOR_TEXT) and network manager"
   AGENT_ARGS=(--role "$ROLE" --hostname "$HOSTNAME_NEW" --name "$UNIT_NAME" --shelves "$SHELVES" --port "$AGENT_PORT" --motor "$MOTOR")
@@ -795,6 +827,13 @@ if [[ $HAS_APP -eq 1 ]]; then
       printf '%s\n' "${BOLD}$HOSTNAME_NEW.local${RESET} as the master hostname. Then link it in the app as"
       printf '%s\n' "${BOLD}pax-slave-1.local${RESET} (port $AGENT_PORT), …"
       printf '%s\n' "${DIM}Slaves appear under Settings → Network → Slave units; Wi-Fi changes are pushed to them.${RESET}"
+    elif [[ "$ROLE" == "pi-server" ]]; then
+      printf '\n%s\n' "This Pi is the MASTER (Pi server). No carousel is driven from here."
+      printf '%s\n' "Install each carousel as a SLAVE: run this same command on it, answer 2, and give"
+      printf '%s\n' "${BOLD}$HOSTNAME_NEW.local${RESET} as the master hostname. Then link it in the app as"
+      printf '%s\n' "${BOLD}pax-slave-1.local${RESET} (port $AGENT_PORT), …"
+      printf '\n%s\n' "Write down the hotspot password printed above. If the Wi-Fi ever disappears, this Pi"
+      printf '%s\n' "opens that hotspot and the app is at ${BOLD}http://10.42.0.1${RESET}."
     elif [[ "$ROLE" == "master" ]]; then
       printf '\n%s\n' "In the app, under Settings → Storage units, set the master paternoster's address to"
       printf '%s\n' "${BOLD}127.0.0.1${RESET} (this Pi drives its own carousel) and pick ${BOLD}$MOTOR_TEXT${RESET}"
