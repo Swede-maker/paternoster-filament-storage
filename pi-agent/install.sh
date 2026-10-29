@@ -21,6 +21,10 @@
 #       carousel wired, no GPIO, no hotspot, and its own network is never
 #       touched. Slaves sign in with it and still receive new router
 #       credentials. Every carousel is then installed as --role slave.
+#   sudo ./install.sh --no-carousel --hostname pax-master
+#       Pi server master: a Raspberry Pi with NO carousel wired (no GPIO), but
+#       unlike --server it keeps the master's network jobs on this Pi: the
+#       fallback hotspot PAX-Setup-XXXX and Wi-Fi switching.
 #   --no-net            skip all Wi-Fi/hostname setup (wired lab bench)
 #   --motor dc|servo    which drive is wired to this Pi; written to
 #                       /var/lib/pax-agent/motor.json (other tuning kept).
@@ -78,6 +82,7 @@ ESP32_HOST=""
 INSTANCE=""
 PORT_SET=0
 SERVER=0
+NO_CAROUSEL=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -97,8 +102,9 @@ while [[ $# -gt 0 ]]; do
     --ap-ssid) AP_SSID="$2"; shift 2 ;;
     --ap-psk) AP_PSK="$2"; shift 2 ;;
     --no-net) NET=0; shift ;;
-    --server) SERVER=1; ROLE="master"; shift ;;
-    -h|--help) sed -n '2,54p' "$0"; exit 0 ;;
+    --server) SERVER=1; NO_CAROUSEL=1; ROLE="master"; shift ;;
+    --no-carousel) NO_CAROUSEL=1; shift ;;
+    -h|--help) sed -n '2,58p' "$0"; exit 0 ;;
     *) echo "unknown option: $1" >&2; exit 2 ;;
   esac
 done
@@ -107,13 +113,13 @@ if [[ "$ROLE" != "master" && "$ROLE" != "slave" ]]; then
   echo "error: --role must be master or slave" >&2
   exit 2
 fi
-if [[ $SERVER -eq 1 ]]; then
+if [[ $NO_CAROUSEL -eq 1 ]]; then
   if [[ "$ROLE" != "master" ]]; then
-    echo "error: --server is always a master; drop --role $ROLE" >&2
+    echo "error: --server / --no-carousel is always a master; drop --role $ROLE" >&2
     exit 2
   fi
   if [[ -n "$MOTOR$PULSE_DRIVE$SERVO_DRIVER$ESP32_LINK$ESP32_HOST$INSTANCE" ]]; then
-    echo "error: --server has no carousel; motor/ESP32/--instance options do not apply" >&2
+    echo "error: --server / --no-carousel has no carousel; motor/ESP32/--instance options do not apply" >&2
     exit 2
   fi
 fi
@@ -202,8 +208,8 @@ echo "[install] user=$RUN_USER dir=$DIR name='$NAME' shelves=$SHELVES port=$PORT
 # --- dependencies -----------------------------------------------------------
 echo "[install] installing python dependencies"
 apt-get update -qq
-if [[ $SERVER -eq 1 ]]; then
-  # No motors here, so no GPIO stack; a PC has no use for it.
+if [[ $NO_CAROUSEL -eq 1 ]]; then
+  # No motors here, so no GPIO stack.
   apt-get install -y -qq python3-websockets >/dev/null
 else
   apt-get install -y -qq python3-websockets python3-gpiozero python3-serial >/dev/null
@@ -253,7 +259,7 @@ fi
 # factory is left unpinned so an optional pigpio setup keeps working.
 ENVIRONMENT=""
 NEED_REBOOT=0
-if [[ $SERVER -eq 1 ]]; then
+if [[ $NO_CAROUSEL -eq 1 ]]; then
   echo "[install] server: no carousel — skipping GPIO backend, gpio group and boot-config changes"
 else
 MODEL="$(tr -d '\0' < /proc/device-tree/model 2>/dev/null || echo unknown)"
@@ -340,6 +346,10 @@ if [[ $SERVER -eq 1 ]]; then
   # No GPIO to be strict about.
   STRICT=0
   EXTRA_ARGS="--no-carousel --no-hotspot"
+elif [[ $NO_CAROUSEL -eq 1 ]]; then
+  # Pi server: no GPIO, but the hotspot and Wi-Fi switching stay on.
+  STRICT=0
+  EXTRA_ARGS="--no-carousel"
 fi
 if [[ $STRICT -eq 1 ]]; then
   # Fail loudly rather than pretending the motor moved.
