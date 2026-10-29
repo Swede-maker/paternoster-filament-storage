@@ -317,9 +317,10 @@ esac
 # --------------------------------------------------------------------------
 if [[ -z "$ROLE" ]]; then
   tty_say "What should this device be?"
-  tty_say "  ${BOLD}1${RESET}) MASTER – the host for the whole system: the web app, the database, and every"
-  tty_say "               slave signs in here. You need exactly ${BOLD}one${RESET}."
-  tty_say "  ${BOLD}2${RESET}) SLAVE  – drives one carousel and follows the master (a Pi Zero 2 W is enough)."
+  tty_say "  ${BOLD}1${RESET}) MASTER – the host for the whole system: web app and database."
+  tty_say "              Every slave signs in here. You need exactly ${BOLD}one${RESET}."
+  tty_say "  ${BOLD}2${RESET}) SLAVE  – drives one carousel and follows the master."
+  tty_say "              A Pi Zero 2 W is enough."
   DEFAULT_CHOICE=1
   [[ "$OLD_ROLE" == "slave" ]] && DEFAULT_CHOICE=2
   case "$(ask "Choose" "$DEFAULT_CHOICE")" in
@@ -332,11 +333,11 @@ fi
 if [[ "$ROLE" == "master-ask" ]]; then
   tty_say ""
   tty_say "Is a carousel wired to this device?"
-  tty_say "  ${BOLD}1${RESET}) No – SERVER only. Best on a Linux PC that is always on. No wiring, no GPIO,"
-  tty_say "          and this computer's own network is never changed. Install every carousel"
-  tty_say "          as a SLAVE pointing at this server."
-  tty_say "  ${BOLD}2${RESET}) Yes – this Pi also drives one carousel and opens the PAX-Setup hotspot if the"
-  tty_say "          router disappears."
+  tty_say "  ${BOLD}1${RESET}) No  – SERVER only. Best on a Linux PC that is always on."
+  tty_say "           No wiring, no GPIO; this computer's network is left alone."
+  tty_say "           Install every carousel as a SLAVE pointing at this server."
+  tty_say "  ${BOLD}2${RESET}) Yes – this Pi also drives one carousel, and opens the"
+  tty_say "           PAX-Setup hotspot if the router disappears."
   DEFAULT_KIND=1
   [[ "$OLD_ROLE" == "master" ]] && DEFAULT_KIND=2
   case "$(ask "Choose" "$DEFAULT_KIND")" in
@@ -372,10 +373,14 @@ fi
 if [[ $HAS_CAROUSEL -eq 1 && -z "$MOTOR" ]]; then
   tty_say ""
   tty_say "Which motors turn this carousel?"
-  tty_say "  ${BOLD}1${RESET}) Integrated servos    – iSV57T or similar, drive built into the motor, pulsed from this Pi"
-  tty_say "  ${BOLD}2${RESET}) Closed-loop steppers – CL57T / CL86Y or similar with a separate drive, pulsed by an ESP32"
-  tty_say "  ${BOLD}3${RESET}) AC servos            – A6-RS or similar with a separate drive, pulsed by an ESP32"
-  tty_say "  ${BOLD}4${RESET}) DC motors            – brushed motors on an H-bridge (L298N / BTS7960), PWM speed"
+  tty_say "  ${BOLD}1${RESET}) Integrated servos    – iSV57T or similar, drive built into the motor,"
+  tty_say "                            pulsed from this Pi"
+  tty_say "  ${BOLD}2${RESET}) Closed-loop steppers – CL57T / CL86Y or similar with a separate drive,"
+  tty_say "                            pulsed by an ESP32"
+  tty_say "  ${BOLD}3${RESET}) AC servos            – A6-RS or similar with a separate drive,"
+  tty_say "                            pulsed by an ESP32"
+  tty_say "  ${BOLD}4${RESET}) DC motors            – brushed motors on an H-bridge (L298N / BTS7960),"
+  tty_say "                            PWM speed"
   DEFAULT_MOTOR=1
   if [[ "$OLD_MOTOR" == "dc" ]]; then DEFAULT_MOTOR=4
   elif [[ "$OLD_PULSE_DRIVE" == "closed-loop-stepper" ]]; then DEFAULT_MOTOR=2
@@ -411,7 +416,7 @@ if [[ $HAS_CAROUSEL -eq 1 && "$MOTOR" == "servo" && "${DRIVE_ASKED:-0}" -eq 0 ]]
     tty_say "${DIM}(flash it first with pi-agent/esp32-servo — see its README)${RESET}"
     tty_say "  ${BOLD}1${RESET}) USB cable – DevKit micro-USB to a Pi USB port, also powers the ESP32"
     tty_say "  ${BOLD}2${RESET}) UART      – 3 wires on the Pi header (GPIO14/15 + GND), needs one reboot"
-    tty_say "  ${BOLD}3${RESET}) Wi-Fi     – ESP32 on its own, no cable to this Pi (you enter its hostname)"
+    tty_say "  ${BOLD}3${RESET}) Wi-Fi     – ESP32 on its own, no cable; you enter its hostname"
     DEFAULT_LINK=1
     case "$OLD_ESP32_LINK" in uart) DEFAULT_LINK=2 ;; wifi) DEFAULT_LINK=3 ;; esac
     case "$(ask "Choose" "$DEFAULT_LINK")" in
@@ -469,9 +474,10 @@ else
   UNIT_NAME="Paternoster $((NUMBER + 1))"
   MASTER_HOST="${MASTER_HOST:-$(ask "Master hostname" "${OLD_MASTER:-pax-master.local}")}"
   if [[ -z "$AP_PSK" && $ASSUME_YES -eq 0 && "$ACTION" != "update" && "$ACTION" != "change-motor" ]]; then
-    tty_say "${DIM}A MASTER + CAROUSEL printed a hotspot password when it was installed. Enter it so this"
-    tty_say "slave can always find the master. Press Enter to skip if the master is a SERVER (it has"
-    tty_say "no hotspot) or if both are on the same Wi-Fi now.${RESET}"
+    tty_say "${DIM}A MASTER + CAROUSEL printed a hotspot password when it was installed."
+    tty_say "Enter it so this slave can always find the master. Press Enter to skip"
+    tty_say "if the master is a SERVER (it has no hotspot) or both are on the same"
+    tty_say "Wi-Fi now.${RESET}"
     AP_PSK="$(ask_secret "Master hotspot password (optional)")"
   fi
   if [[ -n "$AP_PSK" && -z "$AP_SSID" ]]; then
