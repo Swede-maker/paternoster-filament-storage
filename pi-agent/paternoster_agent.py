@@ -222,7 +222,7 @@ SERVO_MIRROR_B = True
 PULSE_DRIVE_DEFAULT = "integrated-servo"
 PULSE_DRIVES = ("integrated-servo", "ac-servo", "closed-loop-stepper")
 PULSE_DRIVE_PROFILES = {
-    "integrated-servo":   {"ena_active_low": False, "alm_active_low": False, "max_pps": 300_000, "has_enable": False, "default_driver": "gpio"},
+    "integrated-servo":   {"ena_active_low": False, "alm_active_low": False, "max_pps": 300_000, "has_enable": False, "default_driver": "esp32"},
     "ac-servo":           {"ena_active_low": False, "alm_active_low": False, "max_pps": 300_000, "has_enable": True,  "default_driver": "esp32"},
     "closed-loop-stepper":{"ena_active_low": False, "alm_active_low": True,  "max_pps": 200_000, "has_enable": True,  "default_driver": "esp32"},
 }

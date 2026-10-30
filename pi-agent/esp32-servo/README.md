@@ -261,6 +261,36 @@ The sensors are wired as in section 3.
 
 ---
 
+## 3c. Wire the ESP32 to integrated servos (iSV57T)
+
+Profile **`integrated-servo`**. Wire it the same way as the closed-loop
+stepper in section 3b: the iSV57T's PUL and DIR are also opto-isolated 5 V
+inputs, so use **common-anode from +5 V** and let the ESP32 pin sink the
+signal. The differences are that there is **no enable line**, and ALM has
+the opposite sense.
+
+| signal | motor A | motor B | iSV57T terminal |
+| --- | --- | --- | --- |
+| PUL− (pulse) | GPIO25 | GPIO32 | **PUL−** (PUL+ → +5 V) |
+| DIR− (direction) | GPIO26 | GPIO33 | **DIR−** (DIR+ → +5 V) |
+| ALM+ | GPIO18 | GPIO19 | **ALM+** (ALM− → ESP32 GND) |
+| GND | — | — | drive's signal GND ↔ ESP32 GND |
+
+- **Enable:** leave ENA unconnected (if your unit has it). The motor is
+  energised as soon as it has power. GPIO27/GPIO14 stay unused. To cut the
+  motors, switch their supply with a relay.
+- **ALM** conducts **while the drive is healthy**, like the A6-RS. The ESP32
+  reads LOW = OK and HIGH = fault, so an **unwired** ALM reads as a fault.
+  Until ALM is wired, turn on **Ignore the drives' alarm outputs** in the app.
+- **Pulses/rev:** set by the DIP switches on the motor. Enter the same number
+  as *Pulses per revolution* in the app.
+- **Power:** 24–48 V DC on the motor's power terminals. The control inputs
+  take nothing from it.
+
+The sensors are wired as in section 3.
+
+---
+
 ## 4. Switch the agent over
 
 In the app: *Settings → Motor drive*, pick the drive card (AC servo /
