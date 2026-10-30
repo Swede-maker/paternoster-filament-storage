@@ -21,7 +21,7 @@ import {
 } from "lucide-react"
 import { useStore } from "@/lib/store"
 import type { StorageNode } from "@/lib/types"
-import type { NetPin, NetSlave, WifiNetwork } from "@/lib/node-protocol"
+import type { NetPin, NetResultEvent, NetSlave, WifiNetwork } from "@/lib/node-protocol"
 import { NET_MODE_LABEL, NET_PIN_LABEL, signalBars, validatePsk, wifiQrPayload } from "@/lib/net"
 import { qrSvgMarkup } from "@/lib/qr"
 import { cn } from "@/lib/utils"
@@ -38,8 +38,17 @@ import { AddSlaveCarouselDialog } from "./add-slave-carousel-dialog"
  * the existing relay; results stream back over the SSE link as `net.*` frames
  * and land on `node.net` / `node.netSlaves` / `node.netResult`.
  */
-export function NetworkPanel({ node }: { node: StorageNode }) {
+export function NetworkPanel({
+  node,
+  onResult,
+}: {
+  node: StorageNode
+  /** Overrides where net results go — for a server-only master that is not a store node. */
+  onResult?: (result: NetResultEvent | null) => void
+}) {
   const { state, dispatch } = useStore()
+  const setResult = (r: NetResultEvent | null) =>
+    onResult ? onResult(r) : dispatch({ type: "NODE_NET_RESULT", nodeId: node.id, result: r })
   const [addingSlave, setAddingSlave] = useState<NetSlave | null>(null)
   const net = node.net ?? null
   const result = node.netResult ?? null
@@ -105,7 +114,7 @@ export function NetworkPanel({ node }: { node: StorageNode }) {
 
   const join = async (ssid: string, psk: string) => {
     setJoining(ssid)
-    dispatch({ type: "NODE_NET_RESULT", nodeId: node.id, result: null })
+    setResult(null)
     try {
       const r = await fetch("/api/net/join", {
         method: "POST",
@@ -116,16 +125,12 @@ export function NetworkPanel({ node }: { node: StorageNode }) {
       if (!data.ok) throw new Error(data.error ?? "Could not send")
     } catch (err) {
       setJoining(null)
-      dispatch({
-        type: "NODE_NET_RESULT",
-        nodeId: node.id,
-        result: { type: "net.result", op: "join", ok: false, error: err instanceof Error ? err.message : "Failed" },
-      })
+      setResult({ type: "net.result", op: "join", ok: false, error: err instanceof Error ? err.message : "Failed" })
     }
   }
 
   const postMode = async (body: Record<string, unknown>, opLabel: string) => {
-    dispatch({ type: "NODE_NET_RESULT", nodeId: node.id, result: null })
+    setResult(null)
     try {
       const r = await fetch("/api/net/mode", {
         method: "POST",
@@ -137,11 +142,7 @@ export function NetworkPanel({ node }: { node: StorageNode }) {
     } catch (err) {
       setPendingPin(null)
       setBusy(null)
-      dispatch({
-        type: "NODE_NET_RESULT",
-        nodeId: node.id,
-        result: { type: "net.result", op: opLabel, ok: false, error: err instanceof Error ? err.message : "Failed" },
-      })
+      setResult({ type: "net.result", op: opLabel, ok: false, error: err instanceof Error ? err.message : "Failed" })
     }
   }
 
@@ -153,7 +154,7 @@ export function NetworkPanel({ node }: { node: StorageNode }) {
     }
     setNewPskError(null)
     setBusy("set-ap-psk")
-    dispatch({ type: "NODE_NET_RESULT", nodeId: node.id, result: null })
+    setResult(null)
     try {
       const r = await fetch("/api/net/hotspot", {
         method: "POST",
@@ -167,11 +168,7 @@ export function NetworkPanel({ node }: { node: StorageNode }) {
       setApPsk(newPsk)
     } catch (err) {
       setBusy(null)
-      dispatch({
-        type: "NODE_NET_RESULT",
-        nodeId: node.id,
-        result: { type: "net.result", op: "set-ap-psk", ok: false, error: err instanceof Error ? err.message : "Failed" },
-      })
+      setResult({ type: "net.result", op: "set-ap-psk", ok: false, error: err instanceof Error ? err.message : "Failed" })
     }
   }
 
@@ -257,7 +254,7 @@ export function NetworkPanel({ node }: { node: StorageNode }) {
 
       {/* Result banner */}
       {result && result.op !== "ap-starting" && result.op !== "join-starting" && (
-        <ResultBanner result={result} onDismiss={() => dispatch({ type: "NODE_NET_RESULT", nodeId: node.id, result: null })} />
+        <ResultBanner result={result} onDismiss={() => setResult(null)} />
       )}
       {result?.op === "join-starting" && (
         <p className="flex items-center gap-2 rounded-lg border border-primary/40 bg-primary/5 px-3 py-2 text-sm text-foreground">

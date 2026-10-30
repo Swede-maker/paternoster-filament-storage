@@ -40,6 +40,7 @@ import { useTheme } from "@/lib/use-theme"
 import { cn } from "@/lib/utils"
 import { getStats, masterNode, nodeSlotCount, nodesForSystem, shelfLabel } from "@/lib/selectors"
 import { NetworkPanel } from "./network/network-panel"
+import { LocalMasterNetwork } from "./network/local-master-network"
 import { UpdateSection } from "./update-section"
 import { StartAreaToggle } from "./start-area-toggle"
 import { newId, formatGrams, pulseDriveFor } from "@/lib/filament"
@@ -221,7 +222,7 @@ export function SettingsView() {
       </Section>
 
       {/* Network — only meaningful once a real master Pi exists */}
-      {hardwareMaster && (
+      {hardwareMaster ? (
         <Section icon={<Wifi className="h-5 w-5 text-primary" />} title="Network">
           <p className="text-sm text-muted-foreground text-pretty">
             Wi-Fi for the master Raspberry Pi and every slave that follows it. Pick the workshop router here; if the
@@ -229,6 +230,18 @@ export function SettingsView() {
           </p>
           <NetworkPanel node={hardwareMaster} />
         </Section>
+      ) : (
+        <LocalMasterNetwork>
+          {(panel) => (
+            <Section icon={<Wifi className="h-5 w-5 text-primary" />} title="Network">
+              <p className="text-sm text-muted-foreground text-pretty">
+                Wi-Fi for the master Raspberry Pi and every slave that follows it. Pick the workshop router here; if the
+                router ever disappears, the master opens its own hotspot so you can still reach this app from a phone.
+              </p>
+              {panel}
+            </Section>
+          )}
+        </LocalMasterNetwork>
       )}
 
       {/* Update — pulls the newest code from GitHub on a Pi installation */}
