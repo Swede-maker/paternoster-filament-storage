@@ -8,143 +8,112 @@ Everything you set up is stored in a **single local SQLite file** (`paternoster.
 the machine that runs the app. There is **no external database and no required API key** to
 run it. Any device on your network opens the app in a browser and shares the same data.
 
-The server (your Pi) tracks filament usage **in the background** — as long as the app is
+The server tracks filament usage **in the background** — as long as the app is
 running it keeps polling your printers and deducting filament from the active spool, even
 when no phone or computer has the app open. See [Background filament tracking](#background-filament-tracking).
 
 ---
 
-## 0. Raspberry Pi: one-command install
+## 1. Install
 
-On a fresh Raspberry Pi OS (Bookworm or newer, Wi-Fi already set up by the imager), run:
+On a fresh Raspberry Pi OS (Bookworm or newer, Wi-Fi already set up by the imager) or
+an always-on Debian/Ubuntu PC, run:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Swede-maker/paternoster-filament-storage/main/setup.sh | sudo bash
 ```
 
-It asks **what this Pi should do**:
+It asks **what this device should be**. You need exactly one master; every
+carousel beyond that is a slave.
 
-| Answer | Setup | What gets installed |
+| Choice | What gets installed | Address |
 |---|---|---|
-| `1` | **Filament only** | The web app (spools, shelves, printers). No motors, no GPIO. |
-| `2` | **Master** | The web app **and** it drives one paternoster from this Pi. Host for the whole system: `.local` hostnames, hotspot fallback, slave provisioning. |
-| `3` | **Slave** | Carousel agent only; follows the master. A Pi Zero 2 W is enough. |
+| **Master → PC** | Web app, database and slave sign-in. No motors, no GPIO, the PC's network is left alone. | You pick the hostname (default `pax-master.local`) |
+| **Master → Raspberry Pi → no carousel** | Same as the PC server, plus the **PAX-Setup** hotspot if the router disappears. | `pax-master.local` |
+| **Master → Raspberry Pi → with carousel** | Web app **and** this Pi drives one carousel, plus the hotspot fallback. | `pax-master.local` |
+| **Slave** | Carousel agent only; signs in to the master. A Pi Zero 2 W is enough. | `pax-slave-<number>.local` |
 
-For `2` and `3` it also asks **which motors** are wired up and **how many shelves**
-the carousel has:
+For a carousel (master with carousel, or slave) it also asks **which motors** are
+wired up and **how many shelves** the carousel has:
 
 | Answer | Motors | Who makes the step pulses |
 |---|---|---|
-| `1` | **Integrated servos** — iSV57T or similar, drive built into the motor | The Pi itself (GPIO header) |
+| `1` | **Integrated servos** — iSV57T or similar, drive built into the motor | An **ESP32** motor controller |
 | `2` | **Closed-loop steppers** — CL57T / CL86Y or similar with a separate drive | An **ESP32** motor controller |
 | `3` | **AC servos** — A6-RS or similar with a separate drive | An **ESP32** motor controller |
 | `4` | **DC motors** — brushed motors on an H-bridge (L298N / BTS7960) | The Pi itself (PWM) |
 
-For `2` and `3` it then asks **how the ESP32 is connected**: USB cable (default),
-UART on GPIO14/15 (needs one reboot), or Wi-Fi (an ESP32 with no cable to the Pi;
-you enter its hostname). See [ESP32 motor controller](#esp32-motor-controller-closed-loop-steppers-and-ac-servos)
-below — flash the ESP32 before or after installing, the agent connects as soon
-as it answers.
+For `1`, `2` and `3` it then asks **how the ESP32 is connected**: USB cable (default),
+UART on GPIO14/15 (needs one reboot), or Wi-Fi (you enter its hostname). See
+[ESP32 motor controller](#esp32-motor-controller-closed-loop-steppers-and-ac-servos).
 
-A slave is additionally asked for its number and, optionally, the master's hotspot
-password. Then it installs everything — Node, the app as a service on port 80, the
-carousel agent with the right motor backend, mDNS, hotspot, sudoers — without further
-questions.
+A slave is additionally asked for its number, the master's hostname and,
+optionally, the master's hotspot password (skip it if the master is a PC). Then it
+installs everything — Node, the app as a service on port 80, the agent, mDNS,
+hotspot, sudoers — without further questions. On a Pi with little RAM it enlarges
+swap automatically so the build fits.
 
-When it finishes it prints the app's address (`http://pax-master.local` or
-`http://pax.local`) and, for a master, the hotspot password — write that down.
+When it finishes it prints the app's address and, for a Raspberry Pi master, the
+hotspot password — write that down.
 
-**Updating later: Settings → Update.** On an installed Pi the app checks GitHub for
-you, lists the new changes and has an **Update now** button. It downloads the newest
-code, rebuilds and restarts the app (5–15 minutes on a Pi 4) and shows the progress
-log; the page reconnects by itself when the app is back. Under the hood the app
-only writes `/var/lib/pax/update.request` — a root `pax-update` systemd service
-does the actual work by re-running this installer with your saved answers.
+### Updating
 
-**One-line update over SSH.** After you push new code to GitHub, paste this on the Pi:
+**In the app: Settings → Update.** It checks GitHub, lists the new changes and has
+an **Update now** button. It downloads the newest code, rebuilds and restarts the
+app (5–15 minutes on a Pi 4) and shows the progress log; the page reconnects by
+itself when the app is back.
+
+**Over SSH:**
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Swede-maker/paternoster-filament-storage/main/setup.sh | sudo bash -s -- --update
 ```
 
 It asks nothing: it pulls the newest code, backs up the database, rebuilds and
-restarts with your saved setup (role, motors, shelves, hostname, hotspot password).
-Your filaments, shelves, storage units, printers, history and motor tuning are not
-touched. On a Pi where PAX is not installed yet it stops instead of installing.
+restarts with your saved setup. On a device where PAX is not installed yet it stops
+instead of installing.
 
-**Running the install command again over SSH is also safe and smart.** The answers are saved in `/etc/pax-install.conf`,
-so on an installed Pi the same command recognises the setup and asks what you want:
+Running the plain install command again on an installed device shows what is
+installed and offers to:
 
 - **Update** — newest code, same setup, no questions.
-- **Add carousel control** (shown on a filament-only Pi) — turns it into the master
-  and only asks the hardware questions. Everything you have entered in the app stays.
-- **Change motor type** (shown on a master/slave) — switch between integrated
-  servos, closed-loop steppers, AC servos and DC, or change how the ESP32 is connected.
+- **Wire a carousel to this computer** (on a master without carousel) — only asks the motor questions.
+- **Change the motor type** (on a master with carousel or a slave).
 - **Reconfigure** — asks everything again.
 
-Your data is never touched by any of these. It lives outside the code checkout in
-`/var/lib/pax/paternoster.db` (filaments, shelves, storage units, printers, history),
-`/var/lib/pax-agent/motor.json` (motor tuning) and `/etc/paxnet.conf` (hotspot
-password), and a timestamped copy of the database is made in `/var/lib/pax/backups`
-before every update.
+### Your data
 
-Scripted installs: `sudo ./setup.sh --role master --motor servo --shelves 9`,
-`--role master --pulse-drive closed-loop-stepper --esp32-link usb --shelves 9`,
-`--role app`, `--role slave --motor dc --number 1 …`, or `-y` to update with the saved
-answers.
+Nothing above touches your data. It lives outside the code checkout:
 
-Everything below is the manual route for a PC or home server, or if you want to
-see what the script does.
+| File | Contents |
+|---|---|
+| `/var/lib/pax/paternoster.db` | Filaments, shelves, storage units, printers, history |
+| `/var/lib/pax-agent/motor.json` | Motor tuning |
+| `/etc/paxnet.conf` | Hotspot name and password |
+| `/etc/pax-install.conf` | Your installer answers |
 
----
+A timestamped copy of the database is made in `/var/lib/pax/backups` before every
+update (the five newest are kept).
 
-## 1. Requirements
-
-Install these once on the machine that will run the app (a PC, a home server, or a
-Raspberry Pi 4/5):
-
-- **Node.js 20 or newer** — https://nodejs.org (LTS is fine)
-- **pnpm** — the package manager. After installing Node, run:
-  ```bash
-  npm install -g pnpm
-  ```
-- **git** — https://git-scm.com
-- A **C/C++ build toolchain** (needed to compile the SQLite module):
-  - **Raspberry Pi / Debian / Ubuntu:** `sudo apt-get install -y build-essential python3`
-  - **macOS:** `xcode-select --install`
-  - **Windows:** install "Desktop development with C++" from the Visual Studio Build Tools
-
----
-
-## 2. Download and install
+### Scripted installs
 
 ```bash
-# 1. Download the code
-git clone https://github.com/Swede-maker/paternoster-filament-storage.git pax
-cd pax
-
-# 2. Install dependencies (also compiles the SQLite module automatically)
-pnpm install
-
-# 3. Build the production app
-pnpm build
-
-# 4. Start it
-pnpm start
+sudo ./setup.sh --role server
+sudo ./setup.sh --role pi-server
+sudo ./setup.sh --role master --motor servo --shelves 9
+sudo ./setup.sh --role master --pulse-drive closed-loop-stepper --esp32-link usb --shelves 9
+sudo ./setup.sh --role slave --motor dc --number 1 --shelves 9 --master pax-master.local
 ```
 
-The app now runs at **http://localhost:3000**.
-
-To open it from your phone or another computer on the same network, use the host
-machine's IP address instead, e.g. `http://192.168.1.50:3000`.
+`sudo ./setup.sh --help` lists every flag.
 
 ---
 
-## 3. First run
+## 2. First run
 
 On first launch you'll see **"Set up your storage"** — pick your storage type, name it,
 and click **Build machine**. From then on, all your printers, spools, usage totals, and
-history are saved automatically to `paternoster.db`.
+history are saved automatically.
 
 For a motorised carousel the wizard also asks for the **Motor drive**:
 
@@ -158,10 +127,10 @@ For a motorised carousel the wizard also asks for the **Motor drive**:
 Every carousel has two motors; the drive option only decides *what kind*. The
 choice is saved with the unit and pushed to the agent, which persists it and
 boots straight into the matching control logic. You can change it later under
-**Settings → Units → Motor drive**, together with motor-B mirroring (both
-drives), the servo pulses/rev and top pulse rate, and the jog step size (ms or
-pulses). The pin-by-pin wiring is in [GPIO wiring](#gpio-wiring) below; deeper
-background for both drives is in [`pi-agent/README.md`](pi-agent/README.md#hardware).
+**Settings → Hardware → Motor drive**, together with motor-B mirroring, the servo
+pulses/rev and top pulse rate, and the jog step size (ms or pulses). The
+pin-by-pin wiring is in [GPIO wiring](#gpio-wiring) below; deeper background is in
+[`pi-agent/README.md`](pi-agent/README.md#hardware).
 
 ---
 
@@ -278,218 +247,54 @@ instead of rewiring.
 
 ### Checking the wiring
 
-After installing the agent, open *Manual control*: the sensor lamps should
-light as you pass a piece of metal in front of each sensor, and the jog arrows
-should turn each motor. The agent also prints the pins it is using for every
-carousel at start-up (`journalctl -u pax-agent -f` over SSH).
+After installing, open *Manual control*: the sensor lamps should light as you pass
+a piece of metal in front of each sensor, and the jog arrows should turn each
+motor. The agent also prints the pins it is using for every carousel at start-up
+(`journalctl -u paternoster-agent -f` over SSH).
 
 ---
 
 ## Background filament tracking
 
 Filament consumption is tracked by the **server**, not the browser. When the app starts,
-the Pi launches a background poller (every 5 seconds) that connects to each linked printer
+it launches a background poller (every 5 seconds) that connects to each linked printer
 over your LAN — Klipper (Moonraker), Prusa (PrusaLink), and Bambu Lab — and subtracts the
 filament used from the spool that is currently printing.
 
-Because this runs on the Pi itself:
-
-- **You do not need the app open** on any phone or computer for weights to update. As long
-  as the Pi is powered on and the app is running, tracking continues.
+- **You do not need the app open** on any phone or computer for weights to update.
 - **A sleeping or powered-off viewing device does not stop tracking.** Only the printer
   needs to be reachable for its own consumption to be recorded.
-- When a printer is **off or unreachable**, there is simply nothing to consume; tracking
-  resumes automatically the next time it comes online (usage counters are cumulative, so no
-  data is lost).
+- When a printer is **off or unreachable**, tracking resumes automatically the next time
+  it comes online (usage counters are cumulative, so no data is lost).
 - Any browser you open will catch up to the server's totals within a few seconds.
 
-There is nothing to configure — it starts on its own with the app. To keep it running
-around the clock, run the app as a background service (see
-[Keeping it running in the background](#5-keeping-it-running-in-the-background-optional)).
+There is nothing to configure — it starts on its own with the app.
 
 ---
 
-## 4. Updating to a new version (without losing your setup)
+## 3. Troubleshooting
 
-Your data lives in `paternoster.db`, which is **not** part of the code and is never
-overwritten by an update. To update:
-
-```bash
-cd pax
-cp paternoster.db paternoster.db.backup   # optional but recommended
-git pull
-pnpm install                              # auto-rebuilds the SQLite module
-pnpm build
-pnpm start                                # or restart your service
-```
-
-Your printers and spools reappear automatically because the same database file is reused.
-
-> **Do not** delete the folder or run `git clean -fdx` — those remove `paternoster.db`.
-> To move to a fresh folder, copy `paternoster.db` into the new one first.
-
----
-
-## 4a. Building on the Pi without locking it up
-
-`next build` is by far the heaviest thing this project ever does. Measured on a
-2-core Linux box, a cold build of this app peaks at about **1.5 GB**, while the
-*running* app needs only ~120 MB. The build, not the app, is what a small Pi
-cannot handle — which is why a 2 GB Pi can happily serve this app for months and
-still refuse to build it.
-
-**Set expectations first: there is no config flag that fixes this.** Next.js 16
-builds with Turbopack, which is written in Rust, so its peak memory sits outside
-the V8 JavaScript heap. That means the usual advice does not apply here:
-
-| Attempt                                | Cold-build peak | Verdict            |
-| -------------------------------------- | --------------- | ------------------ |
-| `pnpm build` (baseline)                | ~1534 MB        | —                  |
-| `experimental.cpus: 1`                 | ~1528 MB        | ~6 MB, noise       |
-| `NODE_OPTIONS=--max-old-space-size=512`| ~1509 MB        | ~25 MB, noise      |
-| Both together (`pnpm build:pi`)        | ~1508 MB        | ~26 MB, noise      |
-
-Under a hard 1.2 GB ceiling the build dies with `std::bad_alloc` — a *native*
-allocation failure, not `JavaScript heap out of memory`. That is the tell that
-Node heap flags cannot help. `pnpm build:pi` still exists and is still worth using
-(`LOW_MEM=1`, one compiler worker), but treat it as a small margin, not a fix.
-
-So on a memory-limited Pi, use one of the two things that genuinely work:
-
-**1. Add swap.** Slow on an SD card, but it only has to survive one build, and it
-turns a hard failure into a slow success:
-
-```bash
-sudo dphys-swapfile swapoff
-sudo sed -i 's/^#\?CONF_SWAPSIZE=.*/CONF_SWAPSIZE=4096/' /etc/dphys-swapfile
-sudo dphys-swapfile setup && sudo dphys-swapfile swapon
-```
-
-**2. Build on a PC and copy `.next` over** — see 4b below. This is the reliable
-answer for a 2 GB or smaller Pi, and it is fast. Worth knowing: the *useful* build
-output is tiny (~4 MB of `.next/static` + `.next/server`); the rest of `.next` is
-throwaway compiler cache.
-
-Two more things that free real memory on the Pi itself:
-
-- **Close the desktop.** Building over SSH on Raspberry Pi OS Lite, or with the
-  GUI stopped (`sudo systemctl isolate multi-user.target`), frees several hundred
-  MB — often the difference on a 2 GB Pi.
-- **Stop the app first.** A running `pnpm start` holds ~120 MB, and the carousel
-  agent holds more. Stop the service, build, then start it again.
-
-A build killed for memory dies with a bare `Killed` or `signal SIGKILL`: that is
-the kernel's OOM killer, not a bug in the code.
-
-> Avoid `output: "standalone"` for this project, tempting as the smaller bundle
-> looks. It copies `node_modules` into the build, and the bundled `better-sqlite3`
-> binaries are x64-only — an ARM Pi would fail at runtime on the database.
-
----
-
-## 4b. Building on a PC and copying to the Pi
-
-If the Pi still cannot manage it, or you just want the build to take seconds
-instead of minutes, build elsewhere. This is the fastest option and always works.
-
-Building on a PC and copying over is perfectly valid — `.next` is portable
-JavaScript. **Two rules matter:**
-
-**1. Never copy `node_modules` from the PC.** `better-sqlite3` and `sharp` are
-compiled native binaries tied to the CPU architecture; an x86 PC build cannot run
-on the Pi's ARM chip. Copy the source and `.next`, then install on the Pi:
-
-```bash
-# on the PC
-pnpm install && pnpm build
-
-# copy source + build to the Pi, excluding node_modules
-rsync -av --exclude node_modules --exclude paternoster.db ./ raspberry@192.168.0.52:~/pax/
-
-# then, on the Pi
-cd ~/pax && pnpm install   # builds the ARM SQLite module; does NOT rebuild .next
-pnpm start
-```
-
-`pnpm install` on the Pi only compiles the native modules — it does not redo the
-expensive Next.js build, so it stays light.
-
-**2. Don't switch this project to `output: "standalone"`.** It looks like the right
-tool for copying a build around, but it bundles `node_modules` **from the build
-machine**, so it would ship the PC's x86 SQLite binary to the Pi and fail at
-startup. Plain `pnpm start` with `pnpm install` run on the Pi is correct here.
-
-> After copying, confirm the new code is actually live. If a fix seems to have no
-> effect, you are almost certainly running a stale `.next` — rebuild on the PC and
-> re-copy.
-
----
-
-## 5. Keeping it running in the background (optional)
-
-`pnpm start` stops when you close the terminal. To keep it running, use a process manager
-such as [PM2](https://pm2.keymetrics.io/):
-
-```bash
-npm install -g pm2
-pm2 start "pnpm start" --name pax
-pm2 save
-pm2 startup        # follow the printed instruction to auto-start on boot
-```
-
-> **PM2 is for the web app only. Never run the Pi agent under PM2.**
-> The agent (`pi-agent/paternoster_agent.py`) is started by systemd
-> (`paternoster-agent.service`). If PM2 also starts it, two agents run at once:
-> they fight over port 8765 (`[Errno 98] address already in use`) and both open
-> the ESP32 serial link, which causes "ESP32 not answering", random STOPs mid-move,
-> and failed homing.
->
-> Check with `pm2 list`: only the web app (`pax`, running `pnpm start`) should be
-> there. If anything runs `paternoster_agent.py`, remove it:
->
-> ```bash
-> pm2 delete <name-or-id>
-> pm2 save           # so it doesn't come back after a reboot
-> ```
->
-> Restart the agent only with `sudo systemctl restart paternoster-agent`.
-
----
-
-## 6. Configuration (optional)
-
-| Variable | Default | Purpose |
-| --- | --- | --- |
-| `PATERNOSTER_DB_PATH` | `./paternoster.db` | Absolute path to the database file. Set this to store your data outside the app folder so updates can never touch it. |
-| `PORT` | `3000` | Port the web server listens on. |
-
-Example — store data in a fixed location and run on port 8080:
-
-```bash
-PATERNOSTER_DB_PATH=/home/pi/pax-data/paternoster.db PORT=8080 pnpm start
-```
-
-> **Tip:** setting `PATERNOSTER_DB_PATH` to a path outside the repo is the safest setup —
-> you can then delete and re-clone the whole project and your data stays intact.
-
----
-
-## 7. Troubleshooting
+**Logs.** Over SSH: `journalctl -u pax-app -f` (web app) and
+`journalctl -u paternoster-agent -f` (carousel agent / slave sign-in).
 
 **It shows the setup screen again after an update, or "Could not load your data".**
-The compiled SQLite module got out of sync with your Node version. Fix it with:
+The compiled SQLite module got out of sync with your Node version. Run the update
+command above, or rebuild just the module:
 
 ```bash
-pnpm rebuild better-sqlite3
+cd ~/pax && pnpm rebuild better-sqlite3 && sudo systemctl restart pax-app
 ```
 
-then restart. Your data is safe — this only rebuilds the module, it does not touch
-`paternoster.db`. (This normally happens automatically during `pnpm install`.)
+Your data is safe — this only rebuilds the module.
 
 **Another device can't reach it.**
-Make sure you're using the host machine's LAN IP (not `localhost`) and that its firewall
-allows the port.
+Use the `.local` address or the machine's LAN IP (not `localhost`), and make sure its
+firewall allows port 80.
 
 **A printer shows "Not reachable".**
 Confirm the printer's IP is correct and that the machine running PAX is on the same
 network. Klipper needs Moonraker; Prusa needs PrusaLink enabled on the printer.
+
+**The carousel stops randomly or "ESP32 not answering".**
+Only one agent may run. Restart it with `sudo systemctl restart paternoster-agent`
+and never start `paternoster_agent.py` by hand or under PM2 as well.

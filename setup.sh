@@ -27,8 +27,9 @@
 #
 # For carousels it also asks which motors are wired up (integrated servos,
 # closed-loop steppers, AC servos or DC motors) and how many shelves the
-# carousel has. Closed-loop steppers and AC servos are pulsed by an ESP32
-# (pi-agent/esp32-servo), so for those it also asks how the ESP32 is connected.
+# carousel has. Integrated servos, closed-loop steppers and AC servos are all
+# pulsed by an ESP32 (pi-agent/esp32-servo), so it also asks how the ESP32 is
+# connected.
 #
 # The answers are remembered in /etc/pax-install.conf. Running the same command
 # again on an installed Pi does NOT start over: it shows what is installed and
@@ -50,8 +51,8 @@
 #   sudo ./setup.sh --role slave  --motor dc --number 1 --shelves 9 --master pax-master.local --ap-psk <pw>
 #
 #   --pulse-drive integrated-servo|closed-loop-stepper|ac-servo   (implies --motor servo)
-#   --servo-driver gpio|esp32       who makes the pulses (default: gpio for
-#                                   integrated servos, esp32 for the others)
+#   --servo-driver gpio|esp32       who makes the pulses (default: esp32;
+#                                   gpio pulses from the Pi header instead)
 #   --esp32-link usb|uart|wifi      how the ESP32 reaches this Pi
 #   --esp32-host <host[:port]>      the ESP32's address when --esp32-link wifi
 #   sudo ./setup.sh -y            # re-run with the saved answers (update only)
@@ -407,7 +408,7 @@ if [[ $HAS_CAROUSEL -eq 1 && -z "$MOTOR" ]]; then
   tty_say ""
   tty_say "Which motors turn this carousel?"
   tty_say "  ${BOLD}1${RESET}) Integrated servos    – iSV57T or similar, drive built into the motor,"
-  tty_say "                            pulsed from this Pi"
+  tty_say "                            pulsed by an ESP32"
   tty_say "  ${BOLD}2${RESET}) Closed-loop steppers – CL57T / CL86Y or similar with a separate drive,"
   tty_say "                            pulsed by an ESP32"
   tty_say "  ${BOLD}3${RESET}) AC servos            – A6-RS or similar with a separate drive,"
@@ -431,17 +432,10 @@ if [[ $HAS_CAROUSEL -eq 1 ]]; then
   [[ "$MOTOR" == "servo" || "$MOTOR" == "dc" ]] || die "--motor must be servo or dc"
 fi
 
-# Who makes the step pulses. Separate drives (closed-loop stepper, AC servo)
-# need an ESP32 running pi-agent/esp32-servo; integrated servos are pulsed
-# from the Pi header unless told otherwise.
+# Who makes the step pulses. Every pulse drive is driven by an ESP32 running
+# pi-agent/esp32-servo; --servo-driver gpio still pulses from the Pi header.
 if [[ $HAS_CAROUSEL -eq 1 && "$MOTOR" == "servo" && "${DRIVE_ASKED:-0}" -eq 0 ]]; then
-  if [[ -z "$SERVO_DRIVER" ]]; then
-    if [[ -n "$ESP32_LINK" || ( -n "$PULSE_DRIVE" && "$PULSE_DRIVE" != "integrated-servo" ) ]]; then
-      SERVO_DRIVER=esp32
-    else
-      SERVO_DRIVER=gpio
-    fi
-  fi
+  SERVO_DRIVER="${SERVO_DRIVER:-esp32}"
   [[ "$SERVO_DRIVER" == "gpio" || "$SERVO_DRIVER" == "esp32" ]] || die "--servo-driver must be gpio or esp32"
   if [[ "$SERVO_DRIVER" == "esp32" && -z "$ESP32_LINK" ]]; then
     tty_say ""
