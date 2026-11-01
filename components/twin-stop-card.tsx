@@ -5,7 +5,7 @@ import { ArrowDownCircle, ArrowUpCircle, CheckCircle2, Loader2 } from "lucide-re
 import { useStore } from "@/lib/store"
 import { Button } from "./ui/button"
 import { Input } from "./ui/field"
-import { PartBox } from "./hardware/part-box"
+import { PartBox } from "@/features/hardware/part-box"
 
 /**
  * The second twin carousel's own stop. It runs in parallel with the main

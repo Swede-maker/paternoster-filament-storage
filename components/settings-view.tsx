@@ -32,8 +32,10 @@ import {
   DownloadCloud,
   Scale,
   Video,
+  RotateCw,
 } from "lucide-react"
 import { balanceWarningSetting } from "@/lib/rebalance"
+import { carouselOrientation, type CarouselOrientation } from "@/lib/orientation"
 import { cameraSetting, DEFAULT_CAMERA_PORT, type CameraSetting } from "@/lib/camera"
 import { useStore } from "@/lib/store"
 import { useTheme } from "@/lib/use-theme"
@@ -387,8 +389,13 @@ function NodeList() {
                 <div className="flex flex-wrap items-center gap-2">
                   <span className="truncate text-sm font-semibold text-foreground">{node.name}</span>
                   <span className="rounded-md bg-secondary/70 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
-                    {isLibrary ? "library" : isShelf ? "shelf" : "paternoster"}
+                    {isLibrary ? "library" : isShelf ? "shelf" : "carousel"}
                   </span>
+                  {!isManual && (
+                    <span className="rounded-md bg-primary/10 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-primary">
+                      {carouselOrientation(state, node)}
+                    </span>
+                  )}
                   {!isManual && (
                     <>
                       <span
@@ -492,6 +499,8 @@ function NodeList() {
               )}
             </div>
 
+            {!isManual && <CarouselTypePicker node={node} />}
+
             {editingId === node.id && (
               <NodeLayoutEditor node={node} onDone={() => setEditingId(null)} />
             )}
@@ -507,8 +516,11 @@ function NodeList() {
 
 /** Inline editor to rename / relocate / reshape an existing storage unit. */
 function NodeLayoutEditor({ node, onDone }: { node: StorageNode; onDone: () => void }) {
-  const { dispatch } = useStore()
-  const [draft, setDraft] = useState<StorageDraft>(() => draftFromNode(node))
+  const { state, dispatch } = useStore()
+  const [draft, setDraft] = useState<StorageDraft>(() => ({
+    ...draftFromNode(node),
+    orientation: carouselOrientation(state, node),
+  }))
 
   const save = () => {
     const { storage, shelfMeta } = draftToConfig(draft)
@@ -728,12 +740,13 @@ function AddNodeRow() {
               port: !isManual && hardware ? port : undefined,
               motorMode: !isManual ? motorMode : undefined,
               pulseDrive: !isManual && motorMode === "servo" ? pulseDrive : undefined,
+              orientation: !isManual ? (draft.orientation ?? "horizontal") : undefined,
             })
             reset()
           }}
         >
           <Plus className="h-4 w-4" />{" "}
-          {draft.nodeType === "library" ? "Add library" : isShelf ? "Add shelf storage" : "Add paternoster"}
+          {draft.nodeType === "library" ? "Add library" : isShelf ? "Add shelf storage" : "Add carousel"}
         </Button>
       </div>
     </div>
@@ -1236,6 +1249,54 @@ function CameraSection() {
         </>
       )}
     </Section>
+  )
+}
+
+/** Per-unit carousel type: each paternoster picks horizontal or vertical. */
+export function CarouselTypePicker({ node }: { node: StorageNode }) {
+  const { state, dispatch } = useStore()
+  const orientation = carouselOrientation(state, node)
+  const options: { id: CarouselOrientation; title: string; description: string }[] = [
+    {
+      id: "horizontal",
+      title: "Horizontal carousel",
+      description: "Shelves move up and down.",
+    },
+    {
+      id: "vertical",
+      title: "Vertical carousel",
+      description: "Sections rotate CW / CCW.",
+    },
+  ]
+  return (
+    <div className="mt-3 flex flex-col gap-2">
+      <span className="flex items-center gap-1.5 text-xs font-medium text-muted-foreground">
+        <RotateCw className="h-3.5 w-3.5" aria-hidden /> Carousel type
+      </span>
+      <div role="radiogroup" aria-label={`Carousel type for ${node.name}`} className="grid grid-cols-2 gap-2">
+        {options.map((o) => {
+          const active = orientation === o.id
+          return (
+            <button
+              key={o.id}
+              type="button"
+              role="radio"
+              aria-checked={active}
+              onClick={() => dispatch({ type: "UPDATE_NODE", id: node.id, changes: { orientation: o.id } })}
+              className={cn(
+                "flex flex-col items-start gap-0.5 rounded-lg border px-3 py-2 text-left transition-colors",
+                active ? "border-primary bg-primary/10" : "border-border bg-background/50 hover:border-primary/50",
+              )}
+            >
+              <span className={cn("text-sm font-semibold", active ? "text-primary" : "text-foreground")}>
+                {o.title}
+              </span>
+              <span className="text-xs leading-relaxed text-muted-foreground">{o.description}</span>
+            </button>
+          )
+        })}
+      </div>
+    </div>
   )
 }
 

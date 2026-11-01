@@ -26,6 +26,9 @@ import { SlotPickerDialog } from "./slot-picker-dialog"
 import { PrinterPickerDialog } from "./printer-picker-dialog"
 import { QueuePlaceDialog } from "./queue-place-dialog"
 import { CameraPip } from "./camera-pip"
+import { VerticalCarouselView } from "@/features/vertical/vertical-carousel-view"
+import { SectionOverviewStrip } from "@/features/vertical/section-overview-strip"
+import { isVerticalCarousel } from "@/lib/orientation"
 import { activeNode, nodesForSystem, printerSlotLabel, shelfLabel } from "@/lib/selectors"
 import { newId } from "@/lib/filament"
 import type { SpoolDraft } from "./spool-form"
@@ -112,6 +115,7 @@ export function HomeView() {
   // Both shelf and library are manual (no motor); the carousel chrome + auto
   // "place" button are paternoster-only.
   const isManual = isShelf || isLibrary
+  const vertical = !isManual && isVerticalCarousel(state, currentNode)
 
   const loadablePrinters = state.printers.filter((p) => p.loaded.some((s) => s == null))
   // Printers that currently have at least one loaded spool — the ones "Take out
@@ -299,10 +303,18 @@ export function HomeView() {
           {/* Bind the sidebar to the unit shown in this area, not the raw
               activeNodeId — that can point at a hardware carousel (with its
               own drive settings) when the user last worked in that area. */}
-          <ResizableSidebar
-            overview={<ShelfOverview node={currentNode} />}
-            control={<ManualControl node={currentNode} />}
-          />
+          {vertical ? (
+            // The section overview moves above the carousel as a strip, so the
+            // sidebar is Manual Control only.
+            <div className="flex min-h-0 flex-1 flex-col lg:overflow-y-auto lg:scrollbar-thin">
+              <ManualControl node={currentNode} />
+            </div>
+          ) : (
+            <ResizableSidebar
+              overview={<ShelfOverview node={currentNode} />}
+              control={<ManualControl node={currentNode} />}
+            />
+          )}
         </aside>
       )}
 
@@ -397,6 +409,30 @@ export function HomeView() {
             }}
             highlight={jobTarget}
           />
+        ) : vertical ? (
+          <>
+            {/* Vertical layout: a compact section overview with the printer panel
+                beside it, and the full-width carousel underneath. */}
+            <div className="flex flex-col gap-3 lg:flex-row lg:items-start">
+              <SectionOverviewStrip node={currentNode} className="lg:w-[560px] lg:shrink-0" />
+              <div className="flex min-w-0 flex-col lg:flex-1">
+                <PrinterPanel
+                  onLoadSlot={handleLoadSlot}
+                  onUnloadSlot={handleUnloadSlot}
+                  queuedPrinterSlots={queuedForActivePrinter}
+                />
+              </div>
+            </div>
+            <div className="flex min-w-0 flex-col lg:min-h-0 lg:flex-1">
+              <VerticalCarouselView
+                onSlotClick={(shelf, slot) => {
+                  if (state.job) return // don't open slot editor during an active operation
+                  setSlotTarget({ shelf, slot })
+                }}
+                highlight={jobTarget}
+              />
+            </div>
+          </>
         ) : (
           <CarouselView
             onSlotClick={(shelf, slot) => {
@@ -407,11 +443,13 @@ export function HomeView() {
           />
         )}
 
-        <PrinterPanel
-          onLoadSlot={handleLoadSlot}
-          onUnloadSlot={handleUnloadSlot}
-          queuedPrinterSlots={queuedForActivePrinter}
-        />
+        {!vertical && (
+          <PrinterPanel
+            onLoadSlot={handleLoadSlot}
+            onUnloadSlot={handleUnloadSlot}
+            queuedPrinterSlots={queuedForActivePrinter}
+          />
+        )}
       </div>
 
       {/* Queue tray — assemble the place-in and take-out queues side by side. */}

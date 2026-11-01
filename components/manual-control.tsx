@@ -10,7 +10,10 @@ import {
   SlidersHorizontal,
   ChevronDown,
   AlertTriangle,
+  RotateCw,
+  RotateCcw,
 } from "lucide-react"
+import { isVerticalCarousel } from "@/lib/orientation"
 import { useStore, type Action } from "@/lib/store"
 import { activeNode, nodeLoadGrams } from "@/lib/selectors"
 import {
@@ -85,6 +88,10 @@ export function ManualControl({
 
   // Speed controls only apply to a motorized carousel, not manual shelf storage.
   const isCarousel = node.type !== "shelf"
+  // Vertical carousels only exist in the filament area; hardware passes a twin
+  // or its own node, but still follows the filament setting only when it is a
+  // filament unit.
+  const vertical = isCarousel && isVerticalCarousel(state, node)
   // Servo (PUL/DIR) drive: the same 0..1 speed fraction becomes a pulse rate
   // instead of a PWM duty, so the sliders are relabelled and the jog panel
   // appears. The motion commands themselves are identical in both modes.
@@ -310,8 +317,18 @@ export function ManualControl({
               onClick={() => dispatch({ type: "MANUAL_MOVE", nodeId: node.id, direction: "up" })}
               className="flex h-20 flex-col items-center justify-center gap-1 rounded-xl border border-border bg-secondary/40 text-foreground transition-colors hover:border-primary/50 hover:bg-secondary/70 disabled:opacity-40"
             >
-              <ArrowUp className="h-6 w-6 text-primary" />
-              <span className="text-xs font-medium">Move Up</span>
+              {vertical ? (
+                <>
+                  <RotateCcw className="h-6 w-6 text-primary" aria-hidden />
+                  <span className="text-xs font-medium">Move CCW</span>
+                  <span className="text-[10px] leading-none text-muted-foreground">CCW = CounterClockWise</span>
+                </>
+              ) : (
+                <>
+                  <ArrowUp className="h-6 w-6 text-primary" />
+                  <span className="text-xs font-medium">Move Up</span>
+                </>
+              )}
             </button>
             <button
               type="button"
@@ -319,8 +336,18 @@ export function ManualControl({
               onClick={() => dispatch({ type: "MANUAL_MOVE", nodeId: node.id, direction: "down" })}
               className="flex h-20 flex-col items-center justify-center gap-1 rounded-xl border border-border bg-secondary/40 text-foreground transition-colors hover:border-primary/50 hover:bg-secondary/70 disabled:opacity-40"
             >
-              <ArrowDown className="h-6 w-6 text-primary" />
-              <span className="text-xs font-medium">Move Down</span>
+              {vertical ? (
+                <>
+                  <RotateCw className="h-6 w-6 text-primary" aria-hidden />
+                  <span className="text-xs font-medium">Move CW</span>
+                  <span className="text-[10px] leading-none text-muted-foreground">CW = ClockWise</span>
+                </>
+              ) : (
+                <>
+                  <ArrowDown className="h-6 w-6 text-primary" />
+                  <span className="text-xs font-medium">Move Down</span>
+                </>
+              )}
             </button>
           </div>
 
@@ -672,7 +699,7 @@ export function ManualControl({
       <div className="mt-4 rounded-xl border border-border bg-background/50 p-3">
         <p className="text-xs uppercase tracking-wider text-muted-foreground">Current Position</p>
         <p className="mt-0.5 font-mono text-2xl font-bold text-primary">
-          {homed ? `Shelf ${currentShelf + 1}` : "—"}
+          {homed ? `${vertical ? "Section" : "Shelf"} ${currentShelf + 1}` : "—"}
         </p>
         <p className="mt-1 flex items-center gap-2 text-xs">
           <span

@@ -21,6 +21,8 @@ export interface StorageDraft {
   jagged: boolean
   /** Per-shelf name / area / slot count. Length is kept in sync with `shelves`. */
   perShelf: { name: string; area: string; slots: number }[]
+  /** Carousel type; only meaningful for a paternoster ("Carousel") unit. */
+  orientation?: "horizontal" | "vertical"
 }
 
 // Paternosters are physical carousels: modest, uniform shelves. Manual shelf
@@ -107,6 +109,7 @@ export function makeDraft(nodeType: NodeType): StorageDraft {
     slotsPerShelf,
     jagged: false,
     perShelf: Array.from({ length: shelves }, () => ({ name: "", area: "", slots: slotsPerShelf })),
+    orientation: nodeType === "paternoster" ? "horizontal" : undefined,
   }
 }
 
@@ -168,8 +171,8 @@ function resizePerShelf(d: StorageDraft, shelves: number): StorageDraft["perShel
 const TYPES: { type: NodeType; title: string; blurb: string; icon: typeof Boxes }[] = [
   {
     type: "paternoster",
-    title: "Paternoster",
-    blurb: "Motorised vertical carousel driven by a Raspberry Pi. Rotates to present the right shelf.",
+    title: "Carousel",
+    blurb: "Motorised carousel driven by a Raspberry Pi. Rotates to present the right shelf or section.",
     icon: Boxes,
   },
   {
@@ -198,6 +201,9 @@ export function StorageLayoutEditor({
   const limit = LIMITS[draft.nodeType]
   const isShelf = draft.nodeType === "shelf"
   const isLibrary = draft.nodeType === "library"
+  const isVertical = draft.nodeType === "paternoster" && draft.orientation === "vertical"
+  const unitWord = isVertical ? "section" : "shelf"
+  const unitWordPlural = isVertical ? "sections" : "shelves"
   const total = draft.jagged
     ? draft.perShelf.slice(0, draft.shelves).reduce((s, p) => s + clampInt(p.slots, 1, limit.slots), 0)
     : draft.shelves * draft.slotsPerShelf
@@ -262,6 +268,39 @@ export function StorageLayoutEditor({
         </div>
       )}
 
+      {allowTypeChange && draft.nodeType === "paternoster" && (
+        <div>
+          <p className="mb-1.5 text-sm font-medium text-muted-foreground">Carousel type</p>
+          <div className="grid grid-cols-2 gap-2" role="radiogroup" aria-label="Carousel type">
+            {(
+              [
+                { id: "horizontal", title: "Horizontal carousel", blurb: "Shelves move up and down." },
+                { id: "vertical", title: "Vertical carousel", blurb: "Sections rotate CW / CCW." },
+              ] as const
+            ).map((o) => {
+              const active = (draft.orientation ?? "horizontal") === o.id
+              return (
+                <button
+                  key={o.id}
+                  type="button"
+                  role="radio"
+                  aria-checked={active}
+                  onClick={() => update({ orientation: o.id })}
+                  className={`flex flex-col gap-0.5 rounded-lg border px-3 py-2 text-left transition-colors ${
+                    active
+                      ? "border-primary bg-primary/10 text-foreground"
+                      : "border-border bg-background/50 text-muted-foreground hover:border-primary/50"
+                  }`}
+                >
+                  <span className="text-sm font-medium">{o.title}</span>
+                  <span className="text-xs text-muted-foreground">{o.blurb}</span>
+                </button>
+              )
+            })}
+          </div>
+        </div>
+      )}
+
       <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
         <Field label={isLibrary ? "Library name" : isShelf ? "Storage name" : "System name"}>
           <Input
@@ -287,10 +326,10 @@ export function StorageLayoutEditor({
       ) : (
         <>
           <div className="grid grid-cols-2 gap-4">
-            <Field label={`Number of shelves (1–${limit.shelves})`}>
+            <Field label={`Number of ${unitWordPlural} (1–${limit.shelves})`}>
               <NumberInput min={1} max={limit.shelves} value={draft.shelves} onCommit={setShelves} />
             </Field>
-            <Field label={`Slots per shelf (1–${limit.slots})`}>
+            <Field label={`Slots per ${isVertical ? "sections" : "shelf"} (1–${limit.slots})`}>
               <NumberInput
                 min={1}
                 max={limit.slots}
@@ -309,7 +348,7 @@ export function StorageLayoutEditor({
               onChange={(e) => toggleJagged(e.target.checked)}
             />
             <SlidersHorizontal className="h-4 w-4" />
-            Different slot counts per shelf
+            Different slot counts per {unitWord}
           </label>
         </>
       )}
@@ -318,7 +357,7 @@ export function StorageLayoutEditor({
         <div className="rounded-xl border border-border bg-background/50 p-3">
           <div className="mb-2 flex items-center justify-between">
             <span className="flex items-center gap-2 text-sm font-medium text-muted-foreground">
-              <LayoutGrid className="h-4 w-4" /> Shelves
+              <LayoutGrid className="h-4 w-4" /> {isVertical ? "Sections" : "Shelves"}
             </span>
             <span className="font-mono text-sm text-primary">{total} total slots</span>
           </div>

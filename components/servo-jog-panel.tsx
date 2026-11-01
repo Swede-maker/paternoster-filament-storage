@@ -1,7 +1,20 @@
 "use client"
 
 import { useState } from "react"
-import { ArrowDown, ArrowUp, ChevronDown, Hand, Loader2, Lock, ShieldAlert, ShieldCheck, X } from "lucide-react"
+import {
+  ArrowDown,
+  ArrowUp,
+  ChevronDown,
+  Hand,
+  Loader2,
+  Lock,
+  RotateCcw,
+  RotateCw,
+  ShieldAlert,
+  ShieldCheck,
+  X,
+} from "lucide-react"
+import { isVerticalCarousel } from "@/lib/orientation"
 import { useStore } from "@/lib/store"
 import { usePersistentBoolean } from "@/lib/use-persistent"
 import {
@@ -156,10 +169,15 @@ export function ServoJogPanel({ node }: { node: StorageNode }) {
   // one-servo hardware carousel. The servo case sends "both" so the agent
   // counts the jog as carousel movement (with one servo it only pulses A);
   // the DC agent ignores the motor field and drives its one bridge.
-  const oneMotor = single || !servo
+  // A vertical carousel always jogs as one unit: a single chip that drives
+  // every connected motor ("both" — with one servo the agent pulses only A).
+  const vertical = isVerticalCarousel(state, node)
+  const oneMotor = single || !servo || vertical
   const MOTORS: { id: ServoMotorId; label: string; alarm?: boolean }[] = !servo
     ? [{ id: "a", label: "Motor" }]
-    : single
+    : vertical
+      ? [{ id: "both", label: "Motor", alarm: alarmA || alarmB }]
+      : single
       ? [{ id: "both", label: "Servo", alarm: alarmA }]
       : [
           { id: "a", label: "Motor A", alarm: alarmA },
@@ -186,7 +204,7 @@ export function ServoJogPanel({ node }: { node: StorageNode }) {
         )}
       >
         <span className="whitespace-nowrap text-xs font-semibold uppercase tracking-wider">{label}</span>
-        {id === "both" && !single ? (
+        {id === "both" && !single && !vertical ? (
           <span className={cn("text-[10px]", active ? "text-primary-foreground/80" : "text-muted-foreground")}>
             A + B
           </span>
@@ -211,7 +229,14 @@ export function ServoJogPanel({ node }: { node: StorageNode }) {
   }
 
   const JogArrow = ({ direction }: { direction: "up" | "down" }) => {
-    const Icon = direction === "up" ? ArrowUp : ArrowDown
+    const Icon = vertical
+      ? direction === "up"
+        ? RotateCw
+        : RotateCcw
+      : direction === "up"
+        ? ArrowUp
+        : ArrowDown
+    const dirName = vertical ? (direction === "up" ? "clockwise" : "counter-clockwise") : direction
     const busy = Boolean(
       (selected && pending === `${selected}:${direction}`) ||
         (jogging && node.servo?.motor === selected && node.servo?.direction === direction),
@@ -227,12 +252,12 @@ export function ServoJogPanel({ node }: { node: StorageNode }) {
         aria-pressed={busy}
         aria-label={
           selected
-            ? `Jog ${selectedLabel} ${direction} by ${step} ${unit}`
-            : `Jog ${direction} (select a motor first)`
+            ? `Jog ${selectedLabel} ${dirName} by ${step} ${unit}`
+            : `Jog ${dirName} (select a motor first)`
         }
         onClick={() => selected && void jog(selected, direction)}
         className={cn(
-          "flex h-20 items-center justify-center rounded-xl border transition-colors",
+          "flex h-20 flex-col items-center justify-center gap-1 rounded-xl border transition-colors",
           busy
             ? "border-primary bg-primary/15 text-foreground"
             : "border-border bg-background/60 text-foreground hover:border-primary/50 hover:bg-secondary/70 disabled:hover:border-border disabled:hover:bg-background/60",
@@ -242,7 +267,14 @@ export function ServoJogPanel({ node }: { node: StorageNode }) {
         {busy ? (
           <Loader2 className="h-9 w-9 animate-spin text-primary" />
         ) : (
-          <Icon className={cn("h-9 w-9", waiting ? "text-muted-foreground" : "text-primary")} />
+          <Icon
+            className={cn(vertical ? "h-7 w-7" : "h-9 w-9", waiting ? "text-muted-foreground" : "text-primary")}
+          />
+        )}
+        {vertical && (
+          <span className="text-[10px] font-medium leading-none text-muted-foreground">
+            {direction === "up" ? "CCW" : "CW"}
+          </span>
         )}
       </button>
     )
