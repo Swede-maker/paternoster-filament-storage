@@ -406,6 +406,7 @@ const NODE_TUNING_KEYS = [
   "servoIndexWindowPulses",
   "servoHomeResync",
   "servoCalibratedAt",
+  "orientation",
 ] as const satisfies readonly (keyof StorageNode)[]
 
 function mergeNodeSlots(local: StorageNode[], remote: StorageNode[] | undefined, baseline: StorageNode[] | undefined): StorageNode[] {
@@ -828,6 +829,7 @@ export type Action =
       port?: number
       motorMode?: MotorMode
       pulseDrive?: PulseDrive
+      orientation?: "horizontal" | "vertical"
       /** Mark this unit as a real slave to be linked later via a pairing code. */
       pair?: boolean
     }
@@ -864,6 +866,7 @@ export type Action =
           | "servoHoldTimeoutS"
           | "positionMode"
           | "servoHomeResync"
+          | "orientation"
         >
       >
     }
@@ -1610,11 +1613,18 @@ function coreReducer(state: AppState, action: Action): AppState {
       // driver until (and after) a real agent phones home, so the app never
       // tries to reach a fixed IP for it.
       if (action.pair) node.pairStatus = "unpaired"
+      if (action.orientation && action.nodeType === "paternoster") node.orientation = action.orientation
       return { ...state, nodes: [...state.nodes, node] }
     }
 
-    case "UPDATE_NODE":
-      return withNode(state, action.id, (n) => {
+    case "UPDATE_NODE": {
+      // Both halves of a twin are one physical machine, so they always share a carousel type.
+      const orientation = action.changes.orientation
+      const target = orientation ? getNode(state, action.id) : undefined
+      const sibling = target ? twinSiblingOf(state, target) : undefined
+      const base =
+        sibling && orientation ? withNode(state, sibling.id, (n) => ({ ...n, orientation })) : state
+      return withNode(base, action.id, (n) => {
         const merged = { ...n, ...action.changes }
         // If the driver mode changed, reset the link + re-home so the new
         // driver (sim timers vs. Pi agent) takes over from a clean state.
@@ -1624,6 +1634,7 @@ function coreReducer(state: AppState, action: Action): AppState {
         }
         return merged
       })
+    }
 
     case "RESHAPE_NODE": {
       const target = getNode(state, action.id)

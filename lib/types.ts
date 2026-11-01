@@ -593,6 +593,12 @@ export interface Settings {
    */
   balanceWarning?: { enabled: boolean; thresholdGrams: number }
   /**
+   * Filament carousel layout. "horizontal" (default) = paternoster, shelves move
+   * up/down. "vertical" = rotating carousel, sections move CW/CCW and are drawn
+   * as side-by-side columns. Optional for older saves.
+   */
+  carouselOrientation?: "horizontal" | "vertical"
+  /**
    * USB webcam on the Pi (served by pi-agent/camera/pax_camera.py). `enabled`
    * shows the live view in the Home sidebar; `popupOnMove` opens it by itself
    * while a carousel is moving. `host` overrides the address (defaults to the
@@ -740,6 +746,11 @@ export interface StorageNode {
   area?: string
   /** Per-shelf metadata (custom names + areas), index-aligned to shelves. */
   shelfMeta?: ShelfMeta[]
+  /**
+   * Carousel layout for a filament paternoster: "horizontal" (shelves move
+   * up/down) or "vertical" (sections rotate CW/CCW). Absent on older saves.
+   */
+  orientation?: "horizontal" | "vertical"
   /** IP address / hostname of the controller (RPi, microcontroller, …). */
   ip: string
   role: NodeRole

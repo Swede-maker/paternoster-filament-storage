@@ -267,7 +267,7 @@ if [[ $UPDATE_ONLY -eq 1 ]]; then
 elif [[ -n "$OLD_ROLE" && $RECONFIGURE -eq 0 && -z "$ROLE" ]]; then
   tty_say "${GREEN}PAX is already installed on this Pi.${RESET}"
   tty_say "    setup   : $(role_label "$OLD_ROLE")"
-  [[ "$OLD_ROLE" == "master" || "$OLD_ROLE" == "slave" ]] && tty_say "    motors  : $(motor_label "$OLD_MOTOR" "$OLD_PULSE_DRIVE" "$OLD_SERVO_DRIVER" "$OLD_ESP32_LINK")${OLD_SHELVES:+, $OLD_SHELVES shelves}"
+  [[ "$OLD_ROLE" == "master" || "$OLD_ROLE" == "slave" ]] && tty_say "    motors  : $(motor_label "$OLD_MOTOR" "$OLD_PULSE_DRIVE" "$OLD_SERVO_DRIVER" "$OLD_ESP32_LINK")${OLD_SHELVES:+, $OLD_SHELVES shelves/sections}"
   [[ -f "$DATA_DIR/paternoster.db" ]] && tty_say "    data    : $DATA_DIR/paternoster.db ($(du -h "$DATA_DIR/paternoster.db" | cut -f1)) — will be kept"
   tty_say ""
   tty_say "What do you want to do?"
@@ -464,8 +464,8 @@ fi
 # Question 3: shelves, and for a slave its number + master hotspot password
 # --------------------------------------------------------------------------
 if [[ $HAS_CAROUSEL -eq 1 ]]; then
-  SHELVES="${SHELVES:-$(ask "How many shelves does this carousel have?" "${OLD_SHELVES:-9}")}"
-  [[ "$SHELVES" =~ ^[0-9]+$ && "$SHELVES" -ge 2 ]] || die "shelves must be a number (2 or more)"
+  SHELVES="${SHELVES:-$(ask "How many shelves/sections does this carousel have?" "${OLD_SHELVES:-9}")}"
+  [[ "$SHELVES" =~ ^[0-9]+$ && "$SHELVES" -ge 2 ]] || die "shelves/sections must be a number (2 or more)"
 fi
 
 CUR_HOST="$(hostname 2>/dev/null || cat /etc/hostname 2>/dev/null || echo raspberrypi)"
@@ -519,7 +519,7 @@ fi
 printf '\n'
 SUMMARY="$(role_label "$ROLE")"
 MOTOR_TEXT="$(motor_label "$MOTOR" "$PULSE_DRIVE" "$SERVO_DRIVER" "$ESP32_LINK")"
-[[ $HAS_CAROUSEL -eq 1 ]] && SUMMARY="$SUMMARY — $MOTOR_TEXT, $SHELVES shelves"
+[[ $HAS_CAROUSEL -eq 1 ]] && SUMMARY="$SUMMARY — $MOTOR_TEXT, $SHELVES shelves/sections"
 say "Installing: ${BOLD}$SUMMARY${RESET}"
 note "hostname $HOSTNAME_NEW.local"
 [[ "$ACTION" == "add-hardware" ]] && note "your existing filament data stays exactly as it is"
