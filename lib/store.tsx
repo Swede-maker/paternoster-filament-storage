@@ -876,6 +876,7 @@ export type Action =
   /** Force a hardware node's WebSocket to close and reopen (manual retry). */
   | { type: "RECONNECT_NODE"; id: string }
   | { type: "SET_MASTER"; id: string }
+  | { type: "CHANGE_NODE_TYPE"; id: string; nodeType: NodeType }
   | { type: "SET_ACTIVE_NODE"; id: string }
   // Pairing a real slave by code (no IP). See StorageNode.pairStatus.
   /** Issue a fresh pairing code and wait for the slave to check in. */
@@ -1677,8 +1678,15 @@ function coreReducer(state: AppState, action: Action): AppState {
       let nodes = state.nodes.filter((n) => n.id !== action.id)
       // Guarantee exactly one master.
       if (target.role === "master" && !nodes.some((n) => n.role === "master")) {
+        // Hand the role to the next carousel; shelves and libraries have no
+        // controller, so they only inherit it when no carousel is left.
+        const carouselIndex = nodes.findIndex((n) => {
+          const t = n.type ?? "paternoster"
+          return t !== "shelf" && t !== "library"
+        })
+        const heirIndex = carouselIndex === -1 ? 0 : carouselIndex
         nodes = nodes.map((n, i) =>
-          i === 0
+          i === heirIndex
             ? { ...n, role: "master", link: n.driver === "hardware" ? n.link : "online" }
             : n,
         )
@@ -1704,6 +1712,62 @@ function coreReducer(state: AppState, action: Action): AppState {
           return { ...n, role: "master" as NodeRole, link }
         }
         return { ...n, role: "slave" as NodeRole }
+      })
+      return { ...state, nodes }
+    }
+
+    case "CHANGE_NODE_TYPE": {
+      const target = getNode(state, action.id)
+      if (!target) return state
+      const from: NodeType = target.type ?? "paternoster"
+      const to = action.nodeType
+      if (from === to) return state
+      // A twin half shares its motion with its sibling; split the pair first.
+      if (target.twinSide) return state
+      if (state.job?.items.some((it) => !it.done && it.nodeId === target.id)) return state
+
+      // Spools always stay. A library is one unbounded row; a grid is refilled
+      // in order and grows extra shelves if the spools don't fit.
+      const stored = target.slots.flat().filter((id): id is string => !!id)
+      let storage = target.storage
+      let slots: (string | null)[][]
+      if (to === "library") {
+        slots = [stored]
+      } else if (from === "library") {
+        const perShelf = Math.max(1, storage.slotsPerShelf)
+        const needed = Math.ceil(stored.length / perShelf)
+        if (needed > storage.shelves) storage = { ...storage, shelves: needed }
+        slots = buildGrid(storage)
+        stored.forEach((id, i) => {
+          slots[Math.floor(i / perShelf)][i % perShelf] = id
+        })
+      } else {
+        slots = target.slots
+      }
+
+      const manual = to === "shelf" || to === "library"
+      const nodes = state.nodes.map((n): StorageNode => {
+        if (n.id !== target.id) return n
+        const base = { ...n, type: to, storage, slots, calibrating: false }
+        if (manual) {
+          // No controller: drop motor settings and run as an always-online unit.
+          return {
+            ...base,
+            driver: "simulated",
+            link: "online",
+            motorMode: undefined,
+            pulseDrive: undefined,
+            servoDriver: undefined,
+            machine: shelfMachine(),
+          }
+        }
+        return {
+          ...base,
+          driver: "simulated",
+          link: "online",
+          motorMode: n.motorMode ?? "dc",
+          machine: freshMachine(),
+        }
       })
       return { ...state, nodes }
     }

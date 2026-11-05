@@ -43,7 +43,7 @@ import { Field, Input, Checkbox } from "@/components/ui/field"
 import { NumberInput } from "@/components/ui/number-input"
 import { MotorDrivePicker } from "@/components/motor-drive-picker"
 import { MotorDriveEditor } from "@/components/motor-drive-editor"
-import { CarouselTypePicker } from "@/components/settings-view"
+import { CarouselTypePicker, UnitTypePicker } from "@/components/settings-view"
 import { carouselOrientation, isVerticalCarousel } from "@/lib/orientation"
 import {
   draftFromNode,
@@ -414,12 +414,13 @@ function NodeList() {
                   <Columns2 className="h-4 w-4" /> Merge twin
                 </Button>
               )}
-              {state.nodes.length > 1 && !isMaster && !node.twinSide && (
+              {state.nodes.length > 1 && !node.twinSide && (
                 <Button
                   variant="ghost"
                   size="sm"
                   onClick={() => {
-                    if (confirm(`Remove ${node.name}? Hardware stored on it will be removed.`)) {
+                    const handoff = isMaster ? " Another carousel will become the master." : ""
+                    if (confirm(`Remove ${node.name}? Hardware stored on it will be removed.${handoff}`)) {
                       dispatch({ type: "REMOVE_NODE", id: node.id })
                     }
                   }}
@@ -429,6 +430,7 @@ function NodeList() {
               )}
             </div>
 
+            <UnitTypePicker node={node} />
             {!isManual && <CarouselTypePicker node={node} />}
             {editingId === node.id && <NodeLayoutEditor node={node} onDone={() => setEditingId(null)} />}
             {!isManual && <MotorDriveEditor node={node} />}
