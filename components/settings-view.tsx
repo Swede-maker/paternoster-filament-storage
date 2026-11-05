@@ -48,7 +48,7 @@ import { StartAreaToggle } from "./start-area-toggle"
 import { newId, formatGrams, pulseDriveFor } from "@/lib/filament"
 import { newQrTagId, qrPayload, allBindings, describeTarget } from "@/lib/tags"
 import { QrPrintButton } from "./qr-print-button"
-import type { Container, MotorMode, PulseDrive, StorageNode, TagBinding } from "@/lib/types"
+import type { Container, MotorMode, NodeType, PulseDrive, StorageNode, TagBinding } from "@/lib/types"
 import { Button } from "./ui/button"
 import { MotorDrivePicker, motorModeLabel } from "./motor-drive-picker"
 import { MotorDriveEditor } from "./motor-drive-editor"
@@ -484,12 +484,13 @@ function NodeList() {
                   Make master
                 </Button>
               )}
-              {canRemove && !isMaster && (
+              {canRemove && (
                 <Button
                   variant="ghost"
                   size="sm"
                   onClick={() => {
-                    if (confirm(`Remove ${node.name}? Spools stored on it will be removed.`)) {
+                    const handoff = isMaster ? " Another carousel will become the master." : ""
+                    if (confirm(`Remove ${node.name}? Spools stored on it will be removed.${handoff}`)) {
                       dispatch({ type: "REMOVE_NODE", id: node.id })
                     }
                   }}
@@ -499,6 +500,7 @@ function NodeList() {
               )}
             </div>
 
+            <UnitTypePicker node={node} />
             {!isManual && <CarouselTypePicker node={node} />}
 
             {editingId === node.id && (
@@ -1249,6 +1251,67 @@ function CameraSection() {
         </>
       )}
     </Section>
+  )
+}
+
+/** Switch a unit between carousel, shelf storage and library. Role and spools are kept. */
+export function UnitTypePicker({ node }: { node: StorageNode }) {
+  const { state, dispatch } = useStore()
+  const current: NodeType = node.type ?? "paternoster"
+  const busy = !!state.job?.items.some((it) => !it.done && it.nodeId === node.id)
+  const locked = !!node.twinSide || busy
+  const options: { id: NodeType; title: string; description: string; icon: React.ReactNode }[] = [
+    { id: "paternoster", title: "Carousel", description: "Motor-driven.", icon: <Server className="h-4 w-4" aria-hidden /> },
+    { id: "shelf", title: "Shelf storage", description: "Manual, fixed slots.", icon: <Package className="h-4 w-4" aria-hidden /> },
+    { id: "library", title: "Library", description: "Manual, one open row.", icon: <Library className="h-4 w-4" aria-hidden /> },
+  ]
+  const change = (to: NodeType) => {
+    if (to === current || locked) return
+    const label = options.find((o) => o.id === to)!.title.toLowerCase()
+    const motorNote =
+      current === "paternoster" ? " Its motor and Pi agent settings are cleared." : ""
+    const roleNote = node.role === "master" ? " It stays the master." : ""
+    if (confirm(`Change ${node.name} to ${label}? All spools are kept.${motorNote}${roleNote}`)) {
+      dispatch({ type: "CHANGE_NODE_TYPE", id: node.id, nodeType: to })
+    }
+  }
+  return (
+    <div className="mt-3 flex flex-col gap-2">
+      <span className="text-xs font-medium text-muted-foreground">Unit type</span>
+      <div role="radiogroup" aria-label={`Unit type for ${node.name}`} className="grid grid-cols-3 gap-2">
+        {options.map((o) => {
+          const active = current === o.id
+          return (
+            <button
+              key={o.id}
+              type="button"
+              role="radio"
+              aria-checked={active}
+              disabled={locked && !active}
+              onClick={() => change(o.id)}
+              className={cn(
+                "flex flex-col items-start gap-0.5 rounded-lg border px-3 py-2 text-left transition-colors disabled:cursor-not-allowed disabled:opacity-50",
+                active ? "border-primary bg-primary/10" : "border-border bg-background/50 hover:border-primary/50",
+              )}
+            >
+              <span
+                className={cn(
+                  "flex items-center gap-1.5 text-sm font-semibold",
+                  active ? "text-primary" : "text-foreground",
+                )}
+              >
+                {o.icon} {o.title}
+              </span>
+              <span className="text-xs leading-relaxed text-muted-foreground">{o.description}</span>
+            </button>
+          )
+        })}
+      </div>
+      {node.twinSide && (
+        <p className="text-xs text-muted-foreground">Split the twin pair to change this unit&apos;s type.</p>
+      )}
+      {busy && <p className="text-xs text-muted-foreground">Finish the running job to change this unit&apos;s type.</p>}
+    </div>
   )
 }
 
