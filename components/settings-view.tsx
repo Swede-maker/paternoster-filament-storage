@@ -33,6 +33,7 @@ import {
   Scale,
   Video,
   RotateCw,
+  Crown,
 } from "lucide-react"
 import { balanceWarningSetting } from "@/lib/rebalance"
 import { carouselOrientation, type CarouselOrientation } from "@/lib/orientation"
@@ -340,7 +341,11 @@ function NodeList() {
   const { state, dispatch } = useStore()
   // Filament Settings manages filament units only — hardware units have their
   // own management screen in the Hardware area.
-  const filamentNodes = nodesForSystem(state, "filament")
+  // The master always leads the list, whatever its unit type; the rest keep
+  // their creation order (Array.prototype.sort is stable).
+  const filamentNodes = [...nodesForSystem(state, "filament")].sort(
+    (a, b) => Number(b.role === "master") - Number(a.role === "master"),
+  )
   const canRemove = filamentNodes.length > 1
   const [editingId, setEditingId] = useState<string | null>(null)
 
@@ -388,6 +393,11 @@ function NodeList() {
               <div className="min-w-0 flex-1">
                 <div className="flex flex-wrap items-center gap-2">
                   <span className="truncate text-sm font-semibold text-foreground">{node.name}</span>
+                  {isMaster && (
+                    <span className="inline-flex items-center gap-1 rounded-md bg-primary px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-primary-foreground">
+                      <Crown className="h-3 w-3" aria-hidden /> Master
+                    </span>
+                  )}
                   <span className="rounded-md bg-secondary/70 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
                     {isLibrary ? "library" : isShelf ? "shelf" : "carousel"}
                   </span>
@@ -398,14 +408,11 @@ function NodeList() {
                   )}
                   {!isManual && (
                     <>
-                      <span
-                        className={
-                          "rounded-md px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide " +
-                          (isMaster ? "bg-primary/15 text-primary" : "bg-muted text-muted-foreground")
-                        }
-                      >
-                        {node.role}
-                      </span>
+                      {!isMaster && (
+                        <span className="rounded-md bg-muted px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
+                          slave
+                        </span>
+                      )}
                       <span
                         className={
                           "rounded-md px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide " +
