@@ -5475,6 +5475,8 @@ class NetService:
     async def handle(self, ws, msg: dict) -> None:
         t = msg.get("type", "")
         op = t[4:]  # strip "net."
+        if op in NET_REPLY_OPS:
+            return
         if self.esp32_role:
             await self._handle_esp32(ws, op, msg)
             return
@@ -5813,7 +5815,7 @@ class NetService:
                             ap_ssid, ap_psk = msg.get("apSsid"), msg.get("apPsk")
                             if ap_ssid and ap_psk:
                                 self._esp32_push(None, None, ap_ssid, ap_psk)
-                        elif isinstance(t, str) and t.startswith("net."):
+                        elif _is_master_push(msg):
                             await self.handle(ws, msg)
             except asyncio.CancelledError:
                 return
@@ -5858,7 +5860,7 @@ class NetService:
                                     await self._run(paxnet.ensure_master_ap_profile, cfg)
                                 except Exception as exc:
                                     print(f"[agent] master-ap profile: {exc}", flush=True)
-                        elif isinstance(t, str) and t.startswith("net."):
+                        elif _is_master_push(msg):
                             await self.handle(ws, msg)
             except asyncio.CancelledError:
                 return
@@ -5866,6 +5868,20 @@ class NetService:
                 print(f"[agent] master link down ({exc.__class__.__name__}); retry in {backoff}s", flush=True)
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 60)
+
+
+# Frames the master sends out that are replies or events, never commands.
+# Answering one ("unknown op") produces another reply, and two agents bounced
+# these between each other forever at 100 % CPU.
+NET_REPLY_OPS = frozenset({"result", "registered", "ack"})
+
+
+def _is_master_push(msg: dict) -> bool:
+    """A slave's link to the master also receives everything the master
+    broadcasts to its app clients (net.status, net.slaves, net.result, ...).
+    Only the master's explicit pushes are commands for this node."""
+    t = msg.get("type")
+    return isinstance(t, str) and t.startswith("net.") and msg.get("fromMaster") is True
 
 
 def _wifi_mac(iface: str) -> Optional[str]:
