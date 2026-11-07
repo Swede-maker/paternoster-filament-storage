@@ -165,8 +165,37 @@ async function readProgress(): Promise<Pick<UpdateStatus, "phase" | "startedAt" 
   if (result.startsWith("ok")) return { phase: "done", startedAt, finishedAt: result.split(" ")[1]?.trim(), log }
   if (result.startsWith("failed")) return { phase: "failed", startedAt, finishedAt: result.split(" ")[2]?.trim(), log }
   if (requested) return { phase: "requested", log }
-  if (startedAt) return { phase: "running", startedAt, log }
+  if (startedAt) {
+    // A run cut short by a crash or power loss never writes update.result, so
+    // without this check the panel would show "Updating" forever.
+    if (await updaterStillRunning()) return { phase: "running", startedAt, log }
+    return {
+      phase: "failed",
+      startedAt,
+      log: log + "\n==> This update was interrupted (the Pi restarted or the updater stopped). Start it again with Check for updates.\n",
+    }
+  }
   return { phase: "idle", log }
+}
+
+const STALE_LOG_MS = 30 * 60_000
+
+async function updaterStillRunning(): Promise<boolean> {
+  try {
+    const { stdout } = await exec("systemctl", ["is-active", "pax-update.service"], { timeout: 5_000, encoding: "utf8" })
+    return /^(active|activating|reloading)/.test(stdout.trim())
+  } catch (err) {
+    // is-active exits non-zero for inactive/failed units and still prints the state.
+    const out = (err as { stdout?: string }).stdout?.trim()
+    if (out) return /^(active|activating|reloading)/.test(out)
+    // No systemctl answer: fall back to whether the log is still being written.
+    try {
+      const { mtimeMs } = await fs.stat(LOG_FILE())
+      return Date.now() - mtimeMs < STALE_LOG_MS
+    } catch {
+      return false
+    }
+  }
 }
 
 export async function getUpdateStatus(opts: { check?: boolean; force?: boolean } = {}): Promise<UpdateStatus> {
