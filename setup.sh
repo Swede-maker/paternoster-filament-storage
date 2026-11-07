@@ -641,8 +641,26 @@ if [[ $HAS_APP -eq 1 ]]; then
     say "Using the existing build in .next (newer than the source)"
   else
     say "Building the web app (this is the slow part; 5–15 minutes on a Pi 4)"
-    sudo -u "$RUN_USER" -H bash -c "cd '$APP_DIR' && pnpm build:pi 2>&1 | tail -n 5" \
-      || die "build failed. On a 2 GB Pi build on a PC and copy .next over (README §4b), then re-run setup.sh"
+    # `next build` wipes .next before it starts, so a failed or OOM-killed build
+    # used to leave no app at all and pax-app crash-looped on "Could not find a
+    # production build". Park the working build and put it back on failure.
+    rm -rf "$APP_DIR/.next.prev"
+    [[ -f "$APP_DIR/.next/BUILD_ID" ]] && mv "$APP_DIR/.next" "$APP_DIR/.next.prev"
+    BUILD_OK=1
+    # pipefail inside the inner shell: without it the pipeline reports tail's
+    # status and a failed build looked like a success.
+    sudo -u "$RUN_USER" -H bash -c "set -o pipefail; cd '$APP_DIR' && pnpm build:pi 2>&1 | tail -n 25" || BUILD_OK=0
+    [[ -f "$APP_DIR/.next/BUILD_ID" ]] || BUILD_OK=0
+    if [[ $BUILD_OK -eq 0 ]]; then
+      if [[ -d "$APP_DIR/.next.prev" ]]; then
+        rm -rf "$APP_DIR/.next"
+        mv "$APP_DIR/.next.prev" "$APP_DIR/.next"
+        systemctl start pax-app >/dev/null 2>&1 || true
+        die "build failed — the previous version is still running. If the Pi ran out of memory (dmesg | grep -i oom), build on a PC and copy .next over (README §4b), then re-run setup.sh"
+      fi
+      die "build failed and there was no earlier build to fall back to. On a 2 GB Pi build on a PC and copy .next over (README §4b), then re-run setup.sh"
+    fi
+    rm -rf "$APP_DIR/.next.prev"
   fi
 
   say "Installing the web app service (port $APP_PORT)"
