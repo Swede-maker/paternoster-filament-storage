@@ -312,10 +312,18 @@ export interface DispenseRequest {
  * 4-slot AMS alongside a 1-slot AMS Lite / external spool) and carry a custom
  * name the user can rename freely.
  */
+/**
+ * Bambu AMS hardware generation. `ams` covers AMS / AMS 2 Pro / AMS Lite
+ * (4 trays per unit); `ams3` is the H3C's AMS 3 (9 trays per unit).
+ */
+export type AmsModel = "ams" | "ams3"
+
 export interface AmsUnit {
   id: string
   /** User-facing name, e.g. "AMS", "AMS Lite", "External". */
   name: string
+  /** Hardware generation; decides the slot count. Absent on older saves. */
+  model?: AmsModel
   /** Number of filament slots in this unit (>= 1). */
   slots: number
 }

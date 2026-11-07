@@ -1,7 +1,7 @@
 import "server-only"
 import { db } from "@/lib/db"
 import type { PersistedState, Printer, Spool } from "@/lib/types"
-import { DEFAULT_DIAMETER } from "@/lib/filament"
+import { DEFAULT_DIAMETER, printerAmsUnits } from "@/lib/filament"
 import { probeMoonraker, probePrusaLink, probeBambu } from "./printer-status"
 import { consumeFromMm, consumeFromBambu, newTracker, type ConsumptionTracker, type Decrement } from "./consumption"
 import { applyConsumption } from "./consumption-store"
@@ -122,6 +122,7 @@ async function pollOnce(): Promise<void> {
             uid: printer.bambuUid,
             amsUnits: printer.amsUnits,
             slotsPerAms: printer.slotsPerAms,
+            unitSlots: printerAmsUnits(printer).map((u) => u.slots),
           })
           // Only real readings move weights. A simulated fallback (no LAN reach,
           // e.g. a hosted preview) must never tick down real inventory.

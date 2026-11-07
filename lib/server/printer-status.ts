@@ -328,6 +328,8 @@ export interface BambuProbeInput {
   mode?: "lan" | "cloud"
   amsUnits?: number
   slotsPerAms?: number
+  /** Slot count of each configured AMS unit, in order (mixed 4 / 9 trays). */
+  unitSlots?: number[]
   region?: "global" | "china"
   token?: string
   uid?: string
@@ -338,22 +340,45 @@ function rgbaToHex(s: unknown): string | undefined {
   return `#${s.slice(0, 6).toUpperCase()}`
 }
 
-function parseReport(report: any, slotsPerAms: number) {
+/** Slot count for each configured unit, falling back to the uniform value. */
+function unitSizes(unitSlots: number[] | undefined, slotsPerAms: number, count: number): number[] {
+  return Array.from({ length: count }, (_, i) => Math.max(1, Math.floor(unitSlots?.[i] ?? slotsPerAms) || 1))
+}
+
+function parseReport(report: any, slotsPerAms: number, unitSlots?: number[]) {
   const print = report?.print ?? {}
   const amsRoot = print.ams ?? {}
-  const units: any[] = Array.isArray(amsRoot.ams) ? amsRoot.ams : []
+  // Order reported units by their id so the Nth unit maps to the Nth configured
+  // unit. Units can differ in size (4-tray AMS vs 9-tray AMS 3), so each unit's
+  // first slot is the running sum of the sizes before it.
+  const units: any[] = (Array.isArray(amsRoot.ams) ? amsRoot.ams : [])
+    .map((unit: any, u: number) => {
+      const id = Number.parseInt(String(unit?.id), 10)
+      return { unit, amsIndex: Number.isFinite(id) ? id : u }
+    })
+    .sort((a: { amsIndex: number }, b: { amsIndex: number }) => a.amsIndex - b.amsIndex)
+  const sizes = unitSizes(unitSlots, slotsPerAms, units.length)
   const trays: BambuTray[] = []
+  // Bambu reports the active tray as amsId * 4 + trayId; translate it to our
+  // flattened index while walking the units.
+  const trayNow = Number.parseInt(String(amsRoot.tray_now ?? "255"), 10)
+  let activeTray: number | null = null
+  let offset = 0
   for (let u = 0; u < units.length; u++) {
-    const unit = units[u]
-    const amsIndex = Number.isFinite(Number.parseInt(String(unit?.id), 10)) ? Number.parseInt(String(unit.id), 10) : u
+    const { unit, amsIndex } = units[u]
+    const size = sizes[u]
     const trayList: any[] = Array.isArray(unit?.tray) ? unit.tray : []
     for (const t of trayList) {
       const trayIndex = Number.parseInt(String(t?.id ?? "0"), 10) || 0
+      // A tray beyond the configured size would overlap the next unit's slots.
+      if (trayIndex >= size) continue
       const present = !!t?.tray_type
+      const globalIndex = offset + trayIndex
+      if (Number.isFinite(trayNow) && trayNow < 250 && amsIndex * 4 + trayIndex === trayNow) activeTray = globalIndex
       trays.push({
         amsIndex,
         trayIndex,
-        globalIndex: amsIndex * slotsPerAms + trayIndex,
+        globalIndex,
         present,
         material: typeof t?.tray_type === "string" && t.tray_type ? t.tray_type : undefined,
         color: rgbaToHex(t?.tray_color),
@@ -363,10 +388,8 @@ function parseReport(report: any, slotsPerAms: number) {
         rfid: typeof t?.tray_uuid === "string" && /[1-9a-f]/i.test(t.tray_uuid) ? t.tray_uuid : undefined,
       })
     }
+    offset += size
   }
-  const trayNowRaw = amsRoot.tray_now
-  const trayNow = Number.parseInt(String(trayNowRaw ?? "255"), 10)
-  const activeTray = Number.isFinite(trayNow) && trayNow < 250 ? trayNow : null
   const printState = typeof print.gcode_state === "string" ? print.gcode_state : undefined
   return { trays, activeTray, printState }
 }
@@ -378,14 +401,15 @@ const SIM_COLORS = [
   { hex: "#22C55E", name: "Green", material: "PLA" },
 ]
 
-function simulate(serial: string, amsUnits: number, slotsPerAms: number) {
+function simulate(serial: string, amsUnits: number, slotsPerAms: number, unitSlots?: number[]) {
   const trays: BambuTray[] = []
-  const units = Math.max(1, amsUnits)
-  const per = Math.max(1, Math.min(4, slotsPerAms))
+  const sizes = unitSizes(unitSlots, slotsPerAms, Math.max(1, unitSlots?.length || amsUnits))
   const minutes = Date.now() / 60000
-  for (let u = 0; u < units; u++) {
+  let offset = 0
+  for (let u = 0; u < sizes.length; u++) {
+    const per = sizes[u]
     for (let s = 0; s < per; s++) {
-      const globalIndex = u * slotsPerAms + s
+      const globalIndex = offset + s
       const preset = SIM_COLORS[globalIndex % SIM_COLORS.length]
       const isActive = globalIndex === 0
       const base = 100 - ((globalIndex * 17) % 40)
@@ -416,7 +440,13 @@ function cloudBroker(region: "global" | "china"): string {
   return region === "china" ? "cn.mqtt.bambulab.com" : "us.mqtt.bambulab.com"
 }
 
-async function readOverMqtt(target: MqttTarget, serial: string, slotsPerAms: number, ms: number) {
+async function readOverMqtt(
+  target: MqttTarget,
+  serial: string,
+  slotsPerAms: number,
+  unitSlots: number[] | undefined,
+  ms: number,
+) {
   const mqtt = (await import("mqtt")).default
   return new Promise<{ trays: BambuTray[]; activeTray: number | null; printState?: string }>((resolve, reject) => {
     const url =
@@ -454,7 +484,7 @@ async function readOverMqtt(target: MqttTarget, serial: string, slotsPerAms: num
         const report = JSON.parse(payload.toString())
         if (report?.print?.ams) {
           clearTimeout(timer)
-          const parsed = parseReport(report, slotsPerAms)
+          const parsed = parseReport(report, slotsPerAms, unitSlots)
           done(() => resolve(parsed))
         }
       } catch {
@@ -472,6 +502,9 @@ export async function probeBambu(input: BambuProbeInput): Promise<Probe<BambuBod
   const serial = input.serial?.trim() ?? ""
   const amsUnits = Math.max(1, input.amsUnits ?? 1)
   const slotsPerAms = Math.max(1, input.slotsPerAms ?? 4)
+  const unitSlots = Array.isArray(input.unitSlots)
+    ? input.unitSlots.slice(0, 16).map((n) => Math.max(1, Math.min(9, Math.floor(Number(n)) || 1)))
+    : undefined
   const mode = input.mode === "cloud" ? "cloud" : "lan"
 
   let target: MqttTarget | null = null
@@ -493,13 +526,13 @@ export async function probeBambu(input: BambuProbeInput): Promise<Probe<BambuBod
   if (target) {
     try {
       const timeout = target.transport === "cloud" ? 9000 : 5000
-      const parsed = await readOverMqtt(target, serial, slotsPerAms, timeout)
+      const parsed = await readOverMqtt(target, serial, slotsPerAms, unitSlots, timeout)
       return { status: 200, body: { ok: true, connected: true, simulated: false, ...parsed } }
     } catch {
       // Fall through to the simulation so the UI still has data in preview.
     }
   }
 
-  const sim = simulate(serial, amsUnits, slotsPerAms)
+  const sim = simulate(serial, amsUnits, slotsPerAms, unitSlots)
   return { status: 200, body: { ok: true, connected: true, simulated: true, ...sim } }
 }

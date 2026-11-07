@@ -1,4 +1,4 @@
-import type { AmsUnit, FilamentMaterial, Printer, PulseDrive, Spool } from "./types"
+import type { AmsModel, AmsUnit, FilamentMaterial, Printer, PulseDrive, Spool } from "./types"
 
 export const MATERIALS: FilamentMaterial[] = [
   "PLA",
@@ -583,6 +583,9 @@ export function rampStepMs(baseMs: number, stepIndex: number, totalSteps: number
   return Math.round(baseMs * (1 + strength * shape))
 }
 
+/** Trays per unit for each AMS generation. */
+export const AMS_MODEL_SLOTS: Record<AmsModel, number> = { ams: 4, ams3: 9 }
+
 /**
  * Normalised AMS units for a printer. When the printer carries the richer
  * `ams` array (mixed, named units) that is the source of truth; otherwise we
@@ -596,7 +599,8 @@ export function printerAmsUnits(
     return p.ams.map((u, i) => ({
       id: u.id || `ams-${i + 1}`,
       name: u.name?.trim() || `AMS ${i + 1}`,
-      slots: Math.max(1, Math.floor(u.slots)),
+      ...(u.model ? { model: u.model } : {}),
+      slots: u.model ? AMS_MODEL_SLOTS[u.model] : Math.max(1, Math.floor(u.slots)),
     }))
   }
   const count = Math.max(1, p.amsUnits)

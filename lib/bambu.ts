@@ -1,4 +1,5 @@
 import type { Printer } from "./types"
+import { printerAmsUnits } from "./filament"
 
 /**
  * Client-side helpers that talk to our own /api/bambu proxy, which in turn talks
@@ -70,6 +71,7 @@ function connectionPayload(printer: Printer) {
     uid: printer.bambuUid,
     amsUnits: Math.max(1, printer.amsUnits),
     slotsPerAms: Math.max(1, printer.slotsPerAms),
+    unitSlots: printerAmsUnits(printer).map((u) => u.slots),
   }
 }
 

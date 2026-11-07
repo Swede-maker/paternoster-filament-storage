@@ -25,6 +25,7 @@ type Body = {
   mode?: "lan" | "cloud"
   amsUnits?: number
   slotsPerAms?: number
+  unitSlots?: number[]
   action?: "status"
   region?: "global" | "china"
   token?: string
@@ -45,8 +46,9 @@ export async function POST(req: NextRequest) {
     accessCode: body.accessCode,
     mode: body.mode,
     amsUnits: body.amsUnits,
-    slotsPerAms: body.slotsPerAms,
-    region: body.region,
+  slotsPerAms: body.slotsPerAms,
+  unitSlots: body.unitSlots,
+  region: body.region,
     token: body.token,
     uid: body.uid,
   })
