@@ -675,6 +675,7 @@ Type=simple
 User=$RUN_USER
 WorkingDirectory=$APP_DIR
 Environment=NODE_ENV=production
+Environment=UV_USE_IO_URING=0
 Environment=PORT=$APP_PORT
 Environment=PATERNOSTER_DB_PATH=$DATA_DIR/paternoster.db
 Environment=PAX_DATA_DIR=$DATA_DIR
