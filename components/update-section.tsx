@@ -232,19 +232,36 @@ function UpdateProgress({ status, busy, offline }: { status?: UpdateStatus; busy
   const phase = status?.phase
   // The path unit normally reacts within seconds. If nothing has happened
   // after a minute the updater service is probably not installed.
+  // While offline the last status is stale (often still "requested"), so the
+  // stuck hint must not fire then: the updater has stopped the app to build.
   const [stuck, setStuck] = useState(false)
   useEffect(() => {
-    if (phase !== "requested") {
+    if (phase !== "requested" || offline) {
       setStuck(false)
       return
     }
     const t = window.setTimeout(() => setStuck(true), 60_000)
     return () => window.clearTimeout(t)
-  }, [phase])
+  }, [phase, offline])
+
+  const [offlineSince, setOfflineSince] = useState<number | null>(null)
+  const [now, setNow] = useState(() => Date.now())
+  useEffect(() => {
+    if (!(offline && busy)) {
+      setOfflineSince(null)
+      return
+    }
+    setOfflineSince((s) => s ?? Date.now())
+    const t = window.setInterval(() => setNow(Date.now()), 1000)
+    return () => window.clearInterval(t)
+  }, [offline, busy])
+  const offlineFor = offlineSince ? Math.max(0, Math.floor((now - offlineSince) / 1000)) : 0
+  const offlineClock = `${Math.floor(offlineFor / 60)}:${String(offlineFor % 60).padStart(2, "0")}`
+
   let headline: string
   let icon: React.ReactNode
   if (offline && busy) {
-    headline = "Restarting the app… this page reconnects by itself."
+    headline = `Rebuilding on the Pi — the app is offline (${offlineClock}). This page reconnects by itself.`
     icon = <Loader2 className="h-4 w-4 animate-spin text-primary" />
   } else if (busy) {
     headline = phase === "requested" ? "Starting the updater…" : "Updating — please keep the Pi powered."
@@ -262,6 +279,13 @@ function UpdateProgress({ status, busy, offline }: { status?: UpdateStatus; busy
       <p className="flex items-center gap-2 text-sm font-medium">
         {icon} {headline}
       </p>
+      {offline && busy && (
+        <p className="text-xs text-muted-foreground text-pretty">
+          The updater stops the app while it builds, so there is no progress to show here. That usually takes 5–15
+          minutes on a Pi 4. To follow it live, run{" "}
+          <code className="rounded bg-muted px-1 font-mono">tail -f /var/lib/pax/update.log</code> over SSH.
+        </p>
+      )}
       {stuck && (
         <p className="text-xs text-muted-foreground text-pretty">
           Nothing has started yet. The updater service may be missing on this Pi — run the one-line installer over SSH

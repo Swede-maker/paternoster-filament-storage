@@ -6,13 +6,18 @@ import { useStore } from "@/lib/store"
 import { Dialog, DialogHeader, DialogBody, DialogFooter } from "./ui/dialog"
 import { Button } from "./ui/button"
 import { Field, Input, Segmented, NumberChips } from "./ui/field"
-import { newId, printerSlotCount, printerAmsUnits, MAX_PRINTERS } from "@/lib/filament"
-import type { AmsUnit, Printer, PrinterKind, PrinterFirmware } from "@/lib/types"
+import { newId, printerSlotCount, printerAmsUnits, MAX_PRINTERS, AMS_MODEL_SLOTS } from "@/lib/filament"
+import type { AmsModel, AmsUnit, Printer, PrinterKind, PrinterFirmware } from "@/lib/types"
 import { BambuCloudSignIn, type BambuCloudLink } from "./bambu-cloud-sign-in"
 
-/** Max AMS units on one printer, and max slots per unit. */
 const MAX_AMS_UNITS = 8
-const MAX_SLOTS_PER_UNIT = 8
+const MAX_TOOLHEADS = 10
+const MAX_MMU_SLOTS = 12
+
+/** Units saved before the model picker existed: 9 trays means AMS 3. */
+function amsModelOf(unit: AmsUnit): AmsModel {
+  return unit.model ?? (unit.slots >= AMS_MODEL_SLOTS.ams3 ? "ams3" : "ams")
+}
 
 /**
  * Add / edit a printer. When `printer` is supplied the dialog opens in EDIT mode
@@ -34,7 +39,7 @@ export function AddPrinterDialog({
   const [name, setName] = useState("")
   const [kind, setKind] = useState<PrinterKind>("single")
   // Mixed AMS units: each has a custom name and its own slot count.
-  const [ams, setAms] = useState<AmsUnit[]>([{ id: newId("ams"), name: "AMS 1", slots: 4 }])
+  const [ams, setAms] = useState<AmsUnit[]>([{ id: newId("ams"), name: "MMU 1", slots: 4 }])
   const [toolheads, setToolheads] = useState(4)
   const [firmware, setFirmware] = useState<PrinterFirmware>("klipper")
   const [ip, setIp] = useState("")
@@ -77,11 +82,12 @@ export function AddPrinterDialog({
   const atLimit = !isEdit && state.printers.length >= MAX_PRINTERS
   const isBambu = firmware === "bambu"
   const isPrusa = firmware === "prusalink"
+  const unitLabel = isBambu ? "AMS" : "MMU"
 
   function reset() {
     setName("")
     setKind("single")
-    setAms([{ id: newId("ams"), name: "AMS 1", slots: 4 }])
+    setAms([{ id: newId("ams"), name: "MMU 1", slots: 4 }])
     setToolheads(4)
     setFirmware("klipper")
     setIp("")
@@ -97,7 +103,14 @@ export function AddPrinterDialog({
   // --- AMS unit editing helpers ---
   function addAmsUnit() {
     setAms((prev) =>
-      prev.length >= MAX_AMS_UNITS ? prev : [...prev, { id: newId("ams"), name: `AMS ${prev.length + 1}`, slots: 4 }],
+      prev.length >= MAX_AMS_UNITS
+        ? prev
+        : [
+            ...prev,
+            isBambu
+              ? { id: newId("ams"), name: `AMS ${prev.length + 1}`, model: "ams", slots: AMS_MODEL_SLOTS.ams }
+              : { id: newId("ams"), name: `MMU ${prev.length + 1}`, slots: 4 },
+          ],
     )
   }
   function removeAmsUnit(id: string) {
@@ -116,11 +129,16 @@ export function AddPrinterDialog({
     // For a cloud Bambu printer the serial comes from the chosen cloud device.
     const bambuSerial = isBambuCloud ? cloudLink?.serial : serial.trim() || undefined
     // Sanitise the AMS units the reducer will normalise anyway (names + slots).
-    const cleanAms: AmsUnit[] = ams.map((u, i) => ({
-      id: u.id,
-      name: u.name.trim() || `AMS ${i + 1}`,
-      slots: Math.max(1, Math.min(MAX_SLOTS_PER_UNIT, Math.floor(u.slots) || 1)),
-    }))
+    // Bambu units take their slot count from the AMS model; other firmware
+    // (Klipper MMUs etc.) keeps the user's own slot count.
+    const cleanAms: AmsUnit[] = ams.map((u, i) => {
+      if (isBambu) {
+        const model = amsModelOf(u)
+        return { id: u.id, name: u.name.trim() || `AMS ${i + 1}`, model, slots: AMS_MODEL_SLOTS[model] }
+      }
+      const slots = Math.min(MAX_MMU_SLOTS, Math.max(1, Math.floor(u.slots || 1)))
+      return { id: u.id, name: u.name.trim() || `MMU ${i + 1}`, slots }
+    })
 
     const common = {
       name: name.trim() || `Printer ${state.printers.length + 1}`,
@@ -174,7 +192,11 @@ export function AddPrinterDialog({
 
   const preview =
     kind === "ams"
-      ? ams.reduce((sum, u) => sum + Math.max(1, u.slots || 1), 0)
+      ? ams.reduce(
+          (sum, u) =>
+            sum + (isBambu ? AMS_MODEL_SLOTS[amsModelOf(u)] : Math.min(MAX_MMU_SLOTS, Math.max(1, u.slots || 1))),
+          0,
+        )
       : printerSlotCount({ kind, amsUnits: 1, slotsPerAms: 1, toolheads })
 
   return (
@@ -206,7 +228,7 @@ export function AddPrinterDialog({
                 onChange={(v) => setKind(v as PrinterKind)}
                 options={[
                   { value: "single", label: "Single Spool" },
-                  { value: "ams", label: "AMS" },
+                  { value: "ams", label: unitLabel },
                   { value: "toolchanger", label: "Toolchanger" },
                 ]}
               />
@@ -221,7 +243,7 @@ export function AddPrinterDialog({
             {kind === "ams" && (
               <div className="space-y-3">
                 <div className="flex items-center justify-between">
-                  <span className="text-sm font-medium text-muted-foreground">AMS units</span>
+                  <span className="text-sm font-medium text-muted-foreground">{unitLabel} units</span>
                   <button
                     type="button"
                     onClick={addAmsUnit}
@@ -232,37 +254,55 @@ export function AddPrinterDialog({
                     Add unit
                   </button>
                 </div>
-                {/* One row per AMS unit: rename it and set its own slot count, so a
-                    4-slot AMS and a 1-slot AMS Lite can live on the same printer. */}
+                {/* One row per unit. Bambu AMS units pick a model (fixed slot
+                    count); other firmware MMUs set their own slot count. */}
                 {ams.map((unit, i) => (
                   <div key={unit.id} className="rounded-lg border border-border bg-background/40 p-3">
                     <div className="flex items-center gap-2">
                       <Input
-                        aria-label={`AMS unit ${i + 1} name`}
+                        aria-label={`${unitLabel} unit ${i + 1} name`}
                         value={unit.name}
                         onChange={(e) => updateAmsUnit(unit.id, { name: e.target.value })}
-                        placeholder={`AMS ${i + 1}`}
+                        placeholder={`${unitLabel} ${i + 1}`}
                         className="h-9 flex-1"
                       />
                       <button
                         type="button"
                         onClick={() => removeAmsUnit(unit.id)}
                         disabled={ams.length <= 1}
-                        aria-label={`Remove ${unit.name || `AMS ${i + 1}`}`}
+                        aria-label={`Remove ${unit.name || `${unitLabel} ${i + 1}`}`}
                         className="flex h-9 w-9 shrink-0 items-center justify-center rounded-md border border-border text-muted-foreground transition-colors hover:border-destructive/50 hover:text-destructive disabled:opacity-30"
                       >
                         <X className="h-4 w-4" />
                       </button>
                     </div>
-                    <div className="mt-2">
-                      <span className="mb-1.5 block text-xs text-muted-foreground">Slots in this unit</span>
-                      <NumberChips
-                        min={1}
-                        max={MAX_SLOTS_PER_UNIT}
-                        value={unit.slots}
-                        onChange={(v) => updateAmsUnit(unit.id, { slots: v })}
-                      />
-                    </div>
+                    {isBambu ? (
+                      <div className="mt-2">
+                        <span className="mb-1.5 block text-xs text-muted-foreground">AMS model</span>
+                        <Segmented
+                          className="w-full [&>button]:flex-1"
+                          value={amsModelOf(unit)}
+                          onChange={(v) => {
+                            const model = v as AmsModel
+                            updateAmsUnit(unit.id, { model, slots: AMS_MODEL_SLOTS[model] })
+                          }}
+                          options={[
+                            { value: "ams", label: "AMS 1 / AMS 2 · 4 slots" },
+                            { value: "ams3", label: "AMS 3 (H3C) · 9 slots" },
+                          ]}
+                        />
+                      </div>
+                    ) : (
+                      <div className="mt-2">
+                        <span className="mb-1.5 block text-xs text-muted-foreground">Slots in this MMU</span>
+                        <NumberChips
+                          min={1}
+                          max={MAX_MMU_SLOTS}
+                          value={Math.min(MAX_MMU_SLOTS, Math.max(1, unit.slots || 1))}
+                          onChange={(slots) => updateAmsUnit(unit.id, { slots, model: undefined })}
+                        />
+                      </div>
+                    )}
                   </div>
                 ))}
               </div>
@@ -270,7 +310,7 @@ export function AddPrinterDialog({
 
             {kind === "toolchanger" && (
               <Field label="Number of toolheads">
-                <NumberChips min={1} max={8} value={toolheads} onChange={setToolheads} />
+                <NumberChips min={1} max={MAX_TOOLHEADS} value={toolheads} onChange={setToolheads} />
               </Field>
             )}
 
@@ -284,8 +324,17 @@ export function AddPrinterDialog({
                 className="w-full [&>button]:flex-1"
                 value={firmware}
                 onChange={(v) => {
-                  const next = v as PrinterFirmware
-                  setFirmware(next)
+  const next = v as PrinterFirmware
+  setFirmware(next)
+  // Rename units that still carry an auto-generated "AMS n"/"MMU n"
+  // name so they follow the firmware; custom names are left alone.
+  const nextLabel = next === "bambu" ? "AMS" : "MMU"
+  setAms((prev) =>
+  prev.map((u) => {
+  const m = /^(AMS|MMU) (\d+)$/.exec(u.name.trim())
+  return m ? { ...u, name: `${nextLabel} ${m[2]}` } : u
+  }),
+  )
                   // Keep the port sensible for the chosen firmware's default,
                   // unless the user already typed a custom one.
                   if (next === "prusalink" && (port === "7125" || port === "")) setPort("80")
