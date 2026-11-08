@@ -60,6 +60,10 @@
 # One-line update over SSH (never asks anything, never installs from scratch):
 #   curl -fsSL https://raw.githubusercontent.com/OWNER/REPO/main/setup.sh | sudo bash -s -- --update
 #
+# Uninstall over SSH (data in /var/lib/pax is kept unless you add --purge):
+#   curl -fsSL https://raw.githubusercontent.com/OWNER/REPO/main/uninstall.sh | sudo bash
+#   (same as: setup.sh --uninstall [--purge] [--keep-code] [-y])
+#
 set -euo pipefail
 
 # --------------------------------------------------------------------------
@@ -107,7 +111,20 @@ while [[ $# -gt 0 ]]; do
     --reconfigure) RECONFIGURE=1; shift ;;
     -y|--yes) ASSUME_YES=1; shift ;;
     --update) UPDATE_ONLY=1; ASSUME_YES=1; shift ;;
-    -h|--help) sed -n '2,58p' "$0"; exit 0 ;;
+    --uninstall)
+      # Hand off to uninstall.sh (beside this file, or fetched from the repo
+      # when setup.sh itself was piped in from curl). Remaining flags pass on.
+      shift
+      SELF="$(cd "$(dirname "${BASH_SOURCE[0]:-/dev/null}")" 2>/dev/null && pwd || true)"
+      if [[ -n "$SELF" && -f "$SELF/uninstall.sh" ]]; then
+        exec bash "$SELF/uninstall.sh" "$@"
+      fi
+      RAW="${PAX_REPO%.git}"; RAW="${RAW/github.com/raw.githubusercontent.com}/$PAX_BRANCH/uninstall.sh"
+      TMP="$(mktemp)"
+      curl -fsSL "$RAW" -o "$TMP" || { echo "error: could not download $RAW" >&2; exit 1; }
+      exec bash "$TMP" "$@"
+      ;;
+    -h|--help) sed -n '2,64p' "$0"; exit 0 ;;
     *) echo "unknown option: $1" >&2; exit 2 ;;
   esac
 done
@@ -567,7 +584,9 @@ if [[ -f "$DATA_DIR/paternoster.db" ]]; then
   STAMP="$(date +%Y%m%d-%H%M%S)"
   cp -p "$DATA_DIR/paternoster.db" "$DATA_DIR/backups/paternoster-$STAMP.db"
   [[ -f "$DATA_DIR/paternoster.db-wal" ]] && cp -p "$DATA_DIR/paternoster.db-wal" "$DATA_DIR/backups/paternoster-$STAMP.db-wal"
-  ls -1t "$DATA_DIR/backups"/paternoster-*.db 2>/dev/null | tail -n +6 | while read -r old; do rm -f "$old" "$old-wal"; done
+  # Sort by the timestamp in the file name, not mtime: cp -p keeps the
+  # database's old mtime, so `ls -t` would prune the backup just made.
+  ls -1 "$DATA_DIR/backups"/paternoster-*.db 2>/dev/null | sort -r | tail -n +6 | while read -r old; do rm -f "$old" "$old-wal"; done
   say "Backed up your data to $DATA_DIR/backups/paternoster-$STAMP.db"
 fi
 chown -R "$RUN_USER:$RUN_USER" "$DATA_DIR"

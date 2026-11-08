@@ -81,6 +81,46 @@ installed and offers to:
 - **Change the motor type** (on a master with carousel or a slave).
 - **Reconfigure** — asks everything again.
 
+### Uninstalling (Raspberry Pi / Linux)
+
+Over SSH on the device you want to clean up:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Swede-maker/paternoster-filament-storage/main/uninstall.sh | sudo bash
+```
+
+It lists what it will remove and asks `y/N` first. It removes the PAX services
+(`pax-app`, `pax-update`, `paternoster-agent`, extra ESP32 agents, `pax-camera`),
+the updater script, the Wi-Fi sudoers rule, the app checkout (`~/pax`) and the
+PAX hotspot profiles. Your own router Wi-Fi is **kept** (renamed back to its
+network name), so the device stays online and SSH keeps working.
+
+**Your data is kept** by default (`/var/lib/pax`, `/var/lib/pax-agent`,
+`/etc/paxnet.conf`), so installing again later picks everything up. Options go
+after `-s --`:
+
+```bash
+# also delete the database, backups, motor tuning and hotspot password (asks you to type "delete")
+curl -fsSL https://raw.githubusercontent.com/Swede-maker/paternoster-filament-storage/main/uninstall.sh | sudo bash -s -- --purge
+
+# no questions (scripts, or when there is no terminal)
+curl -fsSL https://raw.githubusercontent.com/Swede-maker/paternoster-filament-storage/main/uninstall.sh | sudo bash -s -- -y
+```
+
+| Option | Effect |
+|---|---|
+| `--purge` | Also delete your data. Cannot be undone. |
+| `--keep-code` | Leave the `~/pax` checkout in place. |
+| `-y` | Do not ask for confirmation. |
+
+The same thing works from a checkout (`sudo ./uninstall.sh`) or as
+`setup.sh --uninstall`. Node.js, pnpm, avahi, the hostname and the swap size are
+left alone because other software may use them. If you SSH in over the master's
+PAX hotspot, the session drops at the very end when the hotspot is removed;
+everything else is already done by then.
+
+On Windows, use **Uninstall PAX** in the Start menu or *Settings → Apps*.
+
 ### Your data
 
 Nothing above touches your data. It lives outside the code checkout:
