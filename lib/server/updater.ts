@@ -145,6 +145,36 @@ async function checkRemote(force: boolean) {
   return lastCheck
 }
 
+const AUTO_CHECK_INTERVAL_MS = 6 * 60 * 60_000
+const AUTO_CHECK_FIRST_DELAY_MS = 60_000
+
+/**
+ * Fetch from GitHub every 6 hours while the server runs, so the Settings tab can
+ * flag a new version without anyone pressing "Check for updates". The first
+ * check waits a minute so it doesn't compete with startup on a Pi.
+ */
+export function startUpdateChecker(): void {
+  const g = globalThis as { __paxUpdateChecker?: boolean }
+  if (g.__paxUpdateChecker) return
+  g.__paxUpdateChecker = true
+
+  const run = async () => {
+    try {
+      if (await installedOnPi()) return
+      const { phase } = await readProgress()
+      if (phase === "requested" || phase === "running") return
+      await checkRemote(true)
+    } catch {
+      /* checkRemote records its own errors; a failed tick just waits for the next one */
+    }
+  }
+
+  setTimeout(() => {
+    void run()
+    setInterval(() => void run(), AUTO_CHECK_INTERVAL_MS).unref?.()
+  }, AUTO_CHECK_FIRST_DELAY_MS).unref?.()
+}
+
 async function readTail(file: string, maxBytes = 12_000): Promise<string> {
   try {
     const buf = await fs.readFile(file)

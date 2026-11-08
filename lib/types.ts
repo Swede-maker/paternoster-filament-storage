@@ -613,6 +613,12 @@ export interface Settings {
    * shown carousel's Pi). Optional for older saves (= off).
    */
   camera?: { enabled: boolean; popupOnMove: boolean; port: number; host?: string }
+  /**
+   * Optional features the user installs from Settings → Addons. Nothing here is
+   * on by default. `prusaFilament` = show what PrusaLink printers report as
+   * loaded per tool next to what this app has loaded.
+   */
+  addons?: { prusaFilament?: boolean }
   /** Full spool weight assumption (g) used for new spools. */
   defaultSpoolWeight: number
   /** User-saved material/type names (in addition to the built-in list). */

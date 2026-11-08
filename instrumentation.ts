@@ -11,5 +11,7 @@ export async function register() {
   if (process.env.NEXT_RUNTIME === "nodejs") {
     const { startConsumptionPoller } = await import("@/lib/server/consumption-poller")
     startConsumptionPoller()
+    const { startUpdateChecker } = await import("@/lib/server/updater")
+    startUpdateChecker()
   }
 }

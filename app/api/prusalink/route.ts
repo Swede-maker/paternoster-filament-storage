@@ -1,5 +1,5 @@
 import { type NextRequest, NextResponse } from "next/server"
-import { probePrusaLink } from "@/lib/server/printer-status"
+import { probePrusaLink, readPrusaLoaded } from "@/lib/server/printer-status"
 
 /**
  * Server-side proxy to a printer's PrusaLink HTTP API (Prusa MINI, MK3.9, MK4,
@@ -22,7 +22,7 @@ type Body = {
   ip?: string
   port?: number
   apiKey?: string
-  action?: "status"
+  action?: "status" | "loaded"
   tools?: number
 }
 
@@ -32,6 +32,11 @@ export async function POST(req: NextRequest) {
     body = (await req.json()) as Body
   } catch {
     return NextResponse.json({ ok: false, error: "Invalid JSON body" }, { status: 400 })
+  }
+
+  if (body.action === "loaded") {
+    const { status, body: result } = await readPrusaLoaded({ ip: body.ip, port: body.port, apiKey: body.apiKey })
+    return NextResponse.json(result, { status })
   }
 
   const { status, body: result } = await probePrusaLink({

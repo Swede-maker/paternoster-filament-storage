@@ -293,6 +293,78 @@ export async function probePrusaLink(input: PrusaLinkProbeInput): Promise<Probe<
   return { status: 200, body: { ok: true, connected: true, temps, printState, filamentUsedMm, activeTool: 0 } }
 }
 
+export interface PrusaLoadedTool {
+  index: number
+  material?: string
+  color?: string
+}
+
+export interface PrusaLoadedBody {
+  ok: boolean
+  error?: string
+  tools?: PrusaLoadedTool[]
+}
+
+/**
+ * Best-effort read of the filament each tool reports as loaded. PrusaLink has
+ * no documented per-tool filament endpoint and the shape varies by firmware
+ * (MK4, XL, INDX), so we walk the status/info/printer responses and pick up
+ * any object carrying a `material`/`filament` string, keyed by the nearest
+ * `toolN` / `extruderN` / numeric slot key.
+ */
+export async function readPrusaLoaded(input: PrusaLinkProbeInput): Promise<Probe<PrusaLoadedBody>> {
+  const { ip, port } = input
+  if (!ip || !ip.trim()) return { status: 400, body: { ok: false, error: "Missing printer IP" } }
+  const secret = (input.apiKey ?? "").trim()
+  const base = prusaBase(ip, port)
+  const TIMEOUT = 8000
+
+  const responses = await Promise.all(
+    ["/api/v1/status", "/api/v1/info", "/api/printer"].map((p) => prusaApiGet(base, p, secret, TIMEOUT)),
+  )
+  if (responses.every((r) => r == null)) {
+    return {
+      status: 502,
+      body: { ok: false, error: "Could not reach PrusaLink (check the IP, password, and that PrusaLink is enabled)" },
+    }
+  }
+
+  type Hit = { raw: number; zeroBased: boolean; material?: string; color?: string }
+  const hits: Hit[] = []
+  const pickStr = (o: any, keys: string[]) => {
+    for (const k of keys) if (typeof o?.[k] === "string" && o[k].trim() && o[k] !== "---") return o[k].trim()
+    return undefined
+  }
+  const walk = (node: any, idx: { raw: number; zeroBased: boolean } | null, depth: number) => {
+    if (!node || typeof node !== "object" || depth > 6) return
+    const material = pickStr(node, ["material", "filament", "filament_type"])
+    if (material) {
+      const color = pickStr(node, ["color", "colour", "filament_color"])
+      hits.push({ raw: idx?.raw ?? 0, zeroBased: idx?.zeroBased ?? true, material, color })
+    }
+    for (const [k, v] of Object.entries<any>(node)) {
+      if (!v || typeof v !== "object") continue
+      const tool = /^(?:tool|extruder|t)(\d+)$/i.exec(k)
+      if (tool) walk(v, { raw: Number(tool[1]), zeroBased: true }, depth + 1)
+      else if (/^\d+$/.test(k)) walk(v, { raw: Number(k), zeroBased: !Array.isArray(node) ? false : true }, depth + 1)
+      else walk(v, idx, depth + 1)
+    }
+  }
+  for (const r of responses) walk(r, null, 0)
+
+  // Numeric object keys ("1", "2", …) are treated as 1-based slot numbers
+  // unless one of them is 0.
+  const anyZero = hits.some((h) => !h.zeroBased && h.raw === 0)
+  const byIndex = new Map<number, PrusaLoadedTool>()
+  for (const h of hits) {
+    const index = h.zeroBased || anyZero ? h.raw : h.raw - 1
+    if (index < 0 || byIndex.has(index)) continue
+    byIndex.set(index, { index, material: h.material, color: h.color })
+  }
+  const tools = [...byIndex.values()].sort((a, b) => a.index - b.index)
+  return { status: 200, body: { ok: true, tools } }
+}
+
 // ---------------------------------------------------------------------------
 // Bambu Lab (MQTT: LAN or cloud)
 // ---------------------------------------------------------------------------
