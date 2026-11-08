@@ -263,18 +263,26 @@ The sensors are wired as in section 3.
 
 ## 3c. Wire the ESP32 to integrated servos (iSV57T)
 
-Profile **`integrated-servo`**. Wire it the same way as the closed-loop
-stepper in section 3b: the iSV57T's PUL and DIR are also opto-isolated 5 V
-inputs, so use **common-anode from +5 V** and let the ESP32 pin sink the
-signal. The differences are that there is **no enable line**, and ALM has
-the opposite sense.
+Profile **`integrated-servo`**. Unlike the closed-loop stepper in section
+3b, wire the iSV57T **common-cathode**: the ESP32 pin drives PUL+ / DIR+
+directly and PUL− / DIR− go to ESP32 GND. Do **not** feed PUL+ / DIR+ from
++5 V. An ESP32 pin only rises to 3.3 V, so with +5 V on the anode about
+1.7 V stays across the opto, it never switches off, and the motor sees no
+pulses. There is also **no enable line**, and ALM has the opposite sense.
 
 | signal | motor A | motor B | iSV57T terminal |
 | --- | --- | --- | --- |
-| PUL− (pulse) | GPIO25 | GPIO32 | **PUL−** (PUL+ → +5 V) |
-| DIR− (direction) | GPIO26 | GPIO33 | **DIR−** (DIR+ → +5 V) |
+| PUL (pulse) | GPIO25 | GPIO32 | **PUL+** (PUL− → ESP32 GND) |
+| DIR (direction) | GPIO26 | GPIO33 | **DIR+** (DIR− → ESP32 GND) |
 | ALM+ | GPIO18 | GPIO19 | **ALM+** (ALM− → ESP32 GND) |
 | GND | — | — | drive's signal GND ↔ ESP32 GND |
+
+- **3.3 V signal level:** the iSV57T switches reliably on the ESP32's 3.3 V
+  on most units. If a drive misses steps or ignores pulses, put a 74HCT125
+  powered from 5 V between the ESP32 and PUL+ / DIR+ (same pins, same
+  common-cathode wiring).
+- **Direction:** if the carousel turns the wrong way, change the drive's
+  own direction parameter. Do not rewire DIR to +5 V.
 
 - **Enable:** leave ENA unconnected (if your unit has it). The motor is
   energised as soon as it has power. GPIO27/GPIO14 stay unused. To cut the
