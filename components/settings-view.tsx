@@ -34,7 +34,9 @@ import {
   Video,
   RotateCw,
   Crown,
+  Puzzle,
 } from "lucide-react"
+import { AddonsSection } from "./addons-section"
 import { balanceWarningSetting } from "@/lib/rebalance"
 import { carouselOrientation, type CarouselOrientation } from "@/lib/orientation"
 import { cameraSetting, DEFAULT_CAMERA_PORT, type CameraSetting } from "@/lib/camera"
@@ -45,6 +47,7 @@ import { getStats, masterNode, nodeSlotCount, nodesForSystem, shelfLabel } from 
 import { NetworkPanel } from "./network/network-panel"
 import { LocalMasterNetwork } from "./network/local-master-network"
 import { UpdateSection } from "./update-section"
+import { useUpdateAvailable } from "@/lib/use-update-available"
 import { StartAreaToggle } from "./start-area-toggle"
 import { newId, formatGrams, pulseDriveFor } from "@/lib/filament"
 import { newQrTagId, qrPayload, allBindings, describeTarget } from "@/lib/tags"
@@ -71,6 +74,7 @@ import {
 export function SettingsView() {
   const { state, dispatch } = useStore()
   const stats = getStats(state)
+  const updateCount = useUpdateAvailable()
 
   const [name, setName] = useState(state.settings.systemName)
   // Nullable so the field can be genuinely empty while editing (not a forced 0).
@@ -247,8 +251,21 @@ export function SettingsView() {
         </LocalMasterNetwork>
       )}
 
+      {/* Addons — optional features, off until installed */}
+ <Section icon={<Puzzle className="h-5 w-5 text-primary" />} title="Addons" badge="In development">
+  <p className="rounded-xl border border-primary/30 bg-primary/5 p-3 text-sm leading-relaxed text-muted-foreground">
+  Addons are still in development and may have bugs. Features and settings here can change between updates.
+  </p>
+  <AddonsSection />
+      </Section>
+
       {/* Update — pulls the newest code from GitHub on a Pi installation */}
-      <Section icon={<DownloadCloud className="h-5 w-5 text-primary" />} title="Update">
+      <Section
+        icon={<DownloadCloud className="h-5 w-5 text-primary" />}
+        title="Update"
+        badge={updateCount > 0 ? "Update available" : undefined}
+        badgeTone="warning"
+      >
         <UpdateSection />
       </Section>
 
@@ -1415,12 +1432,16 @@ function Section({
   title,
   children,
   danger,
-}: {
+  badge,
+  badgeTone = "primary",
+  }: {
   icon: React.ReactNode
   title: string
   children: React.ReactNode
   danger?: boolean
-}) {
+  badge?: string
+  badgeTone?: "primary" | "warning"
+  }) {
   return (
     <details
       className={
@@ -1430,7 +1451,21 @@ function Section({
     >
       <summary className="flex cursor-pointer list-none items-center gap-2 rounded-2xl p-4 transition-colors hover:bg-muted/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring [&::-webkit-details-marker]:hidden">
         {icon}
-        <h2 className="flex-1 text-base font-semibold">{title}</h2>
+        <h2 className="flex flex-1 items-center gap-2 text-base font-semibold">
+  {title}
+  {badge && (
+  <span
+  className={
+  "rounded-full border px-2 py-0.5 text-xs font-medium " +
+  (badgeTone === "warning"
+  ? "border-warning/40 bg-warning/10 text-warning"
+  : "border-primary/40 bg-primary/10 text-primary")
+  }
+  >
+  {badge}
+  </span>
+  )}
+  </h2>
         <ChevronDown
           className="h-5 w-5 text-muted-foreground transition-transform group-open:rotate-180"
           aria-hidden="true"

@@ -20,6 +20,7 @@ import { dueReminders, lowStockParts } from "@/lib/selectors"
 import type { TopArea } from "@/lib/types"
 import { getDryers, timerStatus } from "@/lib/dryers"
 import { useEffect, useState } from "react"
+import { useUpdateAvailable } from "@/lib/use-update-available"
 
 type NavBadge = { count: number; tone: "warning" | "info" | "primary" }
 type NavItem = { id: NavTab; label: string; icon: typeof Home; badges?: NavBadge[] }
@@ -48,6 +49,7 @@ export function BottomNav({
   area?: TopArea
 }) {
   const { state } = useStore()
+  const updateCount = useUpdateAvailable()
 
   const orderCount = (state.settings.orders ?? []).length
   const hwOrderCount = (state.hardwareOrders ?? []).length
@@ -107,7 +109,7 @@ export function BottomNav({
     { id: "orders", label: "Orders", icon: ShoppingCart, badges: [{ count: hwOrderCount, tone: "primary" }] },
     { id: "locked", label: "Locked slots", icon: Lock, badges: [{ count: lockedCount, tone: "primary" }] },
     { id: "picking", label: "Picking lists", icon: ClipboardList, badges: [{ count: openListCount, tone: "primary" }] },
-    { id: "settings", label: "Settings", icon: Settings },
+    { id: "settings", label: "Settings", icon: Settings, badges: [{ count: updateCount, tone: "warning" }] },
   ]
 
   // Printers is a self-contained section with its own in-view navigation, so the
