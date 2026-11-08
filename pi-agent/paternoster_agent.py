@@ -62,7 +62,10 @@ from typing import Callable, Optional
 # driving the motor even if paxnet.py is missing or nmcli is not installed —
 # the `net.*` commands then answer with a clear error instead of crashing.
 try:
-    import paxnet  # noqa: E402
+    if __import__("sys").platform == "win32":
+        import paxnet_win as paxnet  # noqa: E402  (Windows PC master)
+    else:
+        import paxnet  # noqa: E402
 except Exception as _paxnet_exc:  # pragma: no cover
     paxnet = None
     _PAXNET_IMPORT_ERROR = repr(_paxnet_exc)

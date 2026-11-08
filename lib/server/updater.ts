@@ -105,6 +105,9 @@ async function exists(p: string): Promise<boolean> {
 }
 
 async function installedOnPi(): Promise<string | undefined> {
+  if (process.platform === "win32") {
+    return "On Windows, update by double-clicking Install-PAX.cmd again (or Start menu: PAX > Update). Your data is backed up first."
+  }
   await resolveInstall()
   if (!DATA_DIR) {
     return "This copy of the app was not installed by the Pi installer (no /etc/pax-install.conf and no PAX_DATA_DIR). Updating from here only works on a Raspberry Pi set up with the one-line installer."
