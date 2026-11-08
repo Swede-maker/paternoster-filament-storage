@@ -632,7 +632,10 @@ if [[ $HAS_APP -eq 1 ]]; then
   systemctl stop pax-app >/dev/null 2>&1 || true
 
   say "Installing app dependencies (compiles the SQLite module — a few minutes on a Pi)"
-  sudo -u "$RUN_USER" -H bash -c "cd '$APP_DIR' && pnpm install --frozen-lockfile --prod=false 2>&1 | tail -n 3"
+  # pnpm can stop and ask "Proceed? (Y/n)" before rebuilding node_modules; with
+  # its output piped the question is invisible and the install looks frozen.
+  # CI=true + confirmModulesPurge=false + </dev/null makes it never ask.
+  sudo -u "$RUN_USER" -H env CI=true bash -c "cd '$APP_DIR' && pnpm install --frozen-lockfile --prod=false --config.confirmModulesPurge=false --reporter=append-only </dev/null 2>&1 | grep -vE '^Progress:' | tail -n 15"
 
   # Skip the expensive build when a build copied over from a PC is present and
   # newer than the source (README §4b).
