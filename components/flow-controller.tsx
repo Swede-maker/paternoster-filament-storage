@@ -2,8 +2,9 @@
 
 import { createContext, useContext, useEffect, useMemo, useState, type ReactNode } from "react"
 import { useStore } from "@/lib/store"
-import { orderQueueItems } from "@/lib/selectors"
-import { pickFilamentDestination } from "@/lib/filament-flow"
+import { nodesForSystem, orderQueueItems } from "@/lib/selectors"
+import { pickFilamentDestination, type SlotRef } from "@/lib/filament-flow"
+import { PlaceOverflowDialog } from "./place-overflow-dialog"
 import { newId } from "@/lib/filament"
 import type { AppState } from "@/lib/types"
 import type { ActiveJob, Printer, QueueItem, Spool } from "@/lib/types"
@@ -43,6 +44,20 @@ export interface PendingItem {
   isNew?: boolean
 }
 
+/**
+ * Spools from a "place" batch that did not fit in the chosen unit. They have no
+ * spool record yet; the overflow prompt asks the operator where they should go.
+ */
+export interface PlaceOverflow {
+  draft: SpoolDraft
+  /** index of the first unplaced spool within the batch (keeps tag ids aligned) */
+  startIndex: number
+  remaining: number
+  total: number
+  /** the unit that ran out of room (undefined = auto-placement, i.e. everything) */
+  fromNodeId?: string
+}
+
 /** Which queue the tray is currently showing. */
 export type QueueView = "in" | "out"
 
@@ -78,6 +93,12 @@ interface FlowContextValue {
   /** Relocate a stored spool from its slot into another storage unit. */
   startMove: (spool: Spool, from: NodeLocation, destNodeId: string) => void
   startPlace: (draft: SpoolDraft, preferredNodeId?: string) => void
+  /** Spools of the last place batch that are still waiting for a destination. */
+  overflow: PlaceOverflow | null
+  /** Send the waiting spools to an existing unit, or into a brand-new library. */
+  placeOverflow: (target: { nodeId: string } | { newLibraryName: string }) => void
+  /** Drop the waiting spools — they were never created, so nothing is left behind. */
+  dismissOverflow: () => void
   /** Queue stored spools to be picked out and sent to a dryer chamber. */
   startDryerPick: (entries: { spool: Spool; from: NodeLocation; dryerId: string; chamberId: string }[]) => void
   /** Queue spools sitting in a dryer to be put back into storage. */
@@ -134,6 +155,7 @@ const EMPTY: FlowState = { inItems: [], outItems: [], view: "in" }
 export function FlowProvider({ children }: { children: ReactNode }) {
   const { state, dispatch } = useStore()
   const [draft, setDraft] = useState<FlowState>(EMPTY)
+  const [overflow, setOverflow] = useState<PlaceOverflow | null>(null)
   // Pending "act on this spool" request handed off from the inventory tab.
   const [inspectRequest, setInspectRequest] = useState<{ spool: Spool; loc: NodeLocation } | null>(null)
   // Pending "act on this printer slot" request handed off from the Printers area.
@@ -216,6 +238,58 @@ export function FlowProvider({ children }: { children: ReactNode }) {
     const { inItems, outItems, view } = draft
     const hasAny = inItems.length > 0 || outItems.length > 0
     const allItems = [...inItems, ...outItems]
+    const filamentNodes = nodesForSystem(state, "filament")
+    const isLibraryNode = (id: string) => (filamentNodes.find((n) => n.id === id)?.type ?? "paternoster") === "library"
+
+    // Only a real filament unit can pin placement to itself; anything else
+    // (no id, a hardware rack) falls back to balanced auto-placement.
+    const strictTarget = (nodeId?: string) => (nodeId && filamentNodes.some((n) => n.id === nodeId) ? nodeId : undefined)
+
+    /**
+     * Find slots for spools `startIndex .. startIndex+count-1` of a draft. With a
+     * target unit, every slot must be IN that unit — the loop stops at the first
+     * spool that doesn't fit, and the caller turns the rest into `overflow`.
+     * Spool records are only minted for spools that actually got a slot, so a
+     * full carousel never leaves slot-less ghost spools in the inventory.
+     */
+    const buildPlacements = (
+      draftSpool: SpoolDraft,
+      startIndex: number,
+      count: number,
+      targetNodeId: string | undefined,
+      existing: PendingItem[],
+      libraryRowLen?: number,
+    ): PendingItem[] => {
+      const created: PendingItem[] = []
+      const toLibrary = !!targetNodeId && (libraryRowLen != null || isLibraryNode(targetNodeId))
+      for (let k = 0; k < count; k++) {
+        // Each physical spool in a batch keeps its OWN minted QR/tag id (the Nth
+        // of draft.tagIds), so every spool stays individually scannable.
+        const fields = draftToSpoolFields(draftSpool, startIndex + k)
+        const reserved = [...existing, ...created].map((i) => ({ nodeId: i.nodeId, shelf: i.shelf, slot: i.slot }))
+        let dest: SlotRef | null
+        if (toLibrary && targetNodeId) {
+          // A library is one unbounded row: append after its spools and after any
+          // queued placements, so two queued spools never share an index.
+          const rowLen = libraryRowLen ?? state.nodes.find((n) => n.id === targetNodeId)?.slots[0]?.length ?? 0
+          const after = reserved.filter((r) => r.nodeId === targetNodeId).map((r) => r.slot + 1)
+          dest = { nodeId: targetNodeId, shelf: 0, slot: Math.max(rowLen, ...after) }
+        } else {
+          dest = pickDestination(state, fields.grams, reserved, targetNodeId, fields.containerId)
+          if (dest && targetNodeId && dest.nodeId !== targetNodeId) dest = null
+        }
+        if (!dest) break
+        const spool: Spool = { id: newId("spool"), createdAt: Date.now(), ...fields }
+        created.push({ spool, nodeId: dest.nodeId, shelf: dest.shelf, slot: dest.slot, grams: spool.grams, isNew: true })
+      }
+      return created
+    }
+
+    const commitPlacements = (created: PendingItem[]) => {
+      if (created.length === 0) return
+      for (const it of created) dispatch({ type: "UPSERT_SPOOL", spool: it.spool })
+      setDraft((prev) => ({ ...prev, view: "in", inItems: [...prev.inItems, ...created] }))
+    }
 
     return {
       flow: hasAny ? draft : null,
@@ -301,30 +375,57 @@ export function FlowProvider({ children }: { children: ReactNode }) {
       },
 
       startPlace(draftSpool, preferredNodeId) {
-        // A draft may request several identical spools; queue each into its own
-        // best slot for the chosen unit (or the balanced default when none is
-        // given), reserving destinations as we go so they don't collide.
-        // `preferredNodeId` defaults placement to the unit the user is on (the
-        // active section) — including a library, which auto-placement otherwise
-        // skips. `quantity` is a form-only field and never stored on a spool.
+        // A draft may request several identical spools; each gets its own slot in
+        // the chosen unit (the one the user is on). Spools that don't fit are NOT
+        // silently dropped or spilled elsewhere — they become `overflow` and the
+        // operator is asked where they should go.
+        // `quantity` is a form-only field and never stored on a spool.
         const count = Math.max(1, Math.round(draftSpool.quantity ?? 1))
-        setDraft((prev) => {
-          const created: PendingItem[] = []
-          for (let n = 0; n < count; n++) {
-            // Each physical spool in a batch gets its OWN minted QR/tag id (the
-            // Nth of draft.tagIds), so every spool is individually scannable.
-            const spool: Spool = { id: newId("spool"), createdAt: Date.now(), ...draftToSpoolFields(draftSpool, n) }
-            // Register the spool immediately so it exists during placement.
-            dispatch({ type: "UPSERT_SPOOL", spool })
-            const reserved = [...prev.inItems, ...created].map((i) => ({ nodeId: i.nodeId, shelf: i.shelf, slot: i.slot }))
-            const dest = pickDestination(state, spool.grams, reserved, preferredNodeId, spool.containerId)
-            if (!dest) break
-            created.push({ spool, nodeId: dest.nodeId, shelf: dest.shelf, slot: dest.slot, grams: spool.grams, isNew: true })
-          }
-          if (created.length === 0) return prev
-          return { ...prev, view: "in", inItems: [...prev.inItems, ...created] }
-        })
+        const target = strictTarget(preferredNodeId)
+        const created = buildPlacements(draftSpool, 0, count, target, draft.inItems)
+        commitPlacements(created)
+        if (created.length < count) {
+          setOverflow({
+            draft: draftSpool,
+            startIndex: created.length,
+            remaining: count - created.length,
+            total: count,
+            fromNodeId: target,
+          })
+        }
       },
+
+      overflow,
+      placeOverflow(target) {
+        if (!overflow) return
+        let nodeId: string
+        let libraryRowLen: number | undefined
+        if ("newLibraryName" in target) {
+          // Create the library with a known id so this batch can target it now,
+          // before the store re-renders with the new unit.
+          nodeId = newId("node")
+          dispatch({
+            type: "ADD_NODE",
+            id: nodeId,
+            name: target.newLibraryName.trim() || "Library",
+            nodeType: "library",
+            system: "filament",
+            storage: { shelves: 1, slotsPerShelf: 1 },
+          })
+          libraryRowLen = 0
+        } else {
+          nodeId = target.nodeId
+        }
+        const created = buildPlacements(overflow.draft, overflow.startIndex, overflow.remaining, nodeId, draft.inItems, libraryRowLen)
+        commitPlacements(created)
+        const left = overflow.remaining - created.length
+        setOverflow(
+          left > 0
+            ? { ...overflow, startIndex: overflow.startIndex + created.length, remaining: left, fromNodeId: nodeId }
+            : null,
+        )
+      },
+      dismissOverflow: () => setOverflow(null),
 
       startDryerPick(entries) {
         setDraft((prev) => {
@@ -454,6 +555,7 @@ export function FlowProvider({ children }: { children: ReactNode }) {
           const placed = state.nodes.some((n) => n.slots.some((row) => row.includes(it.spool.id)))
           if (!placed) dispatch({ type: "DELETE_SPOOL", id: it.spool.id })
         }
+        setOverflow(null)
         setDraft(EMPTY)
       },
 
@@ -528,9 +630,14 @@ export function FlowProvider({ children }: { children: ReactNode }) {
       requestSlot: (printerId, slot) => setSlotRequest({ printerId, slot }),
       consumeSlot: () => setSlotRequest(null),
     }
-  }, [draft, state, dispatch, inspectRequest, slotRequest])
+  }, [draft, overflow, state, dispatch, inspectRequest, slotRequest])
 
-  return <FlowContext.Provider value={value}>{children}</FlowContext.Provider>
+  return (
+    <FlowContext.Provider value={value}>
+      {children}
+      <PlaceOverflowDialog />
+    </FlowContext.Provider>
+  )
 }
 
 export function useFlow() {

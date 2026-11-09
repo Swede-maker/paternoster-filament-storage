@@ -40,19 +40,18 @@ export function PlaceDialog({ open, onClose }: { open: boolean; onClose: () => v
         description="Describe the spool. The system picks the slot that keeps the carousel balanced."
       />
       <DialogBody>
-        {full ? (
-          <p className="rounded-lg border border-warning/40 bg-warning/10 p-4 text-sm text-warning">
-            Storage is full. Remove a spool before adding a new one.
+        {full && (
+          <p className="mb-3 rounded-lg border border-warning/40 bg-warning/10 p-3 text-sm text-foreground text-pretty">
+            Every slot is full. You can still add the spool — you&apos;ll be asked to put it in a library.
           </p>
-        ) : (
-          <SpoolForm value={draft} onChange={setDraft} showProfiles showQuantity showBarcode showTag />
         )}
+        <SpoolForm value={draft} onChange={setDraft} showProfiles showQuantity showBarcode showTag />
       </DialogBody>
       <DialogFooter>
         <Button variant="ghost" onClick={onClose}>
           Cancel
         </Button>
-        <Button onClick={submit} disabled={full}>
+        <Button onClick={submit}>
           {qty > 1 ? `Find ${qty} slots` : "Find best slot"}
         </Button>
       </DialogFooter>
