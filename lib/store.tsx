@@ -703,6 +703,7 @@ function makePairingCode(): string {
 }
 
 function makeNode(opts: {
+  id?: string
   name: string
   ip: string
   role: NodeRole
@@ -724,7 +725,7 @@ function makeNode(opts: {
   const manual = type === "shelf" || type === "library"
   const driver = manual ? "simulated" : opts.driver ?? "simulated"
   return {
-    id: `node-${Date.now().toString(36)}-${nodeCounter}`,
+    id: opts.id ?? `node-${Date.now().toString(36)}-${nodeCounter}`,
     name: opts.name,
     system: opts.system ?? "filament",
     type,
@@ -790,6 +791,7 @@ function makeInitialState(): AppState {
 
 export type Action =
   | { type: "HYDRATE"; state: AppState }
+  | { type: "ADOPT_SAVED"; saved: PersistedState; sent: PersistedState }
   | {
       type: "SETUP"
       nodeType: NodeType
@@ -818,6 +820,8 @@ export type Action =
   // Nodes
   | {
       type: "ADD_NODE"
+      /** Caller-chosen id, so the creator can target the new unit in the same tick. */
+      id?: string
       name: string
       nodeType: NodeType
       system?: SystemKind
@@ -1459,6 +1463,19 @@ function coreReducer(state: AppState, action: Action): AppState {
       }
     }
 
+    case "ADOPT_SAVED": {
+      // A save merged other devices' changes into the document it wrote. That
+      // merged document becomes our baseline, so local state MUST contain those
+      // changes too — otherwise the next save sees "in baseline, missing locally"
+      // and deletes them (spools vanishing from the carousel/library one by one).
+      // Three-way merge against what we sent so any local edit made while the
+      // save was in flight still wins. Runtime-only fields (the active job and
+      // queues) are not part of the document and are kept as-is.
+      const merged = mergeCatalog(toPersisted(state), action.saved, action.sent)
+      const hydrated = coreReducer(state, { type: "HYDRATE", state: migrate(merged) })
+      return { ...hydrated, job: state.job, pendingJobs: state.pendingJobs, hwPickQueue: state.hwPickQueue }
+    }
+
     case "SETUP": {
       const base = makeInitialState()
       const defaultName = action.nodeType === "shelf" ? "Shelf Storage 1" : "Paternoster 1"
@@ -1596,7 +1613,9 @@ function coreReducer(state: AppState, action: Action): AppState {
 
     // ----- nodes -----
     case "ADD_NODE": {
+      if (action.id && state.nodes.some((n) => n.id === action.id)) return state
       const node = makeNode({
+        id: action.id,
         name: action.name,
         ip: action.ip ?? "127.0.0.1",
         role: "slave",
@@ -3404,7 +3423,7 @@ function machineReducer(state: AppState, action: Action): AppState {
   if (core === state) return core
   const next = reconcileDryers(core)
   // HYDRATE/RESET replace the whole state (history included); never log around them.
-  if (action.type === "HYDRATE" || action.type === "RESET_ALL") return next
+  if (action.type === "HYDRATE" || action.type === "ADOPT_SAVED" || action.type === "RESET_ALL") return next
   const events = historyFor(state, next, action)
   if (events.length === 0) return next
   const history = [...events, ...(next.history ?? [])].slice(0, HISTORY_CAP)
@@ -3654,12 +3673,21 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         } catch {
           // Offline or load failed — save the local document as-is.
         }
+        const sent = toPersisted(snapshot)
         const { version } = await saveSystemState(payload)
         dbVersion.current = version
-        lastSavedSig.current = snapshotSig
-        // The document we just wrote is now the server truth — adopt it as the
-        // baseline so subsequent deletes diff against what's actually stored.
-        baselineRef.current = payload
+        if (JSON.stringify(payload) === snapshotSig) {
+          lastSavedSig.current = snapshotSig
+          baselineRef.current = payload
+        } else {
+          // The merge pulled in other devices' changes. The poll will NOT reload
+          // them (the DB version is our own write), so apply them locally now —
+          // the baseline and local state must describe the same document.
+          const stored = toPersisted(migrate(payload))
+          lastSavedSig.current = JSON.stringify(stored)
+          baselineRef.current = stored
+          dispatch({ type: "ADOPT_SAVED", saved: stored, sent })
+        }
       } catch (e) {
         console.log("[v0] system save failed:", (e as Error).message)
       } finally {
@@ -3684,16 +3712,35 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       const timer = saveTimer.current
       saveTimer.current = null
       clearTimeout(timer)
+      const mySeq = ++saveSeq.current
       void (async () => {
         try {
-          const payload = toPersisted(stateRef.current)
-          const savedSig = persistedSig(stateRef.current)
+          const snapshot = stateRef.current
+          const sent = toPersisted(snapshot)
+          let payload = sent
+          // Same merge as the regular save: a blind write here overwrote spools
+          // another tab/device had added, wiping inventory on refresh.
+          try {
+            const latest = await loadSystemState()
+            if (latest.data) payload = mergeCatalog(sent, latest.data, baselineRef.current)
+          } catch {
+            // Offline — save the local document as-is.
+          }
           const { version } = await saveSystemState(payload)
           dbVersion.current = version
-          lastSavedSig.current = savedSig
-          baselineRef.current = payload
+          const stored = toPersisted(migrate(payload))
+          lastSavedSig.current = JSON.stringify(stored)
+          baselineRef.current = stored
+          if (JSON.stringify(payload) !== JSON.stringify(sent)) {
+            dispatch({ type: "ADOPT_SAVED", saved: stored, sent })
+          }
         } catch {
           // Nothing more we can do as the page goes away.
+        } finally {
+          // The cancelled debounce never reaches its own `finally`; without this
+          // the in-flight flag stuck at true after a tab switch and the tab
+          // stopped receiving other devices' changes for good.
+          if (saveSeq.current === mySeq) saveInFlight.current = false
         }
       })()
     }
