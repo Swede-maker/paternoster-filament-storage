@@ -56,7 +56,7 @@ import threading
 import time
 import traceback
 import weakref
-from typing import Callable, Optional
+from typing import Callable, Optional, Tuple
 
 # Wi-Fi / hotspot management (NetworkManager). Optional: the agent must keep
 # driving the motor even if paxnet.py is missing or nmcli is not installed —
@@ -2531,6 +2531,10 @@ class Carousel:
         # Pulse positioning: re-zero the odometer every time the home flag
         # passes during a move. Off = only Home / Calibrate set zero.
         self.home_resync = True
+        # Fixed travel direction for goto: "home" = the way the homing sweep runs,
+        # "reverse" = the opposite, "off" = shortest way round. Homing itself
+        # always keeps HOMING_DIRECTION and is never affected by this.
+        self.one_way = "off"
         # Set by the server to persist a fresh calibration.
         self.on_calibration: Optional[Callable[[dict], None]] = None
 
@@ -2583,6 +2587,29 @@ class Carousel:
         self.home_resync = on
         print(f"[agent] re-zero on home pass = {on}", flush=True)
         return True
+
+    def set_one_way(self, mode) -> bool:
+        if mode not in ("off", "home", "reverse") or mode == self.one_way:
+            return False
+        self.one_way = mode
+        print(f"[agent] one-way rotation = {mode}", flush=True)
+        return True
+
+    def _route(self, target: int) -> Tuple[str, int]:
+        """
+        Direction ("up" = index down) and shelf count for a goto. Shortest way
+        round unless one-way rotation is on, in which case it always travels
+        the fixed direction even when the other way would be shorter.
+        """
+        up_steps = (self.current_shelf - target) % self.shelves     # "up" = index down
+        down_steps = (target - self.current_shelf) % self.shelves   # "down" = index up
+        if self.one_way != "off":
+            home = home_travel_direction()
+            direction = home if self.one_way == "home" else ("down" if home == "up" else "up")
+            return direction, up_steps if direction == "up" else down_steps
+        if up_steps <= down_steps:
+            return "up", up_steps
+        return "down", down_steps
 
     @property
     def shelf_sensor_fitted(self) -> bool:
@@ -2845,6 +2872,9 @@ class Carousel:
         if snap:
             snap["homeTimeoutS"] = round(self._home_timeout(), 1)
             snap["shelfTimeoutS"] = round(self._shelf_timeout(), 1)
+            # Lets the app plan one-way routes in the same direction homing runs.
+            snap["homeStep"] = -1 if home_travel_direction() == "up" else 1
+            snap["oneWay"] = self.one_way
         return snap
 
     def set_motion(self, move_speed=None, homing_speed=None, ramp_pct=None,
@@ -3942,12 +3972,7 @@ class Carousel:
         """
         rev = float(self.carousel_pulses)
         pitch = rev / self.shelves
-        up_steps = (self.current_shelf - target) % self.shelves
-        down_steps = (target - self.current_shelf) % self.shelves
-        if up_steps <= down_steps:
-            direction, steps = "up", up_steps
-        else:
-            direction, steps = "down", down_steps
+        direction, steps = self._route(target)
         step = -1 if direction == "up" else 1
         sign = 1 if direction == "down" else -1  # odometer counts up on forward() = "down"
         start_shelf = self.current_shelf
@@ -4118,13 +4143,8 @@ class Carousel:
         self.status = "moving"
         self.emit(self.snapshot())
 
-        # Shortest direction around the loop.
-        up_steps = (self.current_shelf - target) % self.shelves     # "up" = index down
-        down_steps = (target - self.current_shelf) % self.shelves   # "down" = index up
-        if up_steps <= down_steps:
-            direction, steps = "up", up_steps
-        else:
-            direction, steps = "down", down_steps
+        # Shortest direction around the loop, or the fixed one-way direction.
+        direction, steps = self._route(target)
         step = -1 if direction == "up" else +1
 
         # THE ALREADY-ACTIVE SENSOR AT THE START OF A MOVE.
@@ -4932,6 +4952,7 @@ async def serve(args) -> None:
         c.set_shelf_timeout(saved.get("shelfTimeoutS"))
         c.set_position_mode(saved.get("positionMode"))
         c.set_home_resync(saved.get("homeResync", True))
+        c.set_one_way(saved.get("oneWay", "off"))
         c.restore_calibration(saved.get("calibration"))
         c.set_home_flag(saved.get("homeFlagPulses"))
         if side:
@@ -4964,6 +4985,7 @@ async def serve(args) -> None:
             "shelfTimeoutS": c.shelf_timeout_s,
             "positionMode": c.position_mode,
             "homeResync": c.home_resync,
+            "oneWay": c.one_way,
             "calibration": c.calibration_info,
             "homeFlagPulses": c.index_window_pulses,
             "reverseDir": c.reverse_dir,
@@ -5234,8 +5256,9 @@ async def serve(args) -> None:
                     home_changed = home_changed or shelf_changed
                     reverse_changed = bool(side) and carousel.set_reverse(msg.get("reverseDir"))
                     resync_changed = carousel.set_home_resync(msg.get("homeResync"))
+                    one_way_changed = carousel.set_one_way(msg.get("oneWay"))
                     mode_changed = (carousel.set_position_mode(msg.get("positionMode")) or reverse_changed
-                                    or arm_changed or home_changed or resync_changed)
+                                    or arm_changed or home_changed or resync_changed or one_way_changed)
                     cal_restored = carousel.restore_calibration({
                         "pulsesPerRev": msg.get("servoCarouselPulses"),
                         "indexWindowPulses": msg.get("servoIndexWindowPulses"),
