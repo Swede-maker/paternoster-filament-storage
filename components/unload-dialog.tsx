@@ -39,8 +39,9 @@ export function UnloadDialog({
   // the user can fix a spool's details (material, colors, dual-color, etc.)
   // without first taking it off the printer.
   const [view, setView] = useState<"unload" | "edit">("unload")
+  // ONE draft backs both the quick weight/container fields and the full editor,
+  // so a weight typed on the unload sheet is the weight "Edit details" shows.
   const [draft, setDraft] = useState<SpoolDraft>(() => emptyDraft())
-  const [grams, setGrams] = useState("")
   // Which storage unit to store into. Seeded to the unit the user is viewing, but
   // they can redirect to any unit with room (e.g. paternoster vs a dumb shelf).
   const [destNodeId, setDestNodeId] = useState<string>("")
@@ -86,7 +87,6 @@ export function UnloadDialog({
       diameter: s.diameter,
       barcode: s.barcode,
     })
-    setGrams(String(Math.round(target.spool.grams)))
     // A library never fills up; fixed grids need a free slot. Prefer the active
     // unit (the section the user is on) when it has room, else the first unit
     // that does.
@@ -104,13 +104,26 @@ export function UnloadDialog({
   }, [target])
 
   if (!target) return null
-  const { printer, slot, spool } = target
+  const { printer, slot } = target
+  // Read the LIVE spool, not the snapshot taken when the dialog opened, so saved
+  // edits (and weight updates from the printer) show up immediately.
+  const spool = state.spools[target.spool.id] ?? target.spool
   // Direct placement into a pre-chosen slot vs. the auto-store queue.
   const placing = !!placeInto
 
+  const gramsVal = Number.isFinite(draft.grams) ? Math.max(0, Math.round(draft.grams)) : undefined
+  const gramsChanged = gramsVal !== undefined && gramsVal !== Math.round(spool.grams)
+  const containerChanged = (containerId || undefined) !== (spool.containerId || undefined)
+  const dirty = gramsChanged || containerChanged
+
+  function saveQuick() {
+    const changes: Partial<Spool> = {}
+    if (gramsChanged) changes.grams = gramsVal
+    if (containerChanged) changes.containerId = containerId || undefined
+    dispatch({ type: "UPDATE_SPOOL", id: spool.id, changes })
+  }
+
   function store() {
-    const g = Number.parseInt(grams)
-    const gramsVal = Number.isFinite(g) ? Math.max(0, g) : undefined
     const chosen = containerId || undefined
     // Persist the container choice on the spool first, then hand a spool that
     // already reflects it downstream so balance math and the box icon both use
@@ -135,6 +148,8 @@ export function UnloadDialog({
   function saveEdit() {
     const { quantity: _q, ...changes } = draft
     dispatch({ type: "UPDATE_SPOOL", id: spool.id, changes })
+    // The editor owns the container too; keep the quick picker in step with it.
+    setContainerId(changes.containerId ?? "")
     setView("unload")
   }
 
@@ -237,9 +252,13 @@ export function UnloadDialog({
             <Input
               type="number"
               inputMode="numeric"
-              value={grams}
-              onChange={(e) => setGrams(e.target.value)}
+              min={0}
+              value={Number.isFinite(draft.grams) ? draft.grams : ""}
+              onChange={(e) =>
+                setDraft({ ...draft, grams: e.target.value === "" ? Number.NaN : Number(e.target.value) })
+              }
               placeholder="grams"
+              aria-label="Remaining weight in grams"
             />
             <span className="text-sm text-muted-foreground">g</span>
           </div>
@@ -249,7 +268,14 @@ export function UnloadDialog({
         </Field>
 
         <Field label="Store in container / dry box">
-          <Select value={containerId} onChange={(e) => setContainerId(e.target.value)} aria-label="Storage container">
+          <Select
+            value={containerId}
+            onChange={(e) => {
+              setContainerId(e.target.value)
+              setDraft({ ...draft, containerId: e.target.value || undefined })
+            }}
+            aria-label="Storage container"
+          >
             <option value="">No container (bare spool)</option>
             {containers.map((c) => (
               <option key={c.id} value={c.id}>
@@ -263,6 +289,24 @@ export function UnloadDialog({
               : "The container's weight is added when balancing the carousel position."}
           </p>
         </Field>
+
+        {dirty && (
+          <div
+            role="status"
+            className="flex items-center justify-between gap-3 rounded-lg border border-primary/40 bg-primary/10 p-3"
+          >
+            <p className="text-sm text-foreground text-pretty">
+              {gramsChanged && containerChanged
+                ? "Weight and container changed."
+                : gramsChanged
+                  ? `Weight changed to ${formatGrams(gramsVal ?? 0)}.`
+                  : "Container changed."}
+            </p>
+            <Button size="sm" onClick={saveQuick}>
+              <Save className="h-4 w-4" /> Save change
+            </Button>
+          </div>
+        )}
 
         {!placing && storageFull && (
           <p className="rounded-lg border border-warning/40 bg-warning/10 p-3 text-sm text-warning">

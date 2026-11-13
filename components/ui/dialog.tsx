@@ -51,7 +51,7 @@ export function Dialog({ open, onClose, children, className, hideClose, title, d
         className={cn(
           "relative z-10 w-full rounded-t-2xl border border-border bg-popover text-popover-foreground shadow-2xl",
           "sm:rounded-2xl animate-in fade-in slide-in-from-bottom-4 sm:zoom-in-95",
-          "max-h-[92vh] overflow-y-auto scrollbar-thin",
+          "max-h-[92dvh] overflow-y-auto overscroll-contain scrollbar-thin",
           className ?? "max-w-lg",
         )}
       >

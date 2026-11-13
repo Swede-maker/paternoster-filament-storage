@@ -150,7 +150,10 @@ export function InHandTab({ onQueued, onContinueDryer }: { onQueued: () => void;
                 Select spools that share the same mission.
               </p>
             ))}
-          <ul className="flex flex-col gap-2">
+          <ul
+            aria-label="Spools in my hand"
+            className="-mx-1 flex max-h-[50dvh] flex-col gap-2 overflow-y-auto overscroll-contain px-1 scrollbar-thin"
+          >
             {spools.map((s) => {
               const queued = queuedIds.has(s.id)
               const moving = movingIds.has(s.id)

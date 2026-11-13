@@ -2,7 +2,7 @@
 
 import { createContext, useContext, useEffect, useMemo, useState, type ReactNode } from "react"
 import { useStore } from "@/lib/store"
-import { nodesForSystem, orderQueueItems } from "@/lib/selectors"
+import { advanceNodePositions, nodesForSystem, orderQueueItems, queueNodePositions } from "@/lib/selectors"
 import { pickFilamentDestination, type SlotRef } from "@/lib/filament-flow"
 import { PlaceOverflowDialog } from "./place-overflow-dialog"
 import { newId } from "@/lib/filament"
@@ -565,14 +565,14 @@ export function FlowProvider({ children }: { children: ReactNode }) {
         // Route a set of pending items by proximity within each motorized
         // carousel so the job grabs the nearest queued shelf first; manual
         // shelves/libraries keep a stable order.
-        const nodePos: Record<string, { currentShelf: number; shelves: number }> = {}
-        for (const n of state.nodes) {
-          if ((n.type ?? "paternoster") === "paternoster") {
-            nodePos[n.id] = { currentShelf: n.machine.currentShelf, shelves: n.storage.shelves }
-          }
-        }
-        const toQueueItems = (items: PendingItem[]): QueueItem[] =>
-          orderQueueItems(items, nodePos).map((i) => ({
+        // With one-way rotation on, each node's route is a single sweep in the fixed
+        // direction. The store run is routed from where the pick run leaves the
+        // carousel, so it keeps sweeping forward instead of starting over.
+        let nodePos = queueNodePositions(state)
+        const toQueueItems = (items: PendingItem[]): QueueItem[] => {
+          const ordered = orderQueueItems(items, nodePos)
+          nodePos = advanceNodePositions(nodePos, ordered)
+          return ordered.map((i) => ({
             spoolId: i.spool.id,
             nodeId: i.nodeId,
             shelf: i.shelf,
@@ -586,6 +586,7 @@ export function FlowProvider({ children }: { children: ReactNode }) {
             grams: i.grams,
             done: false,
           }))
+        }
 
         // In-items into a library have no physical location to travel to, so they
         // commit INSTANTLY here (no motion overlay, no confirm) — mirroring the

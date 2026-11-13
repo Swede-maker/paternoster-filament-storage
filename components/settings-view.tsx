@@ -37,6 +37,7 @@ import {
   Puzzle,
 } from "lucide-react"
 import { AddonsSection } from "./addons-section"
+import { RotationDirectionSetting } from "./rotation-direction-setting"
 import { balanceWarningSetting } from "@/lib/rebalance"
 import { carouselOrientation, type CarouselOrientation } from "@/lib/orientation"
 import { cameraSetting, DEFAULT_CAMERA_PORT, type CameraSetting } from "@/lib/camera"
@@ -98,6 +99,7 @@ export function SettingsView() {
           label="Confirm before every movement"
           description="When on, the machine waits for a 'Confirm & rotate' tap before the carousel moves during a job. Turn off to let it move automatically."
         />
+        <RotationDirectionSetting />
       </Section>
 
       {/* Carousel balance */}

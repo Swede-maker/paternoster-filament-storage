@@ -479,6 +479,7 @@ export function NodeConnection() {
         n.servoHomeResync === false ? 0 : 1,
         n.twinSide ?? "",
         n.twinReverse ? 1 : 0,
+        state.settings.oneWayRotation ?? "off",
       ].join(":")
     })
     .join("|")
@@ -530,6 +531,8 @@ export function NodeConnection() {
               shelfTimeoutS: shelfTimeoutFor(node),
               positionMode: node.positionMode ?? "sensor",
               homeResync: node.servoHomeResync !== false,
+              // Fixed travel direction for every goto; homing is never affected.
+              oneWay: snapshot.settings.oneWayRotation ?? "off",
               // Our copy of the calibration, for an agent that lost its own.
               ...(node.servoCarouselPulses ? { servoCarouselPulses: node.servoCarouselPulses } : {}),
               ...(node.servoIndexWindowPulses ? { servoIndexWindowPulses: node.servoIndexWindowPulses } : {}),

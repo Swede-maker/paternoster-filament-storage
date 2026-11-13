@@ -10,7 +10,7 @@ import { formatRemaining, spoolFill, densityFor, newId } from "@/lib/filament"
 import { klipperHeaterName } from "@/lib/printer-commands"
 import { fetchMoonrakerStatus, isKlipperLinked, type MoonrakerStatus } from "@/lib/moonraker"
 import { fetchPrusaLinkStatus, isPrusaLinked } from "@/lib/prusalink"
-import { fetchBambuStatus, isBambuLinked, bambuCloudRefresh, type BambuStatus } from "@/lib/bambu"
+import { fetchBambuStatus, isBambuLinked, bambuCloudRefresh, bambuCloudProfile, type BambuStatus } from "@/lib/bambu"
 import { Button } from "./ui/button"
 import { Input } from "./ui/field"
 import { AmsUnit, Toolhead } from "./ams-unit"
@@ -39,7 +39,19 @@ export function PrinterPanel({
   const [editPrinter, setEditPrinter] = useState<Printer | null>(null)
   // Collapse the printer section (selector + AMS grid) to reclaim space; the
   // title bar stays. Starts open and is remembered per device.
-  const [open, setOpen] = usePersistentBoolean("pax:home:printersOpen", true)
+  const [savedOpen, setSavedOpen] = usePersistentBoolean("pax:home:printersOpen", true)
+  // During a pick/place job the section always starts collapsed so the carousel
+  // and the active-spool window get the room. Toggling it mid-job only affects
+  // that job; the saved preference comes back once the job ends.
+  const jobActive = !!state.job
+  const [jobOpen, setJobOpen] = useState(false)
+  const [prevJobActive, setPrevJobActive] = useState(jobActive)
+  if (prevJobActive !== jobActive) {
+    setPrevJobActive(jobActive)
+    setJobOpen(false)
+  }
+  const open = jobActive ? jobOpen : savedOpen
+  const toggleOpen = () => (jobActive ? setJobOpen((v) => !v) : setSavedOpen((v) => !v))
   const printer = activePrinter(state)
 
   function handleSlot(p: Printer, index: number) {
@@ -55,17 +67,10 @@ export function PrinterPanel({
       <div className={cn("flex flex-wrap items-center justify-between gap-2", open && "mb-3")}>
         <div className="flex items-center gap-1.5">
           {/* Chevron toggles the whole printer section to free up space. */}
-          <button
-            type="button"
-            onClick={() => setOpen((v) => !v)}
-            aria-expanded={open}
-            aria-label={open ? "Hide printers" : "Show printers"}
-            className="flex h-7 w-7 items-center justify-center rounded-md text-muted-foreground transition-colors hover:text-foreground"
-          >
-            <ChevronDown className={cn("h-4 w-4 transition-transform", open ? "rotate-180" : "rotate-0")} />
-          </button>
+          <SectionToggle open={open} onToggle={toggleOpen} />
           <h2 className="text-base font-semibold">AMS / Toolchanger Status</h2>
         </div>
+        <div className="ml-auto flex items-center gap-2">
         {open && (
           <div className="flex items-center gap-2">
             {/* Printer selector */}
@@ -91,6 +96,10 @@ export function PrinterPanel({
             </Button>
           </div>
         )}
+          {/* Mirror toggle on the right: the active-spool window docks bottom-left
+              during a job and covers the left chevron. */}
+          <SectionToggle open={open} onToggle={toggleOpen} />
+        </div>
       </div>
 
       {open &&
@@ -124,6 +133,20 @@ export function PrinterPanel({
       )}
       </section>
     </div>
+  )
+}
+
+function SectionToggle({ open, onToggle }: { open: boolean; onToggle: () => void }) {
+  return (
+    <button
+      type="button"
+      onClick={onToggle}
+      aria-expanded={open}
+      aria-label={open ? "Hide printers" : "Show printers"}
+      className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+    >
+      <ChevronDown className={cn("h-4 w-4 transition-transform", open ? "rotate-180" : "rotate-0")} />
+    </button>
   )
 }
 
@@ -558,9 +581,26 @@ function BambuLinkRow({ printer, bambu }: { printer: Printer; bambu?: BambuStatu
   const connected = bambu?.connected === true && !bambu.simulated
   const error = linked ? bambu?.error : undefined
   const isCloud = printer.bambuMode === "cloud"
+  // A cloud token saved without a uid (opaque global-region tokens) can usually
+  // be repaired without re-entering the password: ask the profile API for it.
+  const repairUid = isCloud && !!printer.bambuToken?.trim() && !printer.bambuUid?.trim()
+  const uidRepair = useSWR(
+    repairUid ? ["bambu-uid", printer.id, printer.bambuRegion ?? "global", printer.bambuToken] : null,
+    ([, , region, token]) => bambuCloudProfile(region as "global" | "china", token as string),
+    {
+      revalidateOnFocus: false,
+      shouldRetryOnError: false,
+      onSuccess: (res) => {
+        if (res.ok) dispatch({ type: "UPDATE_PRINTER", id: printer.id, changes: { bambuUid: res.uid, link: "checking" } })
+      },
+    },
+  )
+  const repairing = repairUid && uidRepair.isLoading
+  const repairError = repairUid && uidRepair.data && !uidRepair.data.ok ? uidRepair.data.error : undefined
+  const missingSerial = isCloud && !!printer.bambuToken?.trim() && !!printer.bambuUid?.trim() && !printer.serial?.trim()
   // Offer a cloud sign-in when this is a cloud printer that isn't linked yet
-  // (never signed in, or the saved token was cleared).
-  const needsCloudSignIn = isCloud && !linked
+  // (never signed in, or the saved token couldn't be repaired).
+  const needsCloudSignIn = isCloud && !linked && !repairing && !missingSerial
 
   const status: "online" | "checking" | "offline" = connected || simulated ? "online" : connecting ? "checking" : "offline"
   const dot =
@@ -575,7 +615,13 @@ function BambuLinkRow({ printer, bambu }: { printer: Printer; bambu?: BambuStatu
   const statusColor =
     status === "online" ? (simulated ? "text-warning" : "text-success") : status === "checking" ? "text-warning" : "text-muted-foreground"
   const statusLabel = !linked
-    ? "Add serial + access code to link"
+    ? isCloud
+      ? repairing
+        ? "Finishing cloud sign-in…"
+        : missingSerial
+          ? "Signed in — pick the printer's serial in Edit"
+          : "Not signed in to Bambu cloud"
+      : "Add serial + access code to link"
     : simulated
       ? "Simulated (preview)"
       : connected
@@ -598,6 +644,7 @@ function BambuLinkRow({ printer, bambu }: { printer: Printer; bambu?: BambuStatu
               {isCloud && printer.bambuAccountEmail ? ` · ${printer.bambuAccountEmail}` : ""}
             </p>
             {error && <p className="truncate text-xs text-destructive">{error}</p>}
+            {repairError && <p className="text-xs text-destructive">{repairError}</p>}
             {simulated && (
               <p className="text-xs text-muted-foreground">Self-host on the printer&apos;s LAN for real AMS data.</p>
             )}
