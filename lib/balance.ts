@@ -392,6 +392,41 @@ export function orderRebalanceMoves(moves: RebalanceMove[], startShelf: number, 
 }
 
 /**
+ * Shelf-index step (+1 / -1) the HOMING sweep travels in, as reported by the
+ * node's agent. The Pi agent homes toward decreasing indices by default, so that
+ * is the fallback until the first status frame arrives.
+ */
+export function homeIndexStep(node: StorageNode): 1 | -1 {
+  return node.servo?.homeStep === 1 ? 1 : -1
+}
+
+/**
+ * The fixed index step every carousel move must use, or null when the operator
+ * allows the shortest way round. Homing is never affected by this.
+ */
+export function oneWayStep(node: StorageNode, settings: Pick<Settings, "oneWayRotation">): 1 | -1 | null {
+  const mode = settings.oneWayRotation ?? "off"
+  if (mode === "off") return null
+  const home = homeIndexStep(node)
+  return mode === "home" ? home : home === 1 ? -1 : 1
+}
+
+/**
+ * Rotation from `from` to `to`: the fixed direction when `step` is set, else the
+ * shortest way round. "up" moves toward higher indices (matches MOVE_TICK).
+ */
+export function routeRotation(
+  from: number,
+  to: number,
+  shelves: number,
+  step: 1 | -1 | null,
+): { direction: "up" | "down"; steps: number } {
+  if (step === null) return shortestRotation(from, to, shelves)
+  const steps = (((to - from) * step) % shelves + shelves) % shelves
+  return { direction: step === 1 ? "up" : "down", steps }
+}
+
+/**
  * Shortest rotation from `from` to `to` on a loop of `shelves` positions.
  * Returns the direction and number of steps. "up" moves toward higher indices.
  */

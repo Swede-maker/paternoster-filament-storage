@@ -164,6 +164,8 @@ export interface ConfigCommand {
   servoIndexWindowPulses?: number
   /** Re-zero on every home-flag pass in pulse positioning (default true). */
   homeResync?: boolean
+  /** Fixed travel direction for goto: "home" = homing's way, "reverse", or "off" = shortest. */
+  oneWay?: "off" | "home" | "reverse"
 }
 
 /**
@@ -412,6 +414,8 @@ export interface ServoEvent {
   shelfPitchS?: number | null
   /** DC drive: the longest timed jog the agent accepts, in ms. */
   jogMaxMs?: number
+  /** Shelf-index step (+1 / -1) the agent's homing sweep travels in. */
+  homeStep?: 1 | -1
   /** Present on the frame emitted as a jog starts. */
   jogging?: boolean
   motor?: ServoMotorId

@@ -9,6 +9,7 @@ import type {
   SystemKind,
 } from "./types"
 import { printerAmsUnits } from "./filament"
+import { oneWayStep } from "./balance"
 
 /** The area currently shown; defaults to filament for older saves. */
 export function activeArea(state: AppState): SystemKind {
@@ -70,13 +71,55 @@ export interface StoredEntry {
 export interface NodePosition {
   currentShelf: number
   shelves: number
+  /**
+   * Fixed index step when the carousel may only turn one way (see
+   * Settings.oneWayRotation); null/absent = shortest way round.
+   */
+  step?: 1 | -1 | null
 }
 
-/** Steps between two shelves on the loop, taking the shorter direction. */
-function loopSteps(from: number, to: number, shelves: number): number {
+/**
+ * Steps between two shelves on the loop: the shorter direction, or — when the
+ * carousel may only turn one way — the distance travelling in `step`.
+ */
+function loopSteps(from: number, to: number, shelves: number, step?: 1 | -1 | null): number {
   if (shelves <= 0) return 0
   const up = (((to - from) % shelves) + shelves) % shelves
+  if (step === 1) return up
+  if (step === -1) return (shelves - up) % shelves
   return Math.min(up, shelves - up)
+}
+
+/**
+ * Build the per-node positions the queue planner routes from: every motorized
+ * carousel, with its one-way step when that setting is on.
+ */
+export function queueNodePositions(state: AppState, nodes: StorageNode[] = state.nodes): Record<string, NodePosition> {
+  const out: Record<string, NodePosition> = {}
+  for (const n of nodes) {
+    if ((n.type ?? "paternoster") !== "paternoster") continue
+    out[n.id] = {
+      currentShelf: n.machine.currentShelf,
+      shelves: n.storage.shelves,
+      step: oneWayStep(n, state.settings),
+    }
+  }
+  return out
+}
+
+/**
+ * Where each node's carousel will be parked after serving `items` in order, so
+ * a following job (store after pick) is routed from there, not from the start.
+ */
+export function advanceNodePositions<T extends { nodeId: string; shelf: number }>(
+  pos: Record<string, NodePosition>,
+  items: T[],
+): Record<string, NodePosition> {
+  const next = { ...pos }
+  for (const it of items) {
+    if (next[it.nodeId]) next[it.nodeId] = { ...next[it.nodeId], currentShelf: it.shelf }
+  }
+  return next
 }
 
 /**
@@ -89,17 +132,21 @@ function nearestRoute<T extends { shelf: number; slot: number }>(
   group: { item: T; index: number }[],
   start: number,
   shelves: number,
+  step?: 1 | -1 | null,
 ): T[] {
+  // With a fixed direction, "nearest ahead" each time is exactly one sweep: every
+  // queued shelf is served the first time it comes round, so the carousel never
+  // passes one and has to go all the way round again for it.
   const remaining = [...group]
   const route: T[] = []
   let cur = start
   while (remaining.length > 0) {
     let bestI = 0
     let best = remaining[0]
-    let bestDist = loopSteps(cur, best.item.shelf, shelves)
+    let bestDist = loopSteps(cur, best.item.shelf, shelves, step)
     for (let i = 1; i < remaining.length; i++) {
       const cand = remaining[i]
-      const dist = loopSteps(cur, cand.item.shelf, shelves)
+      const dist = loopSteps(cur, cand.item.shelf, shelves, step)
       const better =
         dist < bestDist ||
         (dist === bestDist &&
@@ -146,7 +193,7 @@ export function orderQueueItems<T extends { nodeId: string; shelf: number; slot:
     const group = byNode.get(nodeId)!
     const pos = nodePos?.[nodeId]
     if (pos) {
-      out.push(...nearestRoute(group, pos.currentShelf, pos.shelves))
+      out.push(...nearestRoute(group, pos.currentShelf, pos.shelves, pos.step))
     } else {
       const sorted = [...group].sort((a, b) => {
         if (a.item.shelf !== b.item.shelf) return a.item.shelf - b.item.shelf

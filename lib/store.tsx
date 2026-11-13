@@ -67,7 +67,7 @@ import type {
 import { printerAmsUnits, printerSlotCount, rampStepMs, newId, DEFAULT_RAMP_PCT, pulseDriveProfile } from "./filament"
 import { pickRemainderDestination } from "./hardware-flow"
 import { shelfLabel, printerSlotLabel, nodeSystem } from "./selectors"
-import { shortestRotation } from "./balance"
+import { oneWayStep, routeRotation } from "./balance"
 import { pickFilamentDestination } from "./filament-flow"
 import { getSystemVersion, loadSystemState, saveSystemState } from "@/app/actions/system-state"
 
@@ -344,6 +344,36 @@ function mergeServerConsumption(
  * a key conflict we take the MAX (whichever device saw more) and union the rest.
  * This preserves the server-written record while tolerating a stale browser.
  */
+function mergePrinterSlots(
+  local: Printer[],
+  remote: Printer[] | undefined,
+  baseline: Printer[] | undefined,
+  nodes: StorageNode[],
+): Printer[] {
+  if (!remote) return local
+  const remoteById = new Map(remote.map((p) => [p.id, p]))
+  const baseById = new Map((baseline ?? []).map((p) => [p.id, p]))
+  // A spool that sits in a storage slot after the merge must not also be
+  // adopted onto a printer slot from a stale copy.
+  const stored = new Set(nodes.flatMap((n) => n.slots.flat()).filter((id): id is string => !!id))
+  return local.map((p) => {
+    const rem = remoteById.get(p.id)
+    const base = baseById.get(p.id)
+    if (!rem || !base) return p
+    let loaded: (string | null)[] | null = null
+    for (let i = 0; i < p.loaded.length; i++) {
+      const l = p.loaded[i] ?? null
+      const b = base.loaded?.[i] ?? null
+      const r = rem.loaded?.[i] ?? null
+      if (l !== b || r === l) continue
+      if (r && stored.has(r)) continue
+      loaded ??= [...p.loaded]
+      loaded[i] = r
+    }
+    return loaded ? { ...p, loaded } : p
+  })
+}
+
 function mergeConsumptionLog(
   local: ConsumptionBucket[] | undefined,
   remote: ConsumptionBucket[] | undefined,
@@ -413,6 +443,7 @@ function mergeNodeSlots(local: StorageNode[], remote: StorageNode[] | undefined,
   if (!remote || !baseline) return local
   const remoteById = new Map(remote.map((n) => [n.id, n]))
   const baseById = new Map(baseline.map((n) => [n.id, n]))
+  const storedLocally = new Set(local.flatMap((n) => n.slots.flat()).filter((id): id is string => !!id))
   let changed = false
   const out = local.map((node) => {
     const rem = remoteById.get(node.id)
@@ -430,6 +461,27 @@ function mergeNodeSlots(local: StorageNode[], remote: StorageNode[] | undefined,
       }
     }
     let slots: (string | null)[][] | null = null
+    if (node.type === "library") {
+      // A library row is compacted and appended to, so indices shift on every
+      // change and a positional merge drops spools another device appended.
+      // Merge it as a set: apply the other device's removals and additions.
+      const lRow = node.slots[0] ?? []
+      const rIds = new Set((rem.slots[0] ?? []).filter((id): id is string => !!id))
+      const bIds = new Set((base.slots[0] ?? []).filter((id): id is string => !!id))
+      const removedElsewhere = new Set([...bIds].filter((id) => !rIds.has(id)))
+      const addedElsewhere = [...rIds].filter((id) => !bIds.has(id) && !storedLocally.has(id))
+      if (addedElsewhere.length > 0 || lRow.some((id) => id && removedElsewhere.has(id))) {
+        const row = lRow.filter((id) => !id || !removedElsewhere.has(id))
+        for (const id of addedElsewhere) {
+          row.push(id)
+          storedLocally.add(id)
+        }
+        slots = [row, ...node.slots.slice(1)]
+      }
+      if (!slots && !tuned) return node
+      changed = true
+      return { ...node, ...(tuned ?? {}), ...(slots ? { slots } : {}) }
+    }
     for (let s = 0; s < node.slots.length; s++) {
       const lRow = node.slots[s] ?? []
       const rRow = rem.slots[s]
@@ -503,6 +555,11 @@ function mergeCatalog(local: PersistedState, remote: PersistedState, baseline: P
   // Same protection for where spools physically are: only cells this device did
   // not touch adopt the other device's value.
   const nodes = mergeNodeSlots(local.nodes, remote.nodes, baseline?.nodes)
+  // And for what is loaded on each printer/AMS slot. Printers used to be plain
+  // last-write-wins, so a second browser that still showed a spool on the AMS
+  // re-saved it there on the next carousel tick, after this device had stored
+  // it in the carousel. The spool then appeared in BOTH places.
+  const printers = mergePrinterSlots(local.printers, remote.printers, baseline?.printers, nodes)
   // Consumption buckets and daily storage snapshots are append-mostly records
   // written by the server (and any device); preserve entries from other devices.
   const consumptionLog = mergeConsumptionLog(local.consumptionLog, remote.consumptionLog)
@@ -546,6 +603,7 @@ function mergeCatalog(local: PersistedState, remote: PersistedState, baseline: P
   return {
     ...local,
     nodes,
+    printers,
     spools,
     parts,
     hardwareOrders,
@@ -1175,7 +1233,12 @@ function beginNodeMoveTo(state: AppState, nodeId: string, target: number, servic
   if (node.machine.status === "moving" && node.machine.targetShelf === target) {
     return state
   }
-  const { direction } = shortestRotation(node.machine.currentShelf, target, node.storage.shelves)
+  const { direction } = routeRotation(
+    node.machine.currentShelf,
+    target,
+    node.storage.shelves,
+    oneWayStep(node, state.settings),
+  )
   // Each area has its own safety gate. Hardware falls back to the filament flag
   // for saves made before the per-area setting existed.
   const confirmSetting =
@@ -1420,8 +1483,19 @@ function coreReducer(state: AppState, action: Action): AppState {
       // Carry both over from the node we already have. On first load there are no
       // existing nodes, so this is a no-op and the document applies as-is.
       const prev = new Map(state.nodes.map((n) => [n.id, n]))
+      // Which unit/printer is on screen is THIS device's choice. The shared
+      // document carries whatever tab another browser last saved, so adopting it
+      // yanked the view away mid-operation (e.g. back to the master Library right
+      // after a slave carousel finished rotating) — and any placement still being
+      // made then landed on the wrong unit.
+      const keepActiveNode =
+        state.nodes.length > 0 && action.state.nodes.some((n) => n.id === state.activeNodeId)
+      const keepActivePrinter =
+        state.activePrinterId != null && action.state.printers.some((p) => p.id === state.activePrinterId)
       return {
         ...action.state,
+        activeNodeId: keepActiveNode ? state.activeNodeId : action.state.activeNodeId,
+        activePrinterId: keepActivePrinter ? state.activePrinterId : action.state.activePrinterId,
         nodes: action.state.nodes.map((n) => {
           const old = prev.get(n.id)
           if (!old) return n
@@ -2517,7 +2591,12 @@ function coreReducer(state: AppState, action: Action): AppState {
       if (!node || !node.machine.homed || node.machine.status !== "idle" || state.job) return state
       if (!isDrivable(node)) return state
       if (action.shelf === node.machine.currentShelf) return state
-      const { direction } = shortestRotation(node.machine.currentShelf, action.shelf, node.storage.shelves)
+      const { direction } = routeRotation(
+        node.machine.currentShelf,
+        action.shelf,
+        node.storage.shelves,
+        oneWayStep(node, state.settings),
+      )
       return withNode(state, action.nodeId, (n) => ({
         ...n,
         machine: { ...n.machine, targetShelf: action.shelf, direction, moveFrom: n.machine.currentShelf, status: "moving" },
@@ -3504,9 +3583,18 @@ function migrate(parsed: any): AppState {
     // fields agree, synthesising `ams` for printers saved before it existed.
     // De-dupe by id first: older data could contain the same printer twice
     // (a double ADD_PRINTER), which crashed React with duplicate keys.
-    printers: dedupeById<Printer>((parsed.printers ?? []) as Printer[]).map((p) =>
-      normalizePrinter({ ...p, link: "offline" }),
-    ),
+    // A spool can't be on a printer AND in a storage slot. Older saves could hold
+    // both (a stale device re-saved the AMS after the spool was stored), and the
+    // storage placement is always the later, confirmed step, so the AMS copy goes.
+    printers: (() => {
+      const stored = new Set(nodes.flatMap((n) => n.slots.flat()).filter((id): id is string => !!id))
+      return dedupeById<Printer>((parsed.printers ?? []) as Printer[]).map((p) => {
+        const normalized = normalizePrinter({ ...p, link: "offline" })
+        return normalized.loaded.some((id) => id && stored.has(id))
+          ? { ...normalized, loaded: normalized.loaded.map((id) => (id && stored.has(id) ? null : id)) }
+          : normalized
+      })
+    })(),
     activePrinterId: parsed.activePrinterId ?? null,
     dispenseRequests: Array.isArray(parsed.dispenseRequests)
       ? (parsed.dispenseRequests as DispenseRequest[]).slice(-DISPENSE_CAP)

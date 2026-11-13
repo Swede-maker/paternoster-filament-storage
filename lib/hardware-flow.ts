@@ -1,7 +1,7 @@
 import type { AppState, HardwarePart, PickList, QueueItem, StorageNode } from "./types"
 import type { Action } from "./store"
 import { bestSlotForNode, bestNodeSlot, type BalanceOccupant } from "./balance"
-import { getNode, nodesForSystem, orderQueueItems, partWeightGrams } from "./selectors"
+import { getNode, nodesForSystem, orderQueueItems, partWeightGrams, queueNodePositions } from "./selectors"
 
 type Dispatch = (action: Action) => void
 
@@ -283,13 +283,9 @@ export function takeOutParts(state: AppState, dispatch: Dispatch, partIds: strin
     .filter((x): x is { partId: string; nodeId: string; shelf: number; slot: number } => x != null)
   if (located.length === 0) return false
 
-  // Shortest-route ordering per motorized unit (matches the filament run()).
-  const nodePos: Record<string, { currentShelf: number; shelves: number }> = {}
-  for (const n of nodesForSystem(state, "hardware")) {
-    if ((n.type ?? "paternoster") === "paternoster") {
-      nodePos[n.id] = { currentShelf: n.machine.currentShelf, shelves: n.storage.shelves }
-    }
-  }
+  // Shortest-route (or one-way sweep) ordering per motorized unit, matching the
+  // filament run().
+  const nodePos = queueNodePositions(state, nodesForSystem(state, "hardware"))
 
   const items: QueueItem[] = orderQueueItems(located, nodePos).map((it) => ({
     spoolId: it.partId,
@@ -321,12 +317,7 @@ export function pickFromList(state: AppState, dispatch: Dispatch, list: PickList
     .filter((x): x is { partId: string; lineId: string; nodeId: string; shelf: number; slot: number } => x != null)
   if (located.length === 0) return false
 
-  const nodePos: Record<string, { currentShelf: number; shelves: number }> = {}
-  for (const n of nodesForSystem(state, "hardware")) {
-    if ((n.type ?? "paternoster") === "paternoster") {
-      nodePos[n.id] = { currentShelf: n.machine.currentShelf, shelves: n.storage.shelves }
-    }
-  }
+  const nodePos = queueNodePositions(state, nodesForSystem(state, "hardware"))
 
   const items: QueueItem[] = orderQueueItems(located, nodePos).map((it) => ({
     spoolId: it.partId,

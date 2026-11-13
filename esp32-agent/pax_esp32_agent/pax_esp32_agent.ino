@@ -59,7 +59,11 @@ struct Settings {
   bool reverseDir, mirrorB, ignoreAlarm;
   uint32_t maxPps, pulsesPerRev;
   long carouselPulses;   // calibrated pulses per carousel turn (servo), 0 = none
+  String oneWay;         // "off" | "home" | "reverse": fixed goto direction (homing unaffected)
 } S;
+
+// Homing always sweeps toward increasing shelf index (startHome uses +1).
+const int HOME_DIR = +1;
 
 Preferences prefs;
 
@@ -74,6 +78,7 @@ void loadSettings() {
   S.shelves = prefs.getInt("shelves", DEFAULT_SHELVES);
   S.motorMode = prefs.getString("motor", DEFAULT_MOTOR_MODE);
   S.positionMode = prefs.getString("posMode", DEFAULT_POSITION_MODE);
+  S.oneWay = prefs.getString("oneWay", "off");
   S.moveSpeed = prefs.getFloat("moveSpd", 0.6f);
   S.homingSpeed = prefs.getFloat("homeSpd", 0.35f);
   S.approachSpeed = prefs.getFloat("apprSpd", 0.3f);
@@ -100,6 +105,7 @@ void saveSettings() {
   prefs.putInt("shelves", S.shelves);
   prefs.putString("motor", S.motorMode);
   prefs.putString("posMode", S.positionMode);
+  prefs.putString("oneWay", S.oneWay);
   prefs.putFloat("moveSpd", S.moveSpeed);
   prefs.putFloat("homeSpd", S.homingSpeed);
   prefs.putFloat("apprSpd", S.approachSpeed);
@@ -325,6 +331,8 @@ void fillServo(JsonDocument& d) {
   d["type"] = "servo";
   d["mode"] = isServo() ? "servo" : "dc";
   d["mirrorB"] = S.mirrorB;
+  d["homeStep"] = HOME_DIR;
+  d["oneWay"] = S.oneWay;
   if (isServo()) {
     d["alarmA"] = alarmAIn.stable && !S.ignoreAlarm;
     d["alarmB"] = alarmBIn.stable && !S.ignoreAlarm;
@@ -451,19 +459,21 @@ void beginGoto(int target) {
   if (target == currentShelf) { emitShelfEvent("arrived"); broadcastState(); return; }
 
   int n = S.shelves;
+  // 0 = shortest way round; otherwise every goto travels this fixed direction.
+  int fixedDir = S.oneWay == "home" ? HOME_DIR : S.oneWay == "reverse" ? -HOME_DIR : 0;
   if (isIndexMode()) {
     if (S.carouselPulses <= 0) { emitFault("Calibrate the carousel first (Settings -> Hardware -> Calibrate)."); return; }
     double c = (double)S.carouselPulses;
     double targetPos = c * target / n;
     double fwd = wrapPulses(targetPos - posPulses);
     double back = c - fwd;
-    int dir = fwd <= back ? +1 : -1;
+    int dir = fixedDir != 0 ? fixedDir : (fwd <= back ? +1 : -1);
     startMotion(Mode::Moving, dir, S.moveSpeed);
     travelGoal = dir > 0 ? fwd : back;
   } else {
     int fwd = wrapShelf(target - currentShelf);
     int back = n - fwd;
-    int dir = fwd <= back ? +1 : -1;
+    int dir = fixedDir != 0 ? fixedDir : (fwd <= back ? +1 : -1);
     remainingFlags = dir > 0 ? fwd : back;
     startMotion(Mode::Moving, dir, remainingFlags == 1 ? S.approachSpeed : S.moveSpeed);
   }
@@ -774,6 +784,12 @@ void handleConfig(JsonDocument& msg) {
   }
   if (msg["servoIgnoreAlarm"].is<bool>() && msg["servoIgnoreAlarm"].as<bool>() != S.ignoreAlarm) {
     S.ignoreAlarm = msg["servoIgnoreAlarm"].as<bool>();
+    changed = true;
+    broadcastServo();
+  }
+  String ow = msg["oneWay"] | "";
+  if ((ow == "off" || ow == "home" || ow == "reverse") && ow != S.oneWay) {
+    S.oneWay = ow;
     changed = true;
     broadcastServo();
   }

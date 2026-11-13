@@ -1,5 +1,6 @@
 import type { Printer } from "./types"
 import { printerAmsUnits } from "./filament"
+import { errorText } from "./error-text"
 
 /**
  * Client-side helpers that talk to our own /api/bambu proxy, which in turn talks
@@ -123,7 +124,11 @@ async function postCloud(payload: Record<string, unknown>): Promise<any> {
     } catch {
       json = null
     }
-    if (json && typeof json === "object") return json
+    if (json && typeof json === "object") {
+      // Guard against an older server build that passes Bambu's error object through.
+      if (json.ok === false) json.error = errorText(json.error ?? json.message, "Bambu cloud request failed")
+      return json
+    }
 
     // Non-JSON response — translate the status into an actionable message so
     // the user knows whether it's a missing route, a server crash, etc.
@@ -160,6 +165,14 @@ async function postCloud(payload: Record<string, unknown>): Promise<any> {
   } finally {
     clearTimeout(timer)
   }
+}
+
+/** Resolve the account uid for a saved token (repairs links that are missing it). */
+export async function bambuCloudProfile(
+  region: BambuRegion,
+  token: string,
+): Promise<{ ok: true; uid: string } | { ok: false; error: string }> {
+  return await postCloud({ action: "profile", region, token })
 }
 
 /** Step 1: sign in with email + password. May require a follow-up code. */
@@ -240,7 +253,7 @@ export async function fetchBambuStatus(printer: Printer): Promise<BambuStatus> {
       }
     }
     if (!res.ok || !json?.ok) {
-      return { connected: false, trays: [], error: json?.error ?? `Error ${res.status}` }
+      return { connected: false, trays: [], error: errorText(json?.error ?? json?.message, `Error ${res.status}`) }
     }
     return {
       connected: true,

@@ -588,6 +588,12 @@ export interface Settings {
    */
   confirmBeforeMoveHardware?: boolean
   /**
+   * Force every carousel move to turn the same way. "home" = the direction the
+   * homing sweep runs, "reverse" = the opposite. Homing itself never changes.
+   * Absent/"off" = take the shortest way round.
+   */
+  oneWayRotation?: "off" | "home" | "reverse"
+  /**
    * Which area opens when the app loads or refreshes. Shared by the filament and
    * hardware Settings tabs. Only read on startup, so changing it never moves the
    * user mid-session. Optional for older saves; defaults to "filament".
