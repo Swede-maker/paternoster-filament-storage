@@ -1,4 +1,5 @@
 import { type NextRequest, NextResponse } from "next/server"
+import { errorText } from "@/lib/error-text"
 
 // Node runtime: this route makes outbound HTTPS calls to Bambu's cloud API.
 export const runtime = "nodejs"
@@ -56,6 +57,9 @@ export async function POST(req: NextRequest) {
     }
     if (action === "refresh") {
       return await handleRefresh(region, body, ac.signal)
+    }
+    if (action === "profile") {
+      return await handleProfile(region, body, ac.signal)
     }
     return NextResponse.json({ ok: false, error: `Unknown action: ${action}` }, { status: 400 })
   } catch (err) {
@@ -124,7 +128,7 @@ async function handleLogin(
 
   if (!res.ok) {
     return NextResponse.json(
-      { ok: false, error: json?.error ?? json?.message ?? `Sign-in failed (${res.status})` },
+      { ok: false, error: errorText(json?.error ?? json?.message, `Sign-in failed (${res.status})`) },
       { status: 200 },
     )
   }
@@ -146,7 +150,7 @@ async function handleLogin(
     return NextResponse.json({ ok: false, error: "Sign-in did not return a token" }, { status: 200 })
   }
 
-  return NextResponse.json(tokenResponse(accessToken, json), { status: 200 })
+  return NextResponse.json(await tokenResponse(accessToken, json, region, signal), { status: 200 })
 }
 
 /**
@@ -154,18 +158,59 @@ async function handleLogin(
  * response. Captures the refresh token and an expiry hint (from `expiresIn`
  * seconds, or the JWT `exp` claim) so the client can refresh before it lapses.
  */
-function tokenResponse(accessToken: string, raw: any) {
+async function tokenResponse(accessToken: string, raw: any, region: Region, signal: AbortSignal) {
   const refreshToken: string = raw?.refreshToken ?? raw?.refresh_token ?? ""
   const expiresInSec: number = Number(raw?.expiresIn ?? raw?.expires_in ?? 0)
   const expiresAt =
     expiresInSec > 0 ? Date.now() + expiresInSec * 1000 : decodeExpFromJwt(accessToken)
+  // The MQTT username is `u_<uid>`, so without a uid the printer can't be read.
+  // Older tokens were JWTs carrying it; current global-region tokens are opaque,
+  // so fall back to asking the profile API.
+  const uid = decodeUidFromJwt(accessToken) || (await fetchUid(region, accessToken, signal))
+  if (!uid) {
+    return {
+      ok: false as const,
+      error: "Signed in, but Bambu did not return your user id. Try again, or check the account region.",
+    }
+  }
   return {
     ok: true as const,
     token: accessToken,
-    uid: decodeUidFromJwt(accessToken),
+    uid,
     refreshToken: refreshToken || undefined,
     expiresAt: expiresAt || undefined,
   }
+}
+
+/** Look up the account's numeric user id with an access token. Returns "" on failure. */
+async function fetchUid(region: Region, token: string, signal: AbortSignal): Promise<string> {
+  const headers = { Authorization: `Bearer ${token}`, "User-Agent": UA, Accept: "application/json" }
+  for (const path of ["/v1/user-service/my/profile", "/v1/design-user-service/my/preference"]) {
+    try {
+      const res = await fetch(`${apiBase(region)}${path}`, { headers, signal })
+      if (!res.ok) continue
+      const json: any = await res.json().catch(() => null)
+      const uid = json?.uid ?? json?.uidStr ?? json?.data?.uid
+      if (uid !== undefined && uid !== null && String(uid).trim()) return String(uid).trim()
+    } catch (err) {
+      if (err instanceof DOMException && err.name === "AbortError") throw err
+    }
+  }
+  return ""
+}
+
+/** Resolve the uid for an already-saved token (repairs links made before uid lookup existed). */
+async function handleProfile(region: Region, body: any, signal: AbortSignal): Promise<NextResponse> {
+  const token = String(body.token ?? "").trim()
+  if (!token) return NextResponse.json({ ok: false, error: "Not signed in" }, { status: 200 })
+  const uid = decodeUidFromJwt(token) || (await fetchUid(region, token, signal))
+  if (!uid) {
+    return NextResponse.json(
+      { ok: false, error: "Could not read your Bambu user id — the saved sign-in may have expired. Sign in again." },
+      { status: 200 },
+    )
+  }
+  return NextResponse.json({ ok: true, uid }, { status: 200 })
 }
 
 /**
@@ -193,13 +238,13 @@ async function handleRefresh(region: Region, body: any, signal: AbortSignal): Pr
   const accessToken: string = json?.accessToken ?? json?.token ?? ""
   if (!res.ok || !accessToken) {
     return NextResponse.json(
-      { ok: false, error: json?.error ?? json?.message ?? `Token refresh failed (${res.status})` },
+      { ok: false, error: errorText(json?.error ?? json?.message, `Token refresh failed (${res.status})`) },
       { status: 200 },
     )
   }
   // Bambu may or may not rotate the refresh token; keep the old one if absent.
   const merged = { ...json, refreshToken: json?.refreshToken ?? json?.refresh_token ?? refreshToken }
-  return NextResponse.json(tokenResponse(accessToken, merged), { status: 200 })
+  return NextResponse.json(await tokenResponse(accessToken, merged, region, signal), { status: 200 })
 }
 
 /** Ask Bambu to email a verification code to the account. */
@@ -245,7 +290,7 @@ async function handleTfa(region: Region, body: any, signal: AbortSignal): Promis
   if (!token) {
     return NextResponse.json({ ok: false, error: "2FA verification failed" }, { status: 200 })
   }
-  return NextResponse.json(tokenResponse(token, json ?? {}), { status: 200 })
+  return NextResponse.json(await tokenResponse(token, json ?? {}, region, signal), { status: 200 })
 }
 
 /** List the printers bound to the account. */
@@ -271,7 +316,7 @@ async function handleDevices(region: Region, body: any, signal: AbortSignal): Pr
   }
   if (!res.ok) {
     return NextResponse.json(
-      { ok: false, error: json?.error ?? json?.message ?? `Could not list devices (${res.status})` },
+      { ok: false, error: errorText(json?.error ?? json?.message, `Could not list devices (${res.status})`) },
       { status: 200 },
     )
   }
