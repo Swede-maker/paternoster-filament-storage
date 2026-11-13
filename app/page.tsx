@@ -63,6 +63,19 @@ function DailyStorageSnapshot() {
   return null
 }
 
+const VIEW_SESSION_KEY = "pax:view"
+
+function readViewSession(): { area: TopArea; tab: NavTab } | null {
+  try {
+    const raw = sessionStorage.getItem(VIEW_SESSION_KEY)
+    if (!raw) return null
+    const v = JSON.parse(raw) as { area?: TopArea; tab?: NavTab }
+    return v.area && v.tab ? { area: v.area, tab: v.tab } : null
+  } catch {
+    return null
+  }
+}
+
 function AppShell() {
   const { state, dispatch, ready, loadError } = useStore()
   const [tab, setTab] = useState<NavTab>("home")
@@ -74,11 +87,19 @@ function AppShell() {
   // preference. Later changes to that preference never move the user mid-session.
   const [areaState, setArea] = useState<TopArea | null>(null)
   if (ready && areaState === null) {
-    const saved = state.settings.startArea ?? "filament"
-    const hasUnits = (a: "filament" | "hardware") =>
-      state.nodes.some((n) => (n.system === "hardware" ? "hardware" : "filament") === a)
-    const other = saved === "filament" ? "hardware" : "filament"
-    setArea(!hasUnits(saved) && hasUnits(other) ? other : saved)
+    // A browser reload restores the area and tab this browser tab was on
+    // (sessionStorage is per tab, so other devices/tabs keep their own view).
+    const restored = readViewSession()
+    if (restored) {
+      setArea(restored.area)
+      setTab(restored.tab)
+    } else {
+      const saved = state.settings.startArea ?? "filament"
+      const hasUnits = (a: "filament" | "hardware") =>
+        state.nodes.some((n) => (n.system === "hardware" ? "hardware" : "filament") === a)
+      const other = saved === "filament" ? "hardware" : "filament"
+      setArea(!hasUnits(saved) && hasUnits(other) ? other : saved)
+    }
   }
   const area: TopArea = areaState ?? "filament"
 
@@ -94,6 +115,15 @@ function AppShell() {
     const firstHw = state.nodes.find((n) => n.system === "hardware")
     if (firstHw) dispatch({ type: "SET_ACTIVE_NODE", id: firstHw.id })
   }, [areaState, state.nodes, state.activeNodeId, dispatch])
+
+  useEffect(() => {
+    if (areaState === null) return
+    try {
+      sessionStorage.setItem(VIEW_SESSION_KEY, JSON.stringify({ area: areaState, tab }))
+    } catch {
+      // Private mode / storage disabled: a reload just opens Home.
+    }
+  }, [areaState, tab])
 
   // Switching area is a full context change: focus that area's first storage
   // unit (so activeNode resolves to a node in the shown area) and reset to the
