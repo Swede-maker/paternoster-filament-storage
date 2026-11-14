@@ -2475,11 +2475,18 @@ function coreReducer(state: AppState, action: Action): AppState {
           const row = slots[0] ?? []
           if (action.spoolId === null) {
             if (action.slot >= 0 && action.slot < row.length) row.splice(action.slot, 1)
-          } else if (action.slot >= row.length) {
-            row.push(action.spoolId)
-          } else {
-            row[action.slot] = action.spoolId
+            slots[0] = row
+            return { ...n, slots }
           }
+          // Placing never overwrites: queued library indices go stale as the
+          // row grows within one batch, and writing over an occupied index
+          // silently dropped that spool back into "In my hand".
+          if (row[action.slot] === action.spoolId) return n
+          const existing = row.indexOf(action.spoolId)
+          if (existing !== -1) row.splice(existing, 1)
+          if (action.slot >= row.length) row.push(action.spoolId)
+          else if (!row[action.slot]) row[action.slot] = action.spoolId
+          else row.splice(action.slot, 0, action.spoolId)
           slots[0] = row
           return { ...n, slots }
         }

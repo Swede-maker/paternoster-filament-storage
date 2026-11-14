@@ -226,11 +226,12 @@ export async function bambuCloudRefresh(
 }
 
 /** Query the printer's AMS/RFID + print state. Never throws. */
-export async function fetchBambuStatus(printer: Printer): Promise<BambuStatus> {
+export async function fetchBambuStatus(printer: Printer, timeoutMs = 12000): Promise<BambuStatus> {
   // Guard against a hung request (e.g. a route that never responds) so the UI
-  // gets a clear timeout instead of spinning forever.
+  // gets a clear timeout instead of spinning forever. The clock includes time
+  // the browser keeps the request queued behind other open connections.
   const controller = new AbortController()
-  const timer = setTimeout(() => controller.abort(), 12000)
+  const timer = setTimeout(() => controller.abort(), timeoutMs)
   try {
     const res = await fetch("/api/bambu", {
       method: "POST",
