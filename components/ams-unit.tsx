@@ -1,5 +1,6 @@
 "use client"
 
+import type { ReactNode } from "react"
 import { Flame } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { spoolFill } from "@/lib/filament"
@@ -16,18 +17,27 @@ export function AmsUnit({
   onSlotClick,
   activeSlot,
   queuedSlots,
+  action,
+  status,
 }: {
   index: number
   slots: { spool: Spool | null; globalIndex: number }[]
   onSlotClick?: (globalIndex: number) => void
   activeSlot?: number | null
   queuedSlots?: number[]
+  /** Control placed at the end of the roll bay (e.g. this unit's Sync button). */
+  action?: ReactNode
+  /** Small note on the right of the unit's title row (e.g. last sync time). */
+  status?: ReactNode
 }) {
   return (
     <div className="shrink-0">
-      <div className="mb-1 flex items-center gap-2 px-1">
-        <span className="h-2 w-2 rounded-full bg-success" />
-        <span className="text-sm font-medium text-foreground">AMS {index + 1}</span>
+      <div className="mb-1 flex items-center justify-between gap-2 px-1">
+        <div className="flex items-center gap-2">
+          <span className="h-2 w-2 rounded-full bg-success" />
+          <span className="text-sm font-medium text-foreground">AMS {index + 1}</span>
+        </div>
+        {status}
       </div>
 
       <div className="overflow-hidden rounded-xl border border-black/60 bg-gradient-to-b from-neutral-800 to-neutral-950 shadow-lg">
@@ -44,6 +54,7 @@ export function AmsUnit({
               />
             ),
           )}
+          {action && <div className="ml-2 shrink-0">{action}</div>}
         </div>
 
         {/* Slot labels */}

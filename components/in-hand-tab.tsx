@@ -1,7 +1,7 @@
 "use client"
 
 import { useMemo, useState } from "react"
-import { Archive, Flame, Hand, Loader2 } from "lucide-react"
+import { Archive, Flame, Hand, Loader2, Trash2 } from "lucide-react"
 import { useStore } from "@/lib/store"
 import { locateSpool } from "@/lib/tags"
 import { findSpoolInDryer, getDryers } from "@/lib/dryers"
@@ -30,10 +30,12 @@ export function getSpoolsInHand(state: AppState): Spool[] {
 type Mission = "dryer" | "none"
 
 export function InHandTab({ onQueued, onContinueDryer }: { onQueued: () => void; onContinueDryer: () => void }) {
-  const { state } = useStore()
+  const { state, dispatch } = useStore()
   const flow = useFlow()
   const [open, setOpen] = useState(false)
   const [selected, setSelected] = useState<Set<string>>(new Set())
+  // Spools awaiting a "delete permanently" confirmation.
+  const [pendingDelete, setPendingDelete] = useState<Spool[] | null>(null)
 
   const spools = useMemo(() => getSpoolsInHand(state), [state])
   const count = spools.length
@@ -73,6 +75,18 @@ export function InHandTab({ onQueued, onContinueDryer }: { onQueued: () => void;
   function close() {
     setOpen(false)
     setSelected(new Set())
+    setPendingDelete(null)
+  }
+
+  function confirmDelete() {
+    if (!pendingDelete) return
+    for (const s of pendingDelete) dispatch({ type: "DELETE_SPOOL", id: s.id })
+    setSelected((prev) => {
+      const next = new Set(prev)
+      for (const s of pendingDelete) next.delete(s.id)
+      return next
+    })
+    setPendingDelete(null)
   }
 
   function queueStore(list: Spool[]) {
@@ -214,6 +228,15 @@ export function InHandTab({ onQueued, onContinueDryer }: { onQueued: () => void;
                         <Archive className="h-3.5 w-3.5" aria-hidden />
                         Store
                       </button>
+                      <button
+                        type="button"
+                        onClick={() => setPendingDelete([s])}
+                        aria-label={`Delete ${s.material} ${s.colorName}`}
+                        title="Delete spool"
+                        className="flex h-8 w-8 items-center justify-center rounded-lg border border-border text-muted-foreground hover:border-destructive/50 hover:bg-destructive/10 hover:text-destructive"
+                      >
+                        <Trash2 className="h-3.5 w-3.5" aria-hidden />
+                      </button>
                     </div>
                   )}
                 </li>
@@ -222,8 +245,40 @@ export function InHandTab({ onQueued, onContinueDryer }: { onQueued: () => void;
           </ul>
           </div>
         )}
-        {selectedSpools.length > 0 ? (
+        {pendingDelete ? (
+          <DialogFooter className="flex-wrap items-center">
+            <p role="alert" className="mr-auto text-sm leading-relaxed text-foreground">
+              {pendingDelete.length === 1
+                ? `Delete ${pendingDelete[0].material} · ${pendingDelete[0].colorName} permanently?`
+                : `Delete ${pendingDelete.length} spools permanently?`}
+              <span className="block text-xs text-muted-foreground">They are removed from your inventory.</span>
+            </p>
+            <button
+              type="button"
+              onClick={() => setPendingDelete(null)}
+              className="rounded-lg border border-border px-4 py-2 text-sm font-medium hover:bg-secondary"
+            >
+              Cancel
+            </button>
+            <button
+              type="button"
+              onClick={confirmDelete}
+              className="flex items-center justify-center gap-2 rounded-lg bg-destructive px-4 py-2 text-sm font-medium text-destructive-foreground"
+            >
+              <Trash2 className="h-4 w-4" aria-hidden />
+              Delete
+            </button>
+          </DialogFooter>
+        ) : selectedSpools.length > 0 ? (
           <DialogFooter className="flex-wrap">
+            <button
+              type="button"
+              onClick={() => setPendingDelete(selectedSpools)}
+              className="flex items-center justify-center gap-2 rounded-lg border border-destructive/50 px-4 py-2 text-sm font-medium text-destructive hover:bg-destructive/10"
+            >
+              <Trash2 className="h-4 w-4" aria-hidden />
+              Delete {selectedSpools.length}
+            </button>
             {selectedForDryer.length > 0 && (
               <button
                 type="button"

@@ -333,7 +333,8 @@ function useBambuTokenRefresh(printer: Printer) {
   }, [isCloud, refreshToken, expiresAt, region, printerId, token, dispatch])
 }
 
-type AmsSyncReport = { at: number; entries: AmsSyncEntry[]; auto: boolean; error?: string }
+/** `unit` is the 0-based AMS unit a manual Sync covered. */
+type AmsSyncReport = { at: number; entries: AmsSyncEntry[]; auto: boolean; error?: string; unit?: number }
 
 /**
  * Keeps the app's AMS slots in step with the printer. In the background (every
@@ -344,7 +345,9 @@ type AmsSyncReport = { at: number; entries: AmsSyncEntry[]; auto: boolean; error
 function useAmsSync(printer: Printer, bambu: BambuStatus | undefined) {
   const { state, dispatch } = useStore()
   const [report, setReport] = useState<AmsSyncReport | null>(null)
-  const [syncing, setSyncing] = useState(false)
+  const [syncingUnit, setSyncingUnit] = useState<number | null>(null)
+  const syncing = syncingUnit !== null
+  const [lastSyncs, setLastSyncs] = useState<Record<number, number>>({})
   const [conflicts, setConflicts] = useState<AmsSyncConflict[]>([])
   const enabled = printer.firmware === "bambu" && printer.kind === "ams"
   const opts = { materialDefaults: state.settings.materialDefaults }
@@ -377,35 +380,50 @@ function useAmsSync(printer: Printer, bambu: BambuStatus | undefined) {
     setReport((r) => ({ at: Date.now(), auto: false, entries: [...(r?.entries ?? []), ...res.entries] }))
   }
 
+  // The server answers with demo trays whenever it can't reach the printer. For
+  // a printer with real connection details that's a failed read, never data —
+  // applying it filled empty AMS slots with made-up spools.
+  const linked = isBambuLinked(printer)
+  const usable = (s: BambuStatus | undefined): s is BambuStatus => !!s?.connected && !(linked && s.simulated)
+
   useEffect(() => {
-    if (!enabled || !bambu?.connected || syncing || conflicts.length > 0) return
+    if (!enabled || !usable(bambu) || syncing || conflicts.length > 0) return
     const plan = apply(bambu.trays, true)
     if (plan.entries.length > 0) setReport({ at: Date.now(), entries: plan.entries, auto: true })
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [bambu])
 
-  async function sync() {
-    setSyncing(true)
+  /** Manual Sync of one AMS unit: only the trays in `slots` are reconciled. */
+  async function sync(unit: number, slots: number[]) {
+    setSyncingUnit(unit)
+    const inUnit = new Set(slots)
+    const fail = (error: string) => setReport({ at: Date.now(), entries: [], auto: false, error, unit })
     try {
-      const status = await fetchBambuStatus(printer)
-      if (!status.connected) {
-        setReport({ at: Date.now(), entries: [], auto: false, error: status.error ?? "Printer not reachable" })
-        return
+      // Longer than the background poll: on tablets the request often waits
+      // behind the camera stream, live-update streams and the 4 s polls, since
+      // browsers allow only ~6 connections per site.
+      let status = await fetchBambuStatus(printer, 25000)
+      // The background poll already reads the printer every few seconds, so a
+      // real reading from it is just as good as a fresh one.
+      if (!usable(status) && bambu?.connected && !bambu.simulated) status = bambu
+      if (!status.connected) return fail(status.error ?? "Printer not reachable")
+      if (!usable(status)) {
+        return fail("Couldn't read the AMS from the printer this time, so nothing was changed. Try Sync again.")
       }
       if (status.trays.length === 0) {
-        setReport({
-          at: Date.now(),
-          entries: [],
-          auto: false,
-          error: "The printer didn't report any AMS trays. Check that the AMS is connected and try again.",
-        })
-        return
+        return fail("The printer didn't report any AMS trays. Check that the AMS is connected and try again.")
       }
-      const plan = apply(status.trays, false)
+      const trays = status.trays.filter((t) => inUnit.has(t.globalIndex))
+      if (trays.length === 0) {
+        return fail(`The printer didn't report AMS ${unit + 1}. Check that it is connected and try again.`)
+      }
+      const plan = apply(trays, false)
       setConflicts(plan.conflicts)
-      setReport({ at: Date.now(), entries: plan.entries, auto: false })
+      const at = Date.now()
+      setReport({ at, entries: plan.entries, auto: false, unit })
+      setLastSyncs((prev) => ({ ...prev, [unit]: at }))
     } finally {
-      setSyncing(false)
+      setSyncingUnit(null)
     }
   }
 
@@ -413,6 +431,8 @@ function useAmsSync(printer: Printer, bambu: BambuStatus | undefined) {
     enabled,
     sync,
     syncing,
+    syncingUnit,
+    lastSyncs,
     report,
     dismiss: () => setReport(null),
     conflict: conflicts[0] ?? null,
@@ -462,15 +482,32 @@ function PrinterCard({
         onSlot={onSlot}
         queuedPrinterSlots={queuedPrinterSlots}
         live={live}
-        amsAside={
-          amsSync.enabled ? (
-            <AmsSyncButton
-              onSync={amsSync.sync}
-              syncing={amsSync.syncing}
-              disabled={!isBambuLinked(printer)}
-              lastSync={amsSync.report?.auto === false ? amsSync.report.at : undefined}
-            />
-          ) : undefined
+        amsUnitControls={
+          amsSync.enabled
+            ? (unit, slots) => {
+                const lastSync = amsSync.lastSyncs[unit]
+                const linked = isBambuLinked(printer)
+                return {
+                  action: (
+                    <AmsUnitSyncButton
+                      unit={unit}
+                      onSync={() => amsSync.sync(unit, slots)}
+                      syncing={amsSync.syncingUnit === unit}
+                      disabled={amsSync.syncing || !linked}
+                    />
+                  ),
+                  status: (
+                    <span className="text-[11px] text-muted-foreground" aria-live="polite">
+                      {lastSync
+                        ? `Synced ${new Date(lastSync).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`
+                        : linked
+                          ? "Not synced yet"
+                          : "Link the printer first"}
+                    </span>
+                  ),
+                }
+              }
+            : undefined
         }
       />
       {amsSync.report && <AmsSyncReportCard report={amsSync.report} onDismiss={amsSync.dismiss} />}
@@ -783,15 +820,15 @@ function PrinterBody({
   onSlot,
   queuedPrinterSlots,
   live,
-  amsAside,
+  amsUnitControls,
 }: {
   printer: Printer
   spools: Record<string, Spool>
   onSlot: (p: Printer, index: number) => void
   queuedPrinterSlots?: number[]
   live?: MoonrakerStatus
-  /** Rendered beside the AMS units (e.g. the Bambu Sync control). */
-  amsAside?: ReactNode
+  /** Per-unit extras inside each AMS (e.g. that unit's Bambu Sync button). */
+  amsUnitControls?: (unit: number, slots: number[]) => { action?: ReactNode; status?: ReactNode }
 }) {
   if (printer.kind === "single") {
     const spool = printer.loaded[0] ? spools[printer.loaded[0]!] : null
@@ -858,53 +895,51 @@ function PrinterBody({
 
   return (
     <div className="flex flex-wrap gap-4">
-      {units.map((unit, u) => (
-        <AmsUnit
-          key={u}
-          index={u}
-          slots={unit}
-          queuedSlots={queuedPrinterSlots}
-          onSlotClick={(globalIndex) => onSlot(printer, globalIndex)}
-        />
-      ))}
-      {amsAside}
+      {units.map((unit, u) => {
+        const controls = amsUnitControls?.(
+          u,
+          unit.map((s) => s.globalIndex),
+        )
+        return (
+          <AmsUnit
+            key={u}
+            index={u}
+            slots={unit}
+            queuedSlots={queuedPrinterSlots}
+            onSlotClick={(globalIndex) => onSlot(printer, globalIndex)}
+            action={controls?.action}
+            status={controls?.status}
+          />
+        )
+      })}
     </div>
   )
 }
 
-function AmsSyncButton({
+/** Compact Sync control that sits at the end of an AMS unit's roll bay. */
+function AmsUnitSyncButton({
+  unit,
   onSync,
   syncing,
   disabled,
-  lastSync,
 }: {
+  unit: number
   onSync: () => void
   syncing: boolean
   disabled?: boolean
-  lastSync?: number
 }) {
   return (
-    <div className="flex shrink-0 flex-col justify-end gap-2 pt-6">
-      <button
-        type="button"
-        onClick={onSync}
-        disabled={syncing || disabled}
-        className="flex w-36 flex-col items-center justify-center gap-2 rounded-xl border border-primary/40 bg-primary/10 px-4 py-5 text-primary transition-colors hover:border-primary hover:bg-primary/15 disabled:cursor-not-allowed disabled:opacity-50"
-      >
-        <RefreshCw className={cn("h-6 w-6", syncing && "animate-spin")} aria-hidden />
-        <span className="text-sm font-semibold">{syncing ? "Syncing…" : "Sync AMS"}</span>
-        <span className="text-center text-[11px] leading-snug text-muted-foreground text-pretty">
-          Read spools from the printer
-        </span>
-      </button>
-      <p className="text-center text-[11px] text-muted-foreground" aria-live="polite">
-        {lastSync
-          ? `Last sync ${new Date(lastSync).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`
-          : disabled
-            ? "Link the printer first"
-            : "Not synced yet"}
-      </p>
-    </div>
+    <button
+      type="button"
+      onClick={onSync}
+      disabled={syncing || disabled}
+      aria-label={`Sync AMS ${unit + 1} from the printer`}
+      title={`Read AMS ${unit + 1}'s spools from the printer`}
+      className="flex h-[72px] w-16 flex-col items-center justify-center gap-1.5 rounded-md border border-primary/40 bg-primary/10 text-primary transition-colors hover:border-primary hover:bg-primary/20 disabled:cursor-not-allowed disabled:opacity-50"
+    >
+      <RefreshCw className={cn("h-5 w-5", syncing && "animate-spin")} aria-hidden />
+      <span className="text-[11px] font-semibold leading-none">{syncing ? "Syncing" : "Sync"}</span>
+    </button>
   )
 }
 
@@ -1023,13 +1058,14 @@ const SYNC_KIND_META: Record<AmsSyncEntry["kind"], { title: string; icon: typeof
 
 function AmsSyncReportCard({ report, onDismiss }: { report: AmsSyncReport; onDismiss: () => void }) {
   const handCount = report.entries.filter((e) => e.kind === "toHand").length
+  const unitLabel = report.unit !== undefined ? `AMS ${report.unit + 1}` : "AMS"
   const heading = report.error
-    ? "Sync failed"
+    ? `${unitLabel} sync failed`
     : report.entries.length === 0
-      ? "AMS is in sync"
+      ? `${unitLabel} is in sync`
       : report.auto
         ? "AMS changes detected"
-        : "Sync complete"
+        : `${unitLabel} sync complete`
   return (
     <section
       aria-live="polite"

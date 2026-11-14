@@ -609,8 +609,15 @@ export function FlowProvider({ children }: { children: ReactNode }) {
           if (typeof it.grams === "number") {
             dispatch({ type: "UPDATE_SPOOL", id: it.spool.id, changes: { grams: it.grams } })
           }
-          // slot beyond the row length appends (see SET_STORAGE_SLOT library branch).
-          dispatch({ type: "SET_STORAGE_SLOT", nodeId: it.nodeId, shelf: 0, slot: it.slot, spoolId: it.spool.id })
+          // Always append: the queued index can be stale once earlier items in
+          // this batch have grown the row (see SET_STORAGE_SLOT library branch).
+          dispatch({
+            type: "SET_STORAGE_SLOT",
+            nodeId: it.nodeId,
+            shelf: 0,
+            slot: Number.MAX_SAFE_INTEGER,
+            spoolId: it.spool.id,
+          })
           return false
         })
 
