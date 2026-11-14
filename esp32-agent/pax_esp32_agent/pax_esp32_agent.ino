@@ -286,7 +286,7 @@ void applyDrive(int dir, float speed, uint8_t mask) {
 enum class Mode { Idle, Homing, Moving, Calibrating, Jogging };
 Mode mode = Mode::Idle;
 
-int currentShelf = 0, targetShelf = -1, pendingGoto = -1, remainingFlags = 0;
+int currentShelf = 0, targetShelf = -1, pendingGoto = -1, pendingStep = 0, remainingFlags = 0;
 bool homed = false, calibrateAfterHome = false;
 int dirNow = 0;
 uint8_t maskNow = MOTOR_BOTH;
@@ -443,7 +443,8 @@ void startCalibrate() {
   startCalibrateRun();
 }
 
-void beginGoto(int target) {
+// step: +1 / -1 = the app's chosen shelf-index direction (wins over oneWay); 0 = decide here.
+void beginGoto(int target, int step) {
   if (target < 0 || target >= S.shelves) { emitFault("Shelf " + String(target + 1) + " does not exist."); return; }
   if (busy()) { emitFault("Carousel is busy. Stop it first."); return; }
   if (isIndexMode() && !isServo()) {
@@ -452,6 +453,7 @@ void beginGoto(int target) {
   }
   if (!homed) {
     pendingGoto = target;
+    pendingStep = step;
     startHome();
     return;
   }
@@ -460,7 +462,8 @@ void beginGoto(int target) {
 
   int n = S.shelves;
   // 0 = shortest way round; otherwise every goto travels this fixed direction.
-  int fixedDir = S.oneWay == "home" ? HOME_DIR : S.oneWay == "reverse" ? -HOME_DIR : 0;
+  int fixedDir = step == 1 || step == -1 ? step
+               : S.oneWay == "home" ? HOME_DIR : S.oneWay == "reverse" ? -HOME_DIR : 0;
   if (isIndexMode()) {
     if (S.carouselPulses <= 0) { emitFault("Calibrate the carousel first (Settings -> Hardware -> Calibrate)."); return; }
     double c = (double)S.carouselPulses;
@@ -485,8 +488,10 @@ void afterHomed() {
     startCalibrateRun();
   } else if (pendingGoto >= 0) {
     int t = pendingGoto;
+    int st = pendingStep;
     pendingGoto = -1;
-    beginGoto(t);
+    pendingStep = 0;
+    beginGoto(t, st);
   }
 }
 
@@ -836,7 +841,7 @@ void handleAppMessage(uint8_t client, uint8_t* payload, size_t length) {
   }
   if (t == "stop") halt("");
   else if (t == "home") startHome();
-  else if (t == "goto") beginGoto(msg["shelf"] | 0);
+  else if (t == "goto") beginGoto(msg["shelf"] | 0, msg["step"] | 0);
   else if (t == "calibrate") startCalibrate();
   else if (t == "config") handleConfig(msg);
   else if (t == "hello") { JsonDocument h; fillHello(h); sendTo(client, h); }
