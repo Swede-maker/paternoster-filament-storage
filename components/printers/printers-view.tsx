@@ -18,6 +18,7 @@ import { usePersistentBoolean } from "@/lib/use-persistent"
 import { AddPrinterDialog } from "@/components/add-printer-dialog"
 import { PrinterLoadedSpools } from "@/components/printer-panel"
 import { PrinterEmbed, printerWebUrl } from "./printer-embed"
+import { BambuCamera } from "./bambu-camera"
 import { PrinterApiPanel } from "./printer-api-panel"
 import { DispenseQueue } from "./dispense-queue"
 import type { Printer } from "@/lib/types"
@@ -272,7 +273,12 @@ export function PrintersView({ onGoFilament }: { onGoFilament: () => void }) {
                   <p className="text-xs text-muted-foreground">{firmwareLabel(selected)}</p>
                 </div>
                 <div className="flex min-h-[50vh] flex-1 flex-col">
-                  <PrinterEmbed printer={selected} />
+                  {/* Bambu printers have no web UI to embed; show their live camera instead. */}
+                  {selected.firmware === "bambu" ? (
+                    <BambuCamera key={selected.id} printer={selected} />
+                  ) : (
+                    <PrinterEmbed printer={selected} />
+                  )}
                 </div>
 
                 <section className="rounded-xl border border-border bg-background/40">

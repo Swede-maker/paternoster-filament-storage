@@ -54,6 +54,10 @@ export function AddPrinterDialog({
   const [bambuMode, setBambuMode] = useState<"lan" | "cloud">("lan")
   // Result of a completed Bambu cloud sign-in (cloud mode only).
   const [cloudLink, setCloudLink] = useState<BambuCloudLink | null>(null)
+  // Bambu LAN camera (cloud printers need their own IP + code for it).
+  const [cameraIp, setCameraIp] = useState("")
+  const [cameraCode, setCameraCode] = useState("")
+  const [cameraKind, setCameraKind] = useState<"auto" | "rtsps" | "jpeg">("auto")
 
   // Prefill the form whenever the dialog opens (or the target printer changes).
   // Add mode resets to defaults; edit mode mirrors the existing printer.
@@ -73,6 +77,9 @@ export function AddPrinterDialog({
       setAccessCode(editing.accessCode ?? "")
       setBambuMode(editing.bambuMode ?? "lan")
       setCloudLink(null)
+      setCameraIp(editing.cameraIp ?? "")
+      setCameraCode(editing.cameraAccessCode ?? "")
+      setCameraKind(editing.bambuCamera ?? "auto")
     } else {
       reset()
     }
@@ -98,6 +105,9 @@ export function AddPrinterDialog({
     setAccessCode("")
     setBambuMode("lan")
     setCloudLink(null)
+    setCameraIp("")
+    setCameraCode("")
+    setCameraKind("auto")
   }
 
   // --- AMS unit editing helpers ---
@@ -160,6 +170,10 @@ export function AddPrinterDialog({
       serial: isBambu ? bambuSerial : undefined,
       accessCode: isBambu && !isBambuCloud && accessCode.trim() ? accessCode.trim() : undefined,
       bambuMode: (isBambu ? bambuMode : undefined) as "lan" | "cloud" | undefined,
+      // LAN printers reuse ip/accessCode for the camera; cloud printers store their own.
+      cameraIp: isBambuCloud ? cameraIp.trim() || undefined : undefined,
+      cameraAccessCode: isBambuCloud ? cameraCode.trim() || undefined : undefined,
+      bambuCamera: isBambu && cameraKind !== "auto" ? cameraKind : undefined,
       // Cloud account link (tokens only — never the password).
       bambuRegion: isBambuCloud ? cloudLink?.region : undefined,
       bambuToken: isBambuCloud ? cloudLink?.token : undefined,
@@ -356,20 +370,22 @@ export function AddPrinterDialog({
               </p>
             </Field>
 
-            <Field label="Web UI address (optional)">
-              <Input
-                value={webUrl}
-                onChange={(e) => setWebUrl(e.target.value)}
-                placeholder="e.g. http://192.168.1.50 or http://mainsail.local"
-                inputMode="url"
-                spellCheck={false}
-              />
-              <p className="mt-1 text-xs text-muted-foreground">
-                The printer&apos;s own interface (Mainsail, Fluidd, or a vendor UI). PAX embeds it in the Printers tab so
-                you don&apos;t switch browser tabs. Leave blank to use <span className="font-mono">http://</span> plus the
-                IP above.
-              </p>
-            </Field>
+            {!isBambu && (
+              <Field label="Web UI address (optional)">
+                <Input
+                  value={webUrl}
+                  onChange={(e) => setWebUrl(e.target.value)}
+                  placeholder="e.g. http://192.168.1.50 or http://mainsail.local"
+                  inputMode="url"
+                  spellCheck={false}
+                />
+                <p className="mt-1 text-xs text-muted-foreground">
+                  The printer&apos;s own interface (Mainsail, Fluidd, or a vendor UI). PAX embeds it in the Printers tab
+                  so you don&apos;t switch browser tabs. Leave blank to use <span className="font-mono">http://</span>{" "}
+                  plus the IP above.
+                </p>
+              </Field>
+            )}
 
             {isBambu ? (
               <div className="space-y-4 rounded-lg border border-border bg-background/40 p-3">
@@ -436,6 +452,51 @@ export function AddPrinterDialog({
                     </p>
                   </>
                 )}
+
+                <div className="space-y-3 border-t border-border pt-4">
+                  <div>
+                    <span className="block text-sm font-medium text-foreground">Camera (optional)</span>
+                    <p className="mt-1 text-xs text-muted-foreground">
+                      The live view is read over your home network. On the printer, turn on{" "}
+                      <span className="font-medium text-foreground">LAN Mode Liveview</span> (not LAN Only Mode), so
+                      the cloud and Bambu Handy keep working.
+                      {bambuMode === "lan" && " Uses the IP and access code above."}
+                    </p>
+                  </div>
+                  {bambuMode === "cloud" && (
+                    <>
+                      <Field label="Printer IP address">
+                        <Input
+                          value={cameraIp}
+                          onChange={(e) => setCameraIp(e.target.value)}
+                          placeholder="e.g. 192.168.1.50"
+                          inputMode="decimal"
+                        />
+                      </Field>
+                      <Field label="LAN access code">
+                        <Input
+                          value={cameraCode}
+                          onChange={(e) => setCameraCode(e.target.value)}
+                          placeholder="8-digit code from the printer screen"
+                          spellCheck={false}
+                          className="font-mono"
+                        />
+                      </Field>
+                    </>
+                  )}
+                  <Field label="Camera type">
+                    <Segmented
+                      className="w-full [&>button]:flex-1"
+                      value={cameraKind}
+                      onChange={(v) => setCameraKind(v as "auto" | "rtsps" | "jpeg")}
+                      options={[
+                        { value: "auto", label: "Auto-detect" },
+                        { value: "rtsps", label: "X1 / H2 / H3" },
+                        { value: "jpeg", label: "P1 / A1" },
+                      ]}
+                    />
+                  </Field>
+                </div>
               </div>
             ) : (
               <>

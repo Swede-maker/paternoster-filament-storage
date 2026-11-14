@@ -1,8 +1,33 @@
 "use client"
 
-import { useEffect, useRef, useState } from "react"
+import { useEffect, useRef, useState, type ReactNode } from "react"
 import useSWR from "swr"
-import { Plus, Trash2, Pencil, Printer as PrinterIcon, Wifi, WifiOff, Loader2, Flame, ChevronDown } from "lucide-react"
+import {
+  Plus,
+  Trash2,
+  Pencil,
+  Printer as PrinterIcon,
+  Wifi,
+  WifiOff,
+  Loader2,
+  Flame,
+  ChevronDown,
+  RefreshCw,
+  Hand,
+  ArrowRightLeft,
+  X,
+  Check,
+} from "lucide-react"
+import {
+  planAmsSync,
+  resolveAmsConflict,
+  spoolLabel,
+  type AmsConflictChoice,
+  type AmsSyncConflict,
+  type AmsSyncEntry,
+  type AmsSyncOp,
+} from "@/lib/ams-sync"
+import { Dialog, DialogFooter } from "./ui/dialog"
 import { useStore } from "@/lib/store"
 import { cn } from "@/lib/utils"
 import { activePrinter } from "@/lib/selectors"
@@ -308,78 +333,94 @@ function useBambuTokenRefresh(printer: Printer) {
   }, [isCloud, refreshToken, expiresAt, region, printerId, token, dispatch])
 }
 
+type AmsSyncReport = { at: number; entries: AmsSyncEntry[]; auto: boolean; error?: string }
+
 /**
- * Auto-create spools from Bambu AMS trays via their RFID uid and seat them in
- * the matching AMS slot, so a spool scanned by the printer can later be selected
- * and stored in the paternoster. Idempotent: a slot already holding the tray's
- * RFID spool is skipped.
+ * Keeps the app's AMS slots in step with the printer. In the background (every
+ * poll) only RFID-tagged trays are reconciled; the manual Sync also handles
+ * untagged spools, empty trays and swaps. Spools that leave the AMS go to
+ * "In my hand" and every change is surfaced in a report.
  */
-function useAmsRfidIngest(printer: Printer, bambu: BambuStatus | undefined) {
+function useAmsSync(printer: Printer, bambu: BambuStatus | undefined) {
   const { state, dispatch } = useStore()
-  const spools = state.spools
-  useEffect(() => {
-    if (!bambu?.connected || printer.kind !== "ams") return
-    for (const tray of bambu.trays) {
-      if (!tray.present || !tray.rfid) continue
-      const currentId = printer.loaded[tray.globalIndex]
-      const current = currentId ? spools[currentId] : null
-      if (current && current.rfidUid === tray.rfid) continue // already seated
+  const [report, setReport] = useState<AmsSyncReport | null>(null)
+  const [syncing, setSyncing] = useState(false)
+  const [conflicts, setConflicts] = useState<AmsSyncConflict[]>([])
+  const enabled = printer.firmware === "bambu" && printer.kind === "ams"
+  const opts = { materialDefaults: state.settings.materialDefaults }
 
-      // This tag already belongs to a spool we know about — the user physically
-      // moved that spool to a new slot/AMS unit (or put it back after storing
-      // it). Re-seat the SAME spool record here and refresh its live weight; the
-      // reducer vacates whatever slot/storage it left, so it never ghosts or
-      // duplicates. Its identity (brand/color/name) is preserved untouched. This
-      // takes priority over adoption below so a stray manual spool in this slot
-      // can't hijack a tag that's already assigned elsewhere.
-      const known = Object.values(spools).find((s) => s.rfidUid && s.rfidUid === tray.rfid)
-      if (known) {
-        const cap = known.capacity && known.capacity > 0 ? known.capacity : tray.capacityG && tray.capacityG > 0 ? tray.capacityG : 1000
-        const grams = typeof tray.remainPct === "number" ? Math.round((tray.remainPct / 100) * cap) : known.grams
-        dispatch({ type: "INGEST_AMS_TRAY", printerId: printer.id, slot: tray.globalIndex, spool: { ...known, grams } })
-        continue
-      }
-
-      // The slot already holds a spool the user picked/loaded manually (it has
-      // no tag yet). Adopt it rather than replacing it: bind this tag so future
-      // reads match, and refresh only the live remaining weight. The user's
-      // chosen material/brand/color/name always win, so nothing is overwritten
-      // or orphaned. A slot holding a *different* tagged spool falls through to
-      // ingest below, since that means a tagged spool was physically swapped in.
-      if (current && !current.rfidUid) {
-        const changes: Partial<Spool> = { rfidUid: tray.rfid }
-        if (typeof tray.remainPct === "number") {
-          const cap =
-            current.capacity && current.capacity > 0
-              ? current.capacity
-              : tray.capacityG && tray.capacityG > 0
-                ? tray.capacityG
-                : 1000
-          changes.grams = Math.round((tray.remainPct / 100) * cap)
-        }
-        dispatch({ type: "UPDATE_SPOOL", id: current.id, changes })
-        continue
-      }
-
-      const capacity = tray.capacityG && tray.capacityG > 0 ? tray.capacityG : 1000
-      const remain = typeof tray.remainPct === "number" ? tray.remainPct : 100
-      const material = tray.material || "PLA"
-      const spool = {
-        id: newId("spool"),
-        material,
-        brand: tray.brand || "Bambu",
-        color: tray.color || "#8b5cf6",
-        colorName: tray.colorName || `${material} ${tray.color ?? ""}`.trim(),
-        grams: Math.round((remain / 100) * capacity),
-        capacity,
-        density: densityFor(material, state.settings.materialDefaults),
-        rfidUid: tray.rfid,
-        createdAt: Date.now(),
-      }
-      dispatch({ type: "INGEST_AMS_TRAY", printerId: printer.id, slot: tray.globalIndex, spool })
+  function run(ops: AmsSyncOp[]) {
+    const now = Date.now()
+    for (const op of ops) {
+      if (op.kind === "clear") dispatch({ type: "SET_PRINTER_SLOT", printerId: printer.id, slot: op.slot, spoolId: null })
+      else if (op.kind === "seat")
+        dispatch({ type: "SET_PRINTER_SLOT", printerId: printer.id, slot: op.slot, spoolId: op.spoolId })
+      else if (op.kind === "ingest") dispatch({ type: "INGEST_AMS_TRAY", printerId: printer.id, slot: op.slot, spool: op.spool })
+      else if (op.kind === "update") dispatch({ type: "UPDATE_SPOOL", id: op.id, changes: op.changes })
+      else dispatch({ type: "UPDATE_SPOOL", id: op.id, changes: { inHandSince: now } })
     }
+  }
+
+  function apply(trays: BambuStatus["trays"], rfidOnly: boolean) {
+    const plan = planAmsSync(printer, trays, state.spools, { ...opts, rfidOnly })
+    run(plan.ops)
+    return plan
+  }
+
+  /** Answer the first open conflict; the report fills in as the user goes. */
+  function resolve(choice: AmsConflictChoice) {
+    const [first, ...rest] = conflicts
+    if (!first) return
+    const res = resolveAmsConflict(first, choice, state.spools, opts)
+    run(res.ops)
+    setConflicts(rest)
+    setReport((r) => ({ at: Date.now(), auto: false, entries: [...(r?.entries ?? []), ...res.entries] }))
+  }
+
+  useEffect(() => {
+    if (!enabled || !bambu?.connected || syncing || conflicts.length > 0) return
+    const plan = apply(bambu.trays, true)
+    if (plan.entries.length > 0) setReport({ at: Date.now(), entries: plan.entries, auto: true })
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [bambu])
+
+  async function sync() {
+    setSyncing(true)
+    try {
+      const status = await fetchBambuStatus(printer)
+      if (!status.connected) {
+        setReport({ at: Date.now(), entries: [], auto: false, error: status.error ?? "Printer not reachable" })
+        return
+      }
+      if (status.trays.length === 0) {
+        setReport({
+          at: Date.now(),
+          entries: [],
+          auto: false,
+          error: "The printer didn't report any AMS trays. Check that the AMS is connected and try again.",
+        })
+        return
+      }
+      const plan = apply(status.trays, false)
+      setConflicts(plan.conflicts)
+      setReport({ at: Date.now(), entries: plan.entries, auto: false })
+    } finally {
+      setSyncing(false)
+    }
+  }
+
+  return {
+    enabled,
+    sync,
+    syncing,
+    report,
+    dismiss: () => setReport(null),
+    conflict: conflicts[0] ?? null,
+    conflictsLeft: conflicts.length,
+    resolve,
+    /** Leave the remaining slots as they are for now; the next Sync asks again. */
+    skipConflicts: () => setConflicts([]),
+  }
 }
 
 function PrinterCard({
@@ -409,13 +450,36 @@ function PrinterCard({
   // lib/server/consumption-poller) so weights keep updating even with no browser
   // open — the browser no longer subtracts. We still auto-ingest AMS trays
   // (RFID) here so scanned Bambu spools can be stored afterwards.
-  useAmsRfidIngest(printer, bambu)
+  const amsSync = useAmsSync(printer, bambu)
 
   return (
     <div className="lg:min-h-0 lg:flex-1 lg:overflow-auto lg:scrollbar-thin">
       <PrinterHeader printer={printer} onEdit={onEdit} onRemove={onRemove} />
       <PrinterLinkRow printer={printer} live={live} bambu={bambu} />
-      <PrinterBody printer={printer} spools={spools} onSlot={onSlot} queuedPrinterSlots={queuedPrinterSlots} live={live} />
+      <PrinterBody
+        printer={printer}
+        spools={spools}
+        onSlot={onSlot}
+        queuedPrinterSlots={queuedPrinterSlots}
+        live={live}
+        amsAside={
+          amsSync.enabled ? (
+            <AmsSyncButton
+              onSync={amsSync.sync}
+              syncing={amsSync.syncing}
+              disabled={!isBambuLinked(printer)}
+              lastSync={amsSync.report?.auto === false ? amsSync.report.at : undefined}
+            />
+          ) : undefined
+        }
+      />
+      {amsSync.report && <AmsSyncReportCard report={amsSync.report} onDismiss={amsSync.dismiss} />}
+      <AmsConflictDialog
+        conflict={amsSync.conflict}
+        left={amsSync.conflictsLeft}
+        onChoose={amsSync.resolve}
+        onSkip={amsSync.skipConflicts}
+      />
     </div>
   )
 }
@@ -719,12 +783,15 @@ function PrinterBody({
   onSlot,
   queuedPrinterSlots,
   live,
+  amsAside,
 }: {
   printer: Printer
   spools: Record<string, Spool>
   onSlot: (p: Printer, index: number) => void
   queuedPrinterSlots?: number[]
   live?: MoonrakerStatus
+  /** Rendered beside the AMS units (e.g. the Bambu Sync control). */
+  amsAside?: ReactNode
 }) {
   if (printer.kind === "single") {
     const spool = printer.loaded[0] ? spools[printer.loaded[0]!] : null
@@ -800,7 +867,225 @@ function PrinterBody({
           onSlotClick={(globalIndex) => onSlot(printer, globalIndex)}
         />
       ))}
+      {amsAside}
     </div>
+  )
+}
+
+function AmsSyncButton({
+  onSync,
+  syncing,
+  disabled,
+  lastSync,
+}: {
+  onSync: () => void
+  syncing: boolean
+  disabled?: boolean
+  lastSync?: number
+}) {
+  return (
+    <div className="flex shrink-0 flex-col justify-end gap-2 pt-6">
+      <button
+        type="button"
+        onClick={onSync}
+        disabled={syncing || disabled}
+        className="flex w-36 flex-col items-center justify-center gap-2 rounded-xl border border-primary/40 bg-primary/10 px-4 py-5 text-primary transition-colors hover:border-primary hover:bg-primary/15 disabled:cursor-not-allowed disabled:opacity-50"
+      >
+        <RefreshCw className={cn("h-6 w-6", syncing && "animate-spin")} aria-hidden />
+        <span className="text-sm font-semibold">{syncing ? "Syncing…" : "Sync AMS"}</span>
+        <span className="text-center text-[11px] leading-snug text-muted-foreground text-pretty">
+          Read spools from the printer
+        </span>
+      </button>
+      <p className="text-center text-[11px] text-muted-foreground" aria-live="polite">
+        {lastSync
+          ? `Last sync ${new Date(lastSync).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`
+          : disabled
+            ? "Link the printer first"
+            : "Not synced yet"}
+      </p>
+    </div>
+  )
+}
+
+function ConflictSide({
+  heading,
+  color,
+  name,
+  meta,
+}: {
+  heading: string
+  color: string
+  name: string
+  meta: string
+}) {
+  return (
+    <div className="flex min-w-0 flex-1 flex-col items-center gap-2 rounded-xl border border-border bg-background/50 p-4 text-center">
+      <p className="text-[11px] font-medium uppercase tracking-wider text-muted-foreground">{heading}</p>
+      <SpoolDisc color={color} size={56} />
+      <p className="text-sm font-semibold text-foreground text-balance">{name}</p>
+      <p className="text-xs text-muted-foreground">{meta}</p>
+    </div>
+  )
+}
+
+/**
+ * Asks whether a mismatched AMS slot is the same spool set up differently in
+ * Bambu, or a different spool (then the app's spool goes to "In my hand").
+ */
+function AmsConflictDialog({
+  conflict,
+  left,
+  onChoose,
+  onSkip,
+}: {
+  conflict: AmsSyncConflict | null
+  left: number
+  onChoose: (choice: AmsConflictChoice) => void
+  onSkip: () => void
+}) {
+  if (!conflict) return null
+  const { current, reported } = conflict
+  const appName = spoolLabel(current)
+  const printerName = `${reported.colorName} ${reported.material}`
+  return (
+    <Dialog
+      open
+      onClose={onSkip}
+      title={`Different spool in ${conflict.slotLabel}?`}
+      description={left > 1 ? `${left} slots need your answer.` : undefined}
+    >
+      <p className="text-sm leading-relaxed text-muted-foreground text-pretty">
+        The app has <span className="font-medium text-foreground">{appName}</span> in this slot, but the printer
+        reports <span className="font-medium text-foreground">{printerName}</span>. Is it the same spool?
+      </p>
+
+      <div className="mt-4 flex items-stretch gap-3">
+        <ConflictSide
+          heading="In the app"
+          color={current.color}
+          name={appName}
+          meta={`${current.brand} · ${formatRemaining(current)}`}
+        />
+        <div className="flex items-center text-muted-foreground" aria-hidden>
+          <ArrowRightLeft className="h-4 w-4" />
+        </div>
+        <ConflictSide
+          heading="Printer reports"
+          color={reported.color}
+          name={printerName}
+          meta={reported.weightKnown ? `${reported.grams} / ${reported.capacity} g` : `${reported.capacity} g spool`}
+        />
+      </div>
+
+      <div className="mt-5 flex flex-col gap-2">
+        <Button className="h-auto justify-start py-3 text-left" onClick={() => onChoose("keep")}>
+          <span className="flex flex-col items-start gap-0.5">
+            <span>Same spool, keep {appName}</span>
+            <span className="text-xs font-normal opacity-80">The app is right. Sync won&apos;t ask about this again.</span>
+          </span>
+        </Button>
+        <Button variant="outline" className="h-auto justify-start py-3 text-left" onClick={() => onChoose("update")}>
+          <span className="flex flex-col items-start gap-0.5">
+            <span>Same spool, use the printer&apos;s info</span>
+            <span className="text-xs font-normal text-muted-foreground">
+              Change it to {printerName} in the app.
+            </span>
+          </span>
+        </Button>
+        <Button variant="outline" className="h-auto justify-start py-3 text-left" onClick={() => onChoose("replace")}>
+          <span className="flex flex-col items-start gap-0.5">
+            <span>Different spool</span>
+            <span className="text-xs font-normal text-muted-foreground">
+              Create {printerName} here and send {appName} to &quot;In my hand&quot;.
+            </span>
+          </span>
+        </Button>
+      </div>
+
+      <DialogFooter className="mt-4">
+        <Button variant="ghost" size="sm" onClick={onSkip}>
+          Decide later
+        </Button>
+      </DialogFooter>
+    </Dialog>
+  )
+}
+
+const SYNC_KIND_META: Record<AmsSyncEntry["kind"], { title: string; icon: typeof Plus; tone: string }> = {
+  kept: { title: "Kept", icon: Check, tone: "text-muted-foreground" },
+  created: { title: "New spool created", icon: Plus, tone: "text-success" },
+  relinked: { title: "Recognised", icon: RefreshCw, tone: "text-primary" },
+  moved: { title: "Moved", icon: ArrowRightLeft, tone: "text-primary" },
+  updated: { title: "Updated", icon: Pencil, tone: "text-muted-foreground" },
+  toHand: { title: "Sent to In my hand", icon: Hand, tone: "text-warning" },
+}
+
+function AmsSyncReportCard({ report, onDismiss }: { report: AmsSyncReport; onDismiss: () => void }) {
+  const handCount = report.entries.filter((e) => e.kind === "toHand").length
+  const heading = report.error
+    ? "Sync failed"
+    : report.entries.length === 0
+      ? "AMS is in sync"
+      : report.auto
+        ? "AMS changes detected"
+        : "Sync complete"
+  return (
+    <section
+      aria-live="polite"
+      className={cn(
+        "mt-4 rounded-xl border bg-background/40 p-4",
+        report.error ? "border-destructive/50" : handCount > 0 ? "border-warning/50" : "border-border",
+      )}
+    >
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0">
+          <h3 className={cn("text-sm font-semibold", report.error ? "text-destructive" : "text-foreground")}>{heading}</h3>
+          <p className="text-xs text-muted-foreground">
+            {report.error
+              ? report.error
+              : report.entries.length === 0
+                ? "Everything in the app already matches the AMS."
+                : handCount > 0
+                  ? `${handCount} spool${handCount === 1 ? " was" : "s were"} taken out of the AMS and moved to "In my hand".`
+                  : `${report.entries.length} change${report.entries.length === 1 ? "" : "s"} from the printer.`}
+          </p>
+        </div>
+        <button
+          type="button"
+          onClick={onDismiss}
+          aria-label="Dismiss sync report"
+          className="-mr-1 -mt-1 flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-muted-foreground hover:bg-secondary hover:text-foreground"
+        >
+          <X className="h-4 w-4" />
+        </button>
+      </div>
+      {report.entries.length > 0 && (
+        <ul className="mt-3 flex flex-col gap-2">
+          {report.entries.map((e, i) => {
+            const meta = SYNC_KIND_META[e.kind]
+            const Icon = meta.icon
+            return (
+              <li key={i} className="flex items-center gap-3 rounded-lg bg-secondary/50 px-3 py-2">
+                <Icon className={cn("h-4 w-4 shrink-0", meta.tone)} aria-hidden />
+                <span
+                  className="h-3 w-3 shrink-0 rounded-full border border-border"
+                  style={{ backgroundColor: e.color }}
+                  aria-hidden
+                />
+                <div className="min-w-0 flex-1">
+                  <p className="truncate text-sm text-foreground">
+                    <span className={cn("font-medium", meta.tone)}>{meta.title}:</span> {e.label}
+                    {e.slotLabel && <span className="text-muted-foreground"> · {e.slotLabel}</span>}
+                  </p>
+                  {e.detail && <p className="truncate text-xs text-muted-foreground">{e.detail}</p>}
+                </div>
+              </li>
+            )
+          })}
+        </ul>
+      )}
+    </section>
   )
 }
 
