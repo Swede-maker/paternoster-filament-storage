@@ -402,7 +402,11 @@ export function NodeConnection() {
         }
       } else if (m.status === "moving") {
         if (m.targetShelf != null && c.gotoTarget !== m.targetShelf) {
-          post(node, { type: "goto", shelf: m.targetShelf })
+          post(node, {
+            type: "goto",
+            shelf: m.targetShelf,
+            ...(m.moveStep === 1 || m.moveStep === -1 ? { step: m.moveStep } : {}),
+          })
           c.gotoTarget = m.targetShelf
           c.commandActive = true
         }
