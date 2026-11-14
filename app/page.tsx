@@ -29,6 +29,7 @@ import { PickListDonePrompt } from "@/features/hardware/pick-list-done-prompt"
 import { HardwareOrdersView } from "@/features/hardware/hardware-orders-view"
 import { HardwareSettingsView } from "@/features/hardware/hardware-settings-view"
 import { NodeConnection } from "@/components/node-connection"
+import { UpdateReloadWatcher } from "@/components/update-reload-watcher"
 import { PrintersView } from "@/components/printers/printers-view"
 import type { TopArea } from "@/lib/types"
 
@@ -37,6 +38,7 @@ export default function Page() {
     <StoreProvider>
       <FlowProvider>
         <NodeConnection />
+        <UpdateReloadWatcher />
         <DailyStorageSnapshot />
         <AppShell />
       </FlowProvider>
