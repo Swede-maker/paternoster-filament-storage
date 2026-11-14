@@ -32,6 +32,8 @@ export interface HomeCommand {
 export interface GotoCommand {
   type: "goto"
   shelf: number
+  /** Shelf-index step to travel (+1 / -1). Overrides the agent's own routing. */
+  step?: 1 | -1
 }
 
 /** Immediately stop the motor (emergency stop / cancel). */

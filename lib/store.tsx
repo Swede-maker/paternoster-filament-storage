@@ -1290,6 +1290,7 @@ function beginNodeMoveTo(state: AppState, nodeId: string, target: number, servic
       ...n.machine,
       targetShelf: target,
       direction,
+      moveStep: direction === "up" ? 1 : -1,
       // Remember where this rotation started so the soft start/stop ramp knows
       // how far along the move each tick is.
       moveFrom: n.machine.currentShelf,
@@ -2623,6 +2624,9 @@ function coreReducer(state: AppState, action: Action): AppState {
             ...n.machine,
             targetShelf: target,
             direction: action.direction,
+            // The arrows always take the one shelf they point at, ignoring
+            // one-way rotation.
+            moveStep: delta,
             moveFrom: n.machine.currentShelf,
             status: "moving",
           },
@@ -2644,7 +2648,14 @@ function coreReducer(state: AppState, action: Action): AppState {
       )
       return withNode(state, action.nodeId, (n) => ({
         ...n,
-        machine: { ...n.machine, targetShelf: action.shelf, direction, moveFrom: n.machine.currentShelf, status: "moving" },
+        machine: {
+          ...n.machine,
+          targetShelf: action.shelf,
+          direction,
+          moveStep: direction === "up" ? 1 : -1,
+          moveFrom: n.machine.currentShelf,
+          status: "moving",
+        },
       }))
     }
 

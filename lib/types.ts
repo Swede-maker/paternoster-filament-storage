@@ -460,6 +460,13 @@ export interface Machine {
    */
   moveFrom?: number | null
   /**
+   * Shelf-index step (+1 / -1) the current move must travel, decided by the app
+   * and sent with the goto so the carousel cannot pick its own way round:
+   * one-way rotation for Go to shelf and queue moves, the pressed arrow for a
+   * manual one-shelf move.
+   */
+  moveStep?: 1 | -1 | null
+  /**
    * When emergency-stopped, the status the machine was in at the moment of the
    * stop, so "Continue task" can pick up exactly where it left off. Undefined
    * whenever `status` is not "stopped".

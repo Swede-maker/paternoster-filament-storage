@@ -2559,8 +2559,9 @@ class Carousel:
     def request_home(self) -> None:
         self._set_command(("home",))
 
-    def request_goto(self, shelf: int) -> None:
-        self._set_command(("goto", shelf % self.shelves))
+    def request_goto(self, shelf: int, step: Optional[int] = None) -> None:
+        """`step` (+1 / -1 shelf index) is the app's chosen way round; None = agent decides."""
+        self._set_command(("goto", shelf % self.shelves, step))
 
     def request_calibrate(self) -> None:
         self._set_command(("calibrate",))
@@ -2595,14 +2596,18 @@ class Carousel:
         print(f"[agent] one-way rotation = {mode}", flush=True)
         return True
 
-    def _route(self, target: int) -> Tuple[str, int]:
+    def _route(self, target: int, step: Optional[int] = None) -> Tuple[str, int]:
         """
-        Direction ("up" = index down) and shelf count for a goto. Shortest way
-        round unless one-way rotation is on, in which case it always travels
-        the fixed direction even when the other way would be shorter.
+        Direction ("up" = index down) and shelf count for a goto. An explicit
+        `step` from the app always wins (it already applied one-way rotation, or
+        is a manual arrow move that must go the way it points). Otherwise the
+        shortest way round unless one-way rotation is on, in which case it
+        always travels the fixed direction even when the other way is shorter.
         """
         up_steps = (self.current_shelf - target) % self.shelves     # "up" = index down
         down_steps = (target - self.current_shelf) % self.shelves   # "down" = index up
+        if step in (1, -1):
+            return ("up", up_steps) if step == -1 else ("down", down_steps)
         if self.one_way != "off":
             home = home_travel_direction()
             direction = home if self.one_way == "home" else ("down" if home == "up" else "up")
@@ -3401,7 +3406,7 @@ class Carousel:
                 if cmd[0] == "home":
                     self._do_home()
                 elif cmd[0] == "goto":
-                    self._do_goto(cmd[1])
+                    self._do_goto(cmd[1], cmd[2] if len(cmd) > 2 else None)
                 elif cmd[0] == "calibrate":
                     self._do_calibrate()
                 elif cmd[0] == "jog":
@@ -3957,7 +3962,7 @@ class Carousel:
         self.emit({"type": "homed", "shelf": 0})
         self.emit(self.snapshot())
 
-    def _do_goto_pulses(self, target: int) -> None:
+    def _do_goto_pulses(self, target: int, step_override: Optional[int] = None) -> None:
         """
         Drive a calibrated DISTANCE to the target instead of counting shelf
         flags. Position comes from the pulse odometer referenced to the home
@@ -3972,7 +3977,7 @@ class Carousel:
         """
         rev = float(self.carousel_pulses)
         pitch = rev / self.shelves
-        direction, steps = self._route(target)
+        direction, steps = self._route(target, step_override)
         step = -1 if direction == "up" else 1
         sign = 1 if direction == "down" else -1  # odometer counts up on forward() = "down"
         start_shelf = self.current_shelf
@@ -4109,7 +4114,7 @@ class Carousel:
                    "onSensor": self._shelf_lamp(),
                    "positionMode": self.position_mode})
 
-    def _do_goto(self, target: int) -> None:
+    def _do_goto(self, target: int, step_override: Optional[int] = None) -> None:
         # An un-homed carousel is still allowed to move. Refusing here meant a
         # failed home (e.g. a miswired index sensor) left the machine completely
         # immobile, including the manual Move Up/Down buttons, so the motor
@@ -4124,7 +4129,7 @@ class Carousel:
         if self.position_mode in ("pulses", "index"):
             blocker = self._pulse_mode_blocker()
             if blocker is None:
-                self._do_goto_pulses(target)
+                self._do_goto_pulses(target, step_override)
                 return
             if self.position_mode == "index":
                 # No shelf sensor is wired, so there is nothing to fall back to:
@@ -4144,7 +4149,7 @@ class Carousel:
         self.emit(self.snapshot())
 
         # Shortest direction around the loop, or the fixed one-way direction.
-        direction, steps = self._route(target)
+        direction, steps = self._route(target, step_override)
         step = -1 if direction == "up" else +1
 
         # THE ALREADY-ACTIVE SENSOR AT THE START OF A MOVE.
@@ -5185,7 +5190,9 @@ async def serve(args) -> None:
                 if t == "home":
                     carousel.request_home()
                 elif t == "goto":
-                    carousel.request_goto(int(msg.get("shelf", 0)))
+                    step = msg.get("step")
+                    carousel.request_goto(int(msg.get("shelf", 0)),
+                                          step if step in (1, -1) and not isinstance(step, bool) else None)
                 elif t == "config":
                     carousel.set_shelves(int(msg.get("shelves", carousel.shelves)))
                     carousel.set_motion(
