@@ -5,6 +5,7 @@ import useSWR from "swr"
 import { Check, CheckCircle2, Copy, Download, Loader2, RefreshCw, Terminal, TriangleAlert } from "lucide-react"
 import { Button } from "./ui/button"
 import { cn } from "@/lib/utils"
+import { markUpdateStarted } from "./update-reload-watcher"
 import type { UpdateStatus } from "@/lib/server/updater"
 
 const fetcher = (url: string) => fetch(url).then((r) => r.json() as Promise<UpdateStatus>)
@@ -33,7 +34,11 @@ export function UpdateSection() {
     refreshInterval: (latest) =>
       inFlight || latest?.phase === "requested" || latest?.phase === "running" ? 2000 : 0,
     shouldRetryOnError: true,
-    errorRetryInterval: 2000,
+    // Fixed retry instead of SWR's exponential backoff, which stretched to
+    // minutes between tries while the app was offline rebuilding.
+    onErrorRetry: (_err, _key, _config, revalidate, { retryCount }) => {
+      window.setTimeout(() => revalidate({ retryCount }), 2000)
+    },
   })
 
   const busy = inFlight || data?.phase === "requested" || data?.phase === "running"
@@ -44,11 +49,9 @@ export function UpdateSection() {
       sawOutage.current = true
       return
     }
-    // Back after the restart with a finished run: load the new version.
-    if (sawOutage.current && data && (data.phase === "done" || data.phase === "failed")) {
-      if (data.phase === "done") window.location.reload()
-      setInFlight(false)
-    }
+    // The reload itself is done by <UpdateReloadWatcher />; this only ends the
+    // in-progress display once the run has finished.
+    if (sawOutage.current && data && (data.phase === "done" || data.phase === "failed")) setInFlight(false)
   }, [inFlight, fetchError, data])
 
   async function check() {
@@ -73,6 +76,7 @@ export function UpdateSection() {
         return
       }
       sawOutage.current = false
+      markUpdateStarted(data?.current?.hash)
       setInFlight(true)
       await mutate()
     } finally {

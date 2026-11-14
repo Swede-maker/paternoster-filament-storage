@@ -14,6 +14,24 @@ const MAX_AMS_UNITS = 8
 const MAX_TOOLHEADS = 10
 const MAX_MMU_SLOTS = 12
 
+/**
+ * The cloud sign-in already stored on a printer, so editing it doesn't force a
+ * fresh sign-in (and saving doesn't wipe the tokens).
+ */
+function savedCloudLink(p: Printer): BambuCloudLink | null {
+  if (p.bambuMode !== "cloud" || !p.bambuToken || !p.serial) return null
+  return {
+    region: p.bambuRegion ?? "global",
+    email: p.bambuAccountEmail ?? "Bambu account",
+    token: p.bambuToken,
+    uid: p.bambuUid ?? "",
+    refreshToken: p.bambuRefreshToken,
+    expiresAt: p.bambuTokenExpiresAt,
+    serial: p.serial,
+    deviceName: p.serial,
+  }
+}
+
 /** Units saved before the model picker existed: 9 trays means AMS 3. */
 function amsModelOf(unit: AmsUnit): AmsModel {
   return unit.model ?? (unit.slots >= AMS_MODEL_SLOTS.ams3 ? "ams3" : "ams")
@@ -76,7 +94,7 @@ export function AddPrinterDialog({
       setSerial(editing.serial ?? "")
       setAccessCode(editing.accessCode ?? "")
       setBambuMode(editing.bambuMode ?? "lan")
-      setCloudLink(null)
+      setCloudLink(savedCloudLink(editing))
       setCameraIp(editing.cameraIp ?? "")
       setCameraCode(editing.cameraAccessCode ?? "")
       setCameraKind(editing.bambuCamera ?? "auto")
@@ -398,6 +416,7 @@ export function AddPrinterDialog({
                       setBambuMode(next)
                       // Drop a stale cloud sign-in when switching back to LAN.
                       if (next === "lan") setCloudLink(null)
+                      else if (!cloudLink && editing) setCloudLink(savedCloudLink(editing))
                     }}
                     options={[
                       { value: "lan", label: "LAN (local)" },
@@ -543,6 +562,11 @@ export function AddPrinterDialog({
         )}
       </DialogBody>
       <DialogFooter>
+        {!atLimit && isBambuCloud && !cloudLink && (
+          <p className="mr-auto text-xs text-muted-foreground text-pretty">
+            Sign in to your Bambu account above to save, or switch to LAN.
+          </p>
+        )}
         <Button variant="ghost" onClick={onClose}>
           Cancel
         </Button>
