@@ -72,6 +72,11 @@ export interface Spool {
    * has already been auto-created from an AMS tray so it isn't duplicated.
    */
   rfidUid?: string
+  /**
+   * AMS tray setup ("MATERIAL|#HEX") the user confirmed is this same spool even
+   * though it differs from the app's material/color, so Sync stops asking.
+   */
+  amsAck?: string
   /** Scanned barcode string associated with this spool, if any. */
   barcode?: string
   /**
@@ -378,6 +383,19 @@ export interface Printer {
   accessCode?: string
   /** Bambu Lab only: connect over the local network ("lan") or cloud ("cloud"). */
   bambuMode?: "lan" | "cloud"
+  /**
+   * Bambu Lab only: LAN camera. The live view is always read locally (needs
+   * "LAN Mode Liveview" on the printer, which keeps cloud + Bambu Handy working).
+   * LAN printers reuse `ip` / `accessCode`; cloud printers set these instead.
+   */
+  cameraIp?: string
+  cameraAccessCode?: string
+  /**
+   * Bambu Lab only: camera protocol. "rtsps" = X1 / H2 / H3 series (port 322,
+   * needs ffmpeg on the server), "jpeg" = P1 / A1 series (port 6000).
+   * "auto" (default) detects it by probing both ports.
+   */
+  bambuCamera?: "auto" | "rtsps" | "jpeg"
   /**
    * Bambu Lab cloud only: which Bambu account region the token belongs to.
    * "global" → api.bambulab.com / us.mqtt.bambulab.com,

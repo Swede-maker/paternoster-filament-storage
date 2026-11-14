@@ -78,7 +78,7 @@ import { getSystemVersion, loadSystemState, saveSystemState } from "@/app/action
 const STORAGE_KEY = "pax-filament-system-v1"
 
 /** How often (ms) to poll the DB so edits from other devices show up here. */
-const SYNC_POLL_MS = 4000
+const SYNC_POLL_MS = 2000
 
 /**
  * Maximum number of filament-history events to retain. The log is a rolling
@@ -288,6 +288,73 @@ function mergeRecordByKey<T>(
   return out ?? base
 }
 
+function sameValue(a: unknown, b: unknown) {
+  return a === b || JSON.stringify(a) === JSON.stringify(b)
+}
+
+/**
+ * Field-level three-way merge of one object. A field this device left untouched
+ * since `baseline` adopts the other device's value; a field changed here wins.
+ *
+ * Without it every save wrote this device's WHOLE copy of the object, so a stale
+ * device silently reverted toggles made elsewhere (e.g. "Always rotate the same
+ * way" switched on from a tablet, then switched back off by the PC's next save).
+ */
+function adoptRemoteFields<T extends object>(
+  local: T,
+  remote: T | undefined,
+  baseline: T | undefined,
+  skip: readonly string[] = [],
+): T {
+  if (!remote || !baseline) return local
+  const l = local as Record<string, unknown>
+  const r = remote as Record<string, unknown>
+  const b = baseline as Record<string, unknown>
+  let out: Record<string, unknown> | null = null
+  for (const k of new Set([...Object.keys(l), ...Object.keys(r)])) {
+    if (skip.includes(k)) continue
+    if (sameValue(l[k], b[k]) && !sameValue(r[k], b[k])) {
+      out ??= { ...l }
+      if (r[k] === undefined) delete out[k]
+      else out[k] = r[k]
+    }
+  }
+  return (out as T | null) ?? local
+}
+
+/**
+ * {@link mergeRecordByKey} plus: entries edited on another device adopt those
+ * field changes, and entries another device deleted (untouched here) go away.
+ */
+function mergeRecordFields<T extends object>(
+  local: Record<string, T> | undefined,
+  remote: Record<string, T> | undefined,
+  baseline: Record<string, T> | undefined,
+  skip: readonly string[] = [],
+): Record<string, T> {
+  const merged = mergeRecordByKey(local, remote, baseline)
+  if (!remote || !baseline) return merged
+  let out: Record<string, T> | null = null
+  for (const [k, v] of Object.entries(merged)) {
+    const base = baseline[k]
+    if (!base) continue
+    const rem = remote[k]
+    if (!rem) {
+      if (sameValue(v, base)) {
+        out ??= { ...merged }
+        delete out[k]
+      }
+      continue
+    }
+    const next = adoptRemoteFields(v, rem, base, skip)
+    if (next !== v) {
+      out ??= { ...merged }
+      out[k] = next
+    }
+  }
+  return out ?? merged
+}
+
 /**
  * Fold server-side filament consumption into the outgoing spool map.
  *
@@ -356,10 +423,11 @@ function mergePrinterSlots(
   // A spool that sits in a storage slot after the merge must not also be
   // adopted onto a printer slot from a stale copy.
   const stored = new Set(nodes.flatMap((n) => n.slots.flat()).filter((id): id is string => !!id))
-  return local.map((p) => {
-    const rem = remoteById.get(p.id)
-    const base = baseById.get(p.id)
-    if (!rem || !base) return p
+  return local.map((local) => {
+    const rem = remoteById.get(local.id)
+    const base = baseById.get(local.id)
+    if (!rem || !base) return local
+    const p = adoptRemoteFields(local, rem, base, ["loaded"])
     let loaded: (string | null)[] | null = null
     for (let i = 0; i < p.loaded.length; i++) {
       const l = p.loaded[i] ?? null
@@ -403,42 +471,6 @@ function mergeConsumptionLog(
  * we changed always win, so our own placement can never be undone by a device
  * that merely echoed a position update.
  */
-/**
- * Operator-tuned drive settings on a node. These get the same three-way merge
- * as slot cells: the Pi's position ticks make EVERY open device re-save the
- * document, so a phone's new approach speed was overwritten seconds later by a
- * desktop tab that still held the old value and merely echoed a position — and
- * then synced back to the phone as "reverted to default".
- */
-const NODE_TUNING_KEYS = [
-  "pwmDuty",
-  "homingDuty",
-  "approachDuty",
-  "servoPulsesPerRev",
-  "servoMaxPps",
-  "servoGearRatio",
-  "servoJogPulses",
-  "dcJogMs",
-  "servoMirrorB",
-  "servoSingleMotor",
-  "servoIgnoreAlarm",
-  "servoDriver",
-  "pulseDrive",
-  "pulseEnableActiveLow",
-  "pulseAlarmActiveLow",
-  "esp32Link",
-  "esp32Port",
-  "esp32Baud",
-  "servoHoldTimeoutS",
-  "motorMode",
-  "positionMode",
-  "servoCarouselPulses",
-  "servoIndexWindowPulses",
-  "servoHomeResync",
-  "servoCalibratedAt",
-  "orientation",
-] as const satisfies readonly (keyof StorageNode)[]
-
 function mergeNodeSlots(local: StorageNode[], remote: StorageNode[] | undefined, baseline: StorageNode[] | undefined): StorageNode[] {
   if (!remote || !baseline) return local
   const remoteById = new Map(remote.map((n) => [n.id, n]))
@@ -449,16 +481,17 @@ function mergeNodeSlots(local: StorageNode[], remote: StorageNode[] | undefined,
     const rem = remoteById.get(node.id)
     const base = baseById.get(node.id)
     if (!rem || !base) return node
-    let tuned: Partial<StorageNode> | null = null
-    for (const key of NODE_TUNING_KEYS) {
-      const l = node[key]
-      const r = rem[key]
-      const b = base[key]
-      // Unchanged here but changed on another device → adopt its value.
-      if (l === b && r !== b) {
-        if (!tuned) tuned = {}
-        ;(tuned as Record<string, unknown>)[key] = r
-      }
+    // Any node setting (tuning, name, layout…) unchanged here but changed on
+    // another device adopts its value; slots and motion are merged below.
+    const adopted = adoptRemoteFields(node, rem, base, ["slots", "machine"])
+    let tuned: Partial<StorageNode> | null = adopted === node ? null : { ...adopted }
+    // Same for where the carousel stands: a rotation made from another device
+    // must not be undone by this device's next save.
+    if (
+      node.machine.currentShelf === base.machine.currentShelf &&
+      rem.machine.currentShelf !== base.machine.currentShelf
+    ) {
+      tuned = { ...(tuned ?? {}), machine: { ...node.machine, currentShelf: rem.machine.currentShelf } }
     }
     let slots: (string | null)[][] | null = null
     if (node.type === "library") {
@@ -547,8 +580,9 @@ function mergeCatalog(local: PersistedState, remote: PersistedState, baseline: P
   // (it isn't in our map at all, so a plain local-wins spread dropped it — the
   // "I placed a spool and it disappeared" bug seen with two open tabs); a spool
   // WE deleted since baseline stays deleted. Then fold in server consumption.
+  // Grams are skipped here: mergeServerConsumption folds in the remote delta.
   const spools = mergeServerConsumption(
-    mergeRecordByKey(local.spools, remote.spools, baseline?.spools),
+    mergeRecordFields(local.spools, remote.spools, baseline?.spools, ["grams"]),
     remote.spools,
     baseline?.spools,
   )
@@ -575,7 +609,7 @@ function mergeCatalog(local: PersistedState, remote: PersistedState, baseline: P
   // mutation, so local wins for keys we already know and we only fold in parts
   // another device ADDED since our baseline (mirrors mergeByKey's delete-safe
   // rule so a locally-removed part isn't resurrected).
-  const parts = mergeRecordByKey(local.parts, remote.parts, baseline?.parts)
+  const parts = mergeRecordFields(local.parts, remote.parts, baseline?.parts)
   const hardwareOrders = mergeByKey(local.hardwareOrders, remote.hardwareOrders, baseline?.hardwareOrders, (o) => o.id)
   const hwPickLists = mergeByKey(
     local.hwPickLists ?? [],
@@ -614,8 +648,10 @@ function mergeCatalog(local: PersistedState, remote: PersistedState, baseline: P
     usage,
     consumptionLog,
     storageSnapshots,
+    configured: local.configured === baseline?.configured ? remote.configured : local.configured,
     settings: {
-      ...ls,
+      // Scalar toggles/values: field-level three-way, list registries below.
+      ...adoptRemoteFields(ls, rs, bs),
       hardwareCategories: mergeByKey(
         ls.hardwareCategories,
         rs.hardwareCategories,
@@ -636,7 +672,9 @@ function mergeCatalog(local: PersistedState, remote: PersistedState, baseline: P
       containers: mergeByKey(ls.containers, rs.containers, bs?.containers, (c) => c.id),
       customMaterials: mergeByKey(ls.customMaterials, rs.customMaterials, bs?.customMaterials, (m) => m),
       customBrands: mergeByKey(ls.customBrands, rs.customBrands, bs?.customBrands, (b) => b),
-      materialDefaults: { ...rs.materialDefaults, ...ls.materialDefaults },
+      materialDefaults: bs
+        ? adoptRemoteFields(ls.materialDefaults ?? {}, rs.materialDefaults ?? {}, bs.materialDefaults ?? {})
+        : { ...rs.materialDefaults, ...ls.materialDefaults },
       orders: mergeByKey(ls.orders, rs.orders, bs?.orders, (o) => o.id),
       stores: mergeByKey(ls.stores, rs.stores, bs?.stores, (s) => s.id),
       customColors: mergeByKey(ls.customColors, rs.customColors, bs?.customColors, (c) => c.hex.toLowerCase()),
@@ -3847,7 +3885,10 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       !!stateRef.current.job ||
       saveInFlight.current ||
       persistedSig(stateRef.current) !== lastSavedSig.current
-    const iv = setInterval(async () => {
+    let checking = false
+    const check = async () => {
+      if (checking) return
+      checking = true
       try {
         // Never reload on top of an in-progress operation or a pending write:
         // a job mid-flight or an unacknowledged save is local truth that a stale
@@ -3875,13 +3916,28 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         }
       } catch {
         // transient network error — try again next tick
+      } finally {
+        checking = false
       }
-    }, SYNC_POLL_MS)
+    }
+    const iv = setInterval(check, SYNC_POLL_MS)
+    // Coming back to this tab/device: pick up other devices' changes right away
+    // instead of waiting for the next tick.
+    const onVisible = () => {
+      if (document.visibilityState === "visible") void check()
+    }
+    document.addEventListener("visibilitychange", onVisible)
+    window.addEventListener("focus", onVisible)
     return () => {
       cancelled = true
       clearInterval(iv)
+      document.removeEventListener("visibilitychange", onVisible)
+      window.removeEventListener("focus", onVisible)
     }
-  }, [ready, sig])
+    // Only `ready`: every guard reads refs. Re-subscribing on each local change
+    // restarted the timer, so a busy device could go long stretches without
+    // ever checking for other devices' changes.
+  }, [ready])
 
   // Auto-home every node on power up once configured. Simulated nodes home
   // immediately; hardware nodes only home once their Pi agent is connected
