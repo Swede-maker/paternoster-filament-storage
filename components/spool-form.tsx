@@ -23,7 +23,6 @@ import {
   formatGrams,
   nozzleTempFor,
   densityFor,
-  isBuiltInMaterial,
   newId,
   DEFAULT_DIAMETER,
   type MaterialDefaults,
@@ -361,11 +360,11 @@ export function SpoolForm({
   const defaultDiameter = state.settings.defaultDiameter ?? DEFAULT_DIAMETER
   const materialDefaults = state.settings.materialDefaults
   const materialName = (value.material ?? "").trim()
-  const isCustomMaterial = materialName !== "" && !isBuiltInMaterial(materialName)
+  const hasMaterial = materialName !== ""
   const tempDefault = nozzleTempFor(materialName, materialDefaults)
   const densityDefault = densityFor(materialName, materialDefaults)
-  const canSetTempDefault = isCustomMaterial && value.nozzleTemp != null && value.nozzleTemp !== tempDefault
-  const canSetDensityDefault = isCustomMaterial && value.density != null && value.density !== densityDefault
+  const canSetTempDefault = hasMaterial && value.nozzleTemp != null && value.nozzleTemp !== tempDefault
+  const canSetDensityDefault = hasMaterial && value.density != null && value.density !== densityDefault
 
   const [scannerOpen, setScannerOpen] = useState(false)
   const [scanNote, setScanNote] = useState<string | null>(null)

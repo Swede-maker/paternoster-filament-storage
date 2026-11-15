@@ -1,7 +1,8 @@
 "use client"
 
 import { useMemo, useState } from "react"
-import { Archive, Flame, Hand, Loader2, Trash2 } from "lucide-react"
+import { Archive, Flame, Hand, Loader2, Printer, Trash2 } from "lucide-react"
+import { SendToPrinterPicker } from "@/components/send-to-printer-picker"
 import { useStore } from "@/lib/store"
 import { locateSpool } from "@/lib/tags"
 import { findSpoolInDryer, getDryers } from "@/lib/dryers"
@@ -36,6 +37,8 @@ export function InHandTab({ onQueued, onContinueDryer }: { onQueued: () => void;
   const [selected, setSelected] = useState<Set<string>>(new Set())
   // Spools awaiting a "delete permanently" confirmation.
   const [pendingDelete, setPendingDelete] = useState<Spool[] | null>(null)
+  const [sendingId, setSendingId] = useState<string | null>(null)
+  const [notice, setNotice] = useState<string | null>(null)
 
   const spools = useMemo(() => getSpoolsInHand(state), [state])
   const count = spools.length
@@ -76,6 +79,26 @@ export function InHandTab({ onQueued, onContinueDryer }: { onQueued: () => void;
     setOpen(false)
     setSelected(new Set())
     setPendingDelete(null)
+    setSendingId(null)
+    setNotice(null)
+  }
+
+  const sendingSpool = sendingId ? state.spools[sendingId] : undefined
+
+  function startSend(id: string) {
+    setNotice(null)
+    setPendingDelete(null)
+    setSendingId(id)
+  }
+
+  function finishSend(message: string) {
+    setSelected((prev) => {
+      const next = new Set(prev)
+      if (sendingId) next.delete(sendingId)
+      return next
+    })
+    setSendingId(null)
+    setNotice(message)
   }
 
   function confirmDelete() {
@@ -133,7 +156,17 @@ export function InHandTab({ onQueued, onContinueDryer }: { onQueued: () => void;
         title="Spools without storage location"
         description="Taken out of storage but not yet placed anywhere. They stay pending here until they're stored, loaded or put in a dryer."
       >
-        {count === 0 ? (
+        {notice && !sendingSpool && (
+          <p
+            role="status"
+            className="mb-3 rounded-lg border border-primary/40 bg-primary/10 px-3 py-2 text-sm leading-relaxed text-foreground"
+          >
+            {notice}
+          </p>
+        )}
+        {sendingSpool ? (
+          <SendToPrinterPicker spool={sendingSpool} onBack={() => setSendingId(null)} onDone={finishSend} />
+        ) : count === 0 ? (
           <div className="flex flex-col items-center gap-2 py-8 text-center">
             <Hand className="h-8 w-8 text-muted-foreground" aria-hidden />
             <p className="text-sm font-medium">Nothing in your hand</p>
@@ -228,6 +261,17 @@ export function InHandTab({ onQueued, onContinueDryer }: { onQueued: () => void;
                         <Archive className="h-3.5 w-3.5" aria-hidden />
                         Store
                       </button>
+                      {!dryer && (
+                        <button
+                          type="button"
+                          onClick={() => startSend(s.id)}
+                          aria-label={`Send ${s.material} ${s.colorName} to a printer`}
+                          className="flex items-center gap-1.5 rounded-lg border border-border px-2.5 py-1.5 text-xs font-medium hover:bg-secondary"
+                        >
+                          <Printer className="h-3.5 w-3.5" aria-hidden />
+                          Printer
+                        </button>
+                      )}
                       <button
                         type="button"
                         onClick={() => setPendingDelete([s])}
@@ -245,7 +289,7 @@ export function InHandTab({ onQueued, onContinueDryer }: { onQueued: () => void;
           </ul>
           </div>
         )}
-        {pendingDelete ? (
+        {sendingSpool ? null : pendingDelete ? (
           <DialogFooter className="flex-wrap items-center">
             <p role="alert" className="mr-auto text-sm leading-relaxed text-foreground">
               {pendingDelete.length === 1
