@@ -64,7 +64,15 @@ import type {
   PulseDrive,
   ServoEvent,
 } from "./node-protocol"
-import { printerAmsUnits, printerSlotCount, rampStepMs, newId, DEFAULT_RAMP_PCT, pulseDriveProfile } from "./filament"
+import {
+  printerAmsUnits,
+  printerSlotCount,
+  rampStepMs,
+  newId,
+  DEFAULT_RAMP_PCT,
+  pulseDriveProfile,
+  isBuiltInMaterial,
+} from "./filament"
 import { pickRemainderDestination } from "./hardware-flow"
 import { shelfLabel, printerSlotLabel, nodeSystem } from "./selectors"
 import { oneWayStep, routeRotation } from "./balance"
@@ -1718,7 +1726,7 @@ function coreReducer(state: AppState, action: Action): AppState {
       if (action.density != null) entry.density = action.density
       defaults[existingKey] = entry
       const customs = state.settings.customMaterials ?? []
-      const customMaterials = customs.some((m) => m.toLowerCase() === material.toLowerCase())
+      const customMaterials = isBuiltInMaterial(material) || customs.some((m) => m.toLowerCase() === material.toLowerCase())
         ? customs
         : [...customs, material]
       return { ...state, settings: { ...state.settings, materialDefaults: defaults, customMaterials } }
