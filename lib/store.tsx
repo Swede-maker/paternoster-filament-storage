@@ -1263,6 +1263,18 @@ function removeSpoolEverywhere(state: AppState, id: string): AppState {
  * gate + arrives into an awaiting-confirm state). Otherwise it's a background
  * pre-rotation that moves immediately and parks idle on arrival.
  */
+/**
+ * Step sent with a routed goto. With one-way rotation on, none is sent: the Pi
+ * applies its own fixed direction, and it always knows which way it homes.
+ * The app's copy of that (servo.homeStep) is missing after a reload or
+ * reconnect, and an explicit step built from the fallback guess would override
+ * the Pi and send the carousel the wrong way.
+ */
+function routedMoveStep(direction: "up" | "down", fixedStep: 1 | -1 | null): 1 | -1 | null {
+  if (fixedStep !== null) return null
+  return direction === "up" ? 1 : -1
+}
+
 function beginNodeMoveTo(state: AppState, nodeId: string, target: number, serviced: boolean): AppState {
   const node = getNode(state, nodeId)
   if (!node) return state
@@ -1279,12 +1291,8 @@ function beginNodeMoveTo(state: AppState, nodeId: string, target: number, servic
   if (node.machine.status === "moving" && node.machine.targetShelf === target) {
     return state
   }
-  const { direction } = routeRotation(
-    node.machine.currentShelf,
-    target,
-    node.storage.shelves,
-    oneWayStep(node, state.settings),
-  )
+  const fixedStep = oneWayStep(node, state.settings)
+  const { direction } = routeRotation(node.machine.currentShelf, target, node.storage.shelves, fixedStep)
   // Each area has its own safety gate. Hardware falls back to the filament flag
   // for saves made before the per-area setting existed.
   const confirmSetting =
@@ -1298,7 +1306,7 @@ function beginNodeMoveTo(state: AppState, nodeId: string, target: number, servic
       ...n.machine,
       targetShelf: target,
       direction,
-      moveStep: direction === "up" ? 1 : -1,
+      moveStep: routedMoveStep(direction, fixedStep),
       // Remember where this rotation started so the soft start/stop ramp knows
       // how far along the move each tick is.
       moveFrom: n.machine.currentShelf,
@@ -2648,19 +2656,15 @@ function coreReducer(state: AppState, action: Action): AppState {
       if (!node || !node.machine.homed || node.machine.status !== "idle" || state.job) return state
       if (!isDrivable(node)) return state
       if (action.shelf === node.machine.currentShelf) return state
-      const { direction } = routeRotation(
-        node.machine.currentShelf,
-        action.shelf,
-        node.storage.shelves,
-        oneWayStep(node, state.settings),
-      )
+      const fixedStep = oneWayStep(node, state.settings)
+      const { direction } = routeRotation(node.machine.currentShelf, action.shelf, node.storage.shelves, fixedStep)
       return withNode(state, action.nodeId, (n) => ({
         ...n,
         machine: {
           ...n.machine,
           targetShelf: action.shelf,
           direction,
-          moveStep: direction === "up" ? 1 : -1,
+          moveStep: routedMoveStep(direction, fixedStep),
           moveFrom: n.machine.currentShelf,
           status: "moving",
         },
