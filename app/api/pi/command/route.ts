@@ -38,9 +38,9 @@ function parseBaseCommand(body: unknown): NodeCommand | null {
     case "calibrate":
       return { type }
     case "goto": {
-      const shelf = (body as { shelf?: unknown }).shelf
+      const { shelf, step } = body as { shelf?: unknown; step?: unknown }
       if (typeof shelf !== "number" || !Number.isInteger(shelf) || shelf < 0) return null
-      return { type: "goto", shelf }
+      return step === 1 || step === -1 ? { type: "goto", shelf, step } : { type: "goto", shelf }
     }
     case "jog": {
       const b = body as { motor?: unknown; direction?: unknown; pulses?: unknown; ms?: unknown; speed?: unknown }
@@ -91,6 +91,7 @@ function parseBaseCommand(body: unknown): NodeCommand | null {
         servoCarouselPulses?: unknown
         servoIndexWindowPulses?: unknown
         homeResync?: unknown
+        oneWay?: unknown
       }
       if (typeof b.shelves !== "number" || !Number.isInteger(b.shelves) || b.shelves <= 0) return null
       // Rebuilding the command field-by-field is what dropped the slider values:
@@ -180,6 +181,7 @@ function parseBaseCommand(body: unknown): NodeCommand | null {
       if (carouselPulses !== undefined) cmd.servoCarouselPulses = carouselPulses
       if (windowPulses !== undefined) cmd.servoIndexWindowPulses = windowPulses
       if (typeof b.homeResync === "boolean") cmd.homeResync = b.homeResync
+      if (b.oneWay === "off" || b.oneWay === "home" || b.oneWay === "reverse") cmd.oneWay = b.oneWay
       return cmd
     }
     default:
